@@ -1,0 +1,95 @@
+# Wave 0 shadow labeler. DRAFT (Tern, 2026-10-12). Lives at .github/workflows/labeler-shai.yml in shaiss/shai.
+# Cipher CLEAR with conditions (see /workspace/security/WAIVERS.md):
+#   - runs on shaiss/shai only; never copied into print-bench without a new Cipher review
+#   - job token: contents:read only; no #544 fallback use; binary pinned by sha256; actions SHA-pinned
+#   - tools: read,ls,find only (no fetch); CSV holds labels + metrics only
+# PRE-RUN (manual, before the FIRST run): re-verify the key's $300 credit limit with
+#   GET https://openrouter.ai/api/v1/key  (check limit == 300 and limit_remaining). Not automated here.
+# Shadow mode: proposes labels, logs agreement, APPLIES NOTHING.
+name: labeler-shai (wave0 shadow)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issues:
+        description: "Space-separated print-bench issue numbers (blank = recent open issues)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "22 13 * * 1-5"   # weekdays 9:22 AM ET (EDT)
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/labeler-shai.yml"
+      - "wave0/**"
+
+permissions:
+  contents: read   # Cipher condition 1: nothing else
+
+concurrency:
+  group: labeler-shai
+  cancel-in-progress: false
+
+env:
+  SHAI_VERSION: v0.2.2
+  SHAI_URL: https://github.com/ovh/shai/releases/download/v0.2.2/shai-linux-x86_64
+  SHAI_SHA256: 445bf9b710f6b1f64b845f24ff0d4e39401cb552e578d525658ddadc6abb6779
+  TARGET_REPO: shaiss/print-bench   # read-only: public issue reads
+  SHAI_PROVIDER: openrouter
+  SHAI_MODEL: openai/gpt-oss-120b   # pinned default; matrix entries below are shadow comparisons
+  SHAI_LLM_MAX_RETRIES: "1"
+
+jobs:
+  shadow:
+    if: github.repository == 'shaiss/shai'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: openai/gpt-oss-120b            # default
+            role: default
+          - model: deepseek/deepseek-v4-pro-0813  # shadow comparison
+            role: comparison
+          - model: google/gemini-3.8-flash        # shadow comparison
+            role: comparison
+    steps:
+      - name: Checkout (contents:read)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: wave0
+
+      - name: Install shai ${{ env.SHAI_VERSION }} (pinned, fail closed)
+        run: |
+          curl -fsSL -o shai "$SHAI_URL"
+          echo "${SHAI_SHA256}  shai" | sha256sum -c - || { echo "::error::shai sha256 mismatch, refusing to run"; exit 1; }
+          chmod +x shai
+          ./shai --version </dev/null
+
+      - name: Perms check (read,ls,find only; no fetch; no --agent)
+        run: ./wave0/run-shadow.sh --self-check
+
+      - name: Collect issues (public read)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUES: ${{ inputs.issues }}
+        run: ./wave0/fetch-issues.sh > issues.jsonl
+
+      - name: Shadow label (applies nothing)
+        env:
+          # shai reads OPENROUTER_API_KEY; the secret name stays SHAI_OPENROUTER_API_KEY and is scoped to this step only.
+          OPENROUTER_API_KEY: ${{ secrets.SHAI_OPENROUTER_API_KEY }}
+          SHAI_MODEL: ${{ matrix.model }}
+        run: ./wave0/run-shadow.sh issues.jsonl wave0-label-agreement.csv
+
+      - name: Upload agreement log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: wave0-label-agreement-${{ matrix.role }}-${{ strategy.job-index }}
+          path: wave0-label-agreement.csv
+          if-no-files-found: warn
+          retention-days: 30

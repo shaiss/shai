@@ -1,0 +1,29 @@
+# Wave 0 labeler allow-list, from shaiss/print-bench labels (read-only GitHub API, 2026-10-12: 42 labels).
+# Gate / approval / process labels are deliberately EXCLUDED; a model must never propose them:
+#   approved-to-post, autonomy-ok, decision-approved, decision-rejected, signoff-override, no-auto-review,
+#   needs-decision, disposition:declined, disposition:worth-raising, groomer-report, reeve-report,
+#   agent-brief, growth-queue, coach-round-1, declined-too-big, dependencies, github_actions, python
+adoption-study
+bug
+channel:twitter
+design request
+design-brief
+documentation
+duplicate
+enhancement
+good first issue
+help wanted
+invalid
+maturity:hitl
+maturity:ideation
+maturity:mvp
+maturity:prototype
+maturity:rc
+points-1
+points-2
+points-3
+priority:high
+question
+tools
+v0
+wontfix
