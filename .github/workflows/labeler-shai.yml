@@ -69,7 +69,25 @@ jobs:
           chmod +x shai
           ./shai --version </dev/null
 
-      - name: Perms check (read,ls,find only; no fetch; no --agent)
+      - name: Write shai provider config (openrouter; no key in file)
+        env:
+          SHAI_MODEL: ${{ matrix.model }}
+        run: |
+          # shai v0.2.2 ignores SHAI_PROVIDER/SHAI_MODEL and silently falls back to anonymous OVH
+          # Qwen3-32B when no valid config file exists (shai-core/src/config/config.rs:281,298-307).
+          # tool_method must be a Rust variant name ("FunctionCall"); "auto" fails to parse -> OVH fallback.
+          XDG_CONFIG_HOME="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_CONFIG_HOME/shai"
+          umask 077
+          jq -n --arg m "$SHAI_MODEL" \
+            '{providers:[{provider:"openrouter",env_vars:{},model:$m,tool_method:"FunctionCall"}],selected_provider:0,mcp_configs:{}}' \
+            > "$XDG_CONFIG_HOME/shai/auth.config.json"
+          chmod 600 "$XDG_CONFIG_HOME/shai/auth.config.json"
+          echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"
+
+      - name: Perms check (read,ls,find only; no fetch; no --agent; resolved provider=openrouter)
+        env:
+          SHAI_MODEL: ${{ matrix.model }}
         run: ./wave0/run-shadow.sh --self-check
 
       - name: Collect issues (public read)
