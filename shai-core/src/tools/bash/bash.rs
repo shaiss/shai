@@ -53,11 +53,13 @@ impl BashTool {
         let _ = child.wait().await;
     }
 
-    /// Read stdout/stderr into a shared buffer so a timeout/cancel can still
-    /// report what was emitted before the process was killed.
+    /// Read stdout/stderr into a shared byte buffer so a timeout/cancel can
+    /// still report what was emitted before the process was killed.
+    /// Bytes are decoded once at snapshot time so multibyte UTF-8 characters
+    /// split across read chunks are not corrupted (review on #4).
     async fn drain_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         reader: R,
-        buf: Arc<Mutex<String>>,
+        buf: Arc<Mutex<Vec<u8>>>,
     ) {
         let mut reader = BufReader::new(reader);
         let mut chunk = [0u8; 8192];
@@ -65,9 +67,8 @@ impl BashTool {
             match reader.read(&mut chunk).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&chunk[..n]);
                     if let Ok(mut guard) = buf.lock() {
-                        guard.push_str(&text);
+                        guard.extend_from_slice(&chunk[..n]);
                     }
                 }
                 Err(_) => break,
@@ -75,8 +76,28 @@ impl BashTool {
         }
     }
 
-    fn snapshot(buf: &Arc<Mutex<String>>) -> String {
-        buf.lock().map(|g| g.clone()).unwrap_or_default()
+    fn snapshot(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Wait briefly for readers after kill; abort any that are still running so
+    /// we do not leak JoinHandles/pipe tasks when a descendant holds the fd.
+    async fn finish_readers(
+        stdout_task: &mut tokio::task::JoinHandle<()>,
+        stderr_task: &mut tokio::task::JoinHandle<()>,
+        wait: Duration,
+    ) {
+        let drain = async {
+            let _ = (&mut *stdout_task).await;
+            let _ = (&mut *stderr_task).await;
+        };
+        if tokio::time::timeout(wait, drain).await.is_err() {
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+        }
     }
 
     fn tail_chars(s: &str, max: usize) -> String {
@@ -90,7 +111,7 @@ impl BashTool {
 
     fn format_timeout_error(timeout_secs: u32, stdout: &str, stderr: &str) -> String {
         let mut parts = vec![format!(
-            "Command killed after {} seconds. If it legitimately needs longer, re-run with a larger `timeout` (or `timeout: 0` to disable), or run it in the background (`nohup … &`) and poll.",
+            "Command killed after {} seconds. If it legitimately needs longer, re-run with a larger `timeout` (or `timeout: 0` to disable).",
             timeout_secs
         )];
         let out = Self::tail_chars(stdout, PARTIAL_OUTPUT_TAIL_CHARS);
@@ -138,18 +159,18 @@ impl BashTool {
 
         let mut child = cmd.spawn()?;
 
-        let stdout_buf = Arc::new(Mutex::new(String::new()));
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
 
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
-        let stdout_task = {
+        let mut stdout_task = {
             let buf = stdout_buf.clone();
             tokio::spawn(async move {
                 Self::drain_pipe(stdout, buf).await;
             })
         };
-        let stderr_task = {
+        let mut stderr_task = {
             let buf = stderr_buf.clone();
             tokio::spawn(async move {
                 Self::drain_pipe(stderr, buf).await;
@@ -176,27 +197,20 @@ impl BashTool {
             wait_result = child.wait() => {
                 let exit_status = wait_result?;
                 // Process exited: wait for readers to finish draining the pipes.
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                // Still bound the wait so a leaked descendant cannot hang us forever.
+                Self::finish_readers(&mut stdout_task, &mut stderr_task, Duration::from_millis(200)).await;
                 let exit_code = exit_status.code().unwrap_or(-1);
                 Ok((Self::snapshot(&stdout_buf), Self::snapshot(&stderr_buf), exit_code))
             }
             _ = cancel_future => {
                 Self::kill_process_group(&mut child).await;
-                // Brief window for readers to observe closed pipes.
-                let _ = tokio::time::timeout(Duration::from_millis(200), async {
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
-                }).await;
+                Self::finish_readers(&mut stdout_task, &mut stderr_task, Duration::from_millis(200)).await;
                 Err("Command was cancelled by user".into())
             }
             timed_out = timeout_future => {
                 let timeout_secs = timed_out.expect("timeout_future only completes with Some");
                 Self::kill_process_group(&mut child).await;
-                let _ = tokio::time::timeout(Duration::from_millis(200), async {
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
-                }).await;
+                Self::finish_readers(&mut stdout_task, &mut stderr_task, Duration::from_millis(200)).await;
                 let stdout_output = Self::snapshot(&stdout_buf);
                 let stderr_output = Self::snapshot(&stderr_buf);
                 Err(Self::format_timeout_error(timeout_secs, &stdout_output, &stderr_output).into())

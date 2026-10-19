@@ -95,6 +95,11 @@ async fn test_timeout_keeps_partial_stdout() {
         "missing hint: {}",
         err
     );
+    assert!(
+        !err.to_lowercase().contains("nohup"),
+        "must not suggest nohup (issue #7 / review on #4): {}",
+        err
+    );
 }
 
 #[tokio::test]
@@ -172,4 +177,29 @@ fn test_resolve_timeout_helpers_exported() {
     let cfg = BashToolConfig::default();
     assert_eq!(resolve_timeout_secs(None, &cfg), Some(300));
     assert_eq!(resolve_timeout_secs(Some(0), &cfg), None);
+}
+
+#[tokio::test]
+async fn test_utf8_multibyte_not_corrupted_across_pipe_reads() {
+    let tool = BashTool::new();
+    // ~20KB of a 2-byte UTF-8 character so output spans multiple 8KB reads.
+    let params = BashToolParams {
+        command: r#"python3 -c "import sys; sys.stdout.buffer.write(b'\xc3\xa9'*12000); sys.stdout.buffer.flush()""#.to_string(),
+        timeout: Some(10),
+        working_dir: None,
+        env: HashMap::new(),
+    };
+    let result = Tool::execute(&tool, params, None).await;
+    assert!(result.is_success(), "{:?}", result);
+    if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        assert!(
+            !output.contains('\u{FFFD}'),
+            "replacement char present: corrupted UTF-8"
+        );
+        assert_eq!(output.chars().count(), 12000);
+        assert!(
+            output.chars().all(|c| c == 'é'),
+            "unexpected char in output"
+        );
+    }
 }
