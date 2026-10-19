@@ -328,6 +328,9 @@ impl AgentCore {
                     // Emit tool call finish event
                     let tool_was_denied = result.is_denied();
                     info!(target: "agent::tool_completed", call = ?tc_for_error.function.name.clone(), result = ?result);
+                    // Capture resolved name before moving `call` into ToolCallCompleted
+                    // (Cipher HOLD on #3 tip 1bcc316 — E0382 use-after-move).
+                    let resolved_tool_name = call.tool_name.clone();
                     if let Some(tx) = public_event_tx.clone() {
                         let _ = tx.send(AgentEvent::ToolCallCompleted {
                             duration: Utc::now() - start,
@@ -341,7 +344,7 @@ impl AgentCore {
                     // Emit TodoUpdated after todo_write executes. Use the resolved
                     // tool_name (not the raw LLM function name) so namespaced /
                     // harmony-suffixed aliases still refresh the TUI (Bugbot on #3).
-                    if call.tool_name == "todo_write" {
+                    if resolved_tool_name == "todo_write" {
                         let todos = todo_storage.get_all().await;
                         if let Some(tx) = public_event_tx.clone() {
                             let _ = tx.send(AgentEvent::TodoUpdated { todos });
