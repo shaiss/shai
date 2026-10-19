@@ -73,8 +73,10 @@ jobs:
         env:
           SHAI_MODEL: ${{ matrix.model }}
         run: |
-          # shai v0.2.2 ignores SHAI_PROVIDER/SHAI_MODEL and silently falls back to anonymous OVH
-          # Qwen3-32B when no valid config file exists (shai-core/src/config/config.rs:281,298-307).
+          # shai v0.2.2 ignores SHAI_PROVIDER/SHAI_MODEL *env* when no valid config file exists and
+          # silently falls back to anonymous OVH Qwen3-32B (config.rs Default + get_llm).
+          # With this file present, get_llm -> set_env_vars copies providers[].model into SHAI_MODEL,
+          # then default_model() uses that (so matrix `$SHAI_MODEL` here IS what the banner shows).
           # tool_method must be a Rust variant name ("FunctionCall"); "auto" fails to parse -> OVH fallback.
           XDG_CONFIG_HOME="$RUNNER_TEMP/xdg"
           mkdir -p "$XDG_CONFIG_HOME/shai"

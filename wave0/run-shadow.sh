@@ -27,6 +27,9 @@ self_check() {
   [[ ",$TOOLS," == *",fetch,"* ]] && { echo "perms-check: fetch must be absent" >&2; exit 1; }
   [[ -z ${OVH_KEY_WAS_SET:-} ]] || { echo "perms-check: OVH_API_KEY is set in the environment; refusing" >&2; exit 1; }
   # Provider pin (Cipher cond. 2): check what shai ACTUALLY resolves, not env vars. Fail closed.
+  # Model resolution (shai v0.2.2): ShaiConfig::get_llm loads auth.config.json, then
+  # set_env_vars() copies providers[selected].model into SHAI_MODEL, then
+  # LlmClient::default_model() returns SHAI_MODEL. The config `model` field is NOT ignored.
   local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/shai/auth.config.json" model=${SHAI_MODEL:?SHAI_MODEL required} banner
   [[ -f "$cfg" ]] || { echo "perms-check: missing $cfg" >&2; exit 1; }
   # Offline probe: dummy key, proxies pointed at a dead port so no request can leave the runner.
@@ -117,14 +120,18 @@ print(",".join(sorted(l for l in d.get("labels",[]) if l in allowed)))
 PY
 )
     attempted=$((attempted+1))
-    # shai exits 0 on LLM errors: rc=0 with LLM-error/rate-limit text on stderr is a failure, never ok.
-    if [[ $proposed != __PARSE_ERROR__ ]] && llm_error_text "$errf"; then
-      status=llm_error; proposed=""; j=","
-      echo "call-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
-    elif [[ $proposed == __PARSE_ERROR__ ]]; then
-      status=parse_error; proposed=""; j=","
-      # Job log only (never the CSV, never raw output): failure class + byte count.
-      echo "parse-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
+    # shai exits 0 on LLM errors. Only treat as llm_error when we did NOT get
+    # allow-listed labels — stderr also carries the prompt/reasoning/JSON and can
+    # contain tokens like "429"/"quota" in normal successful output (Bugbot on #1).
+    if [[ $proposed == __PARSE_ERROR__ ]] || [[ -z $proposed ]]; then
+      if llm_error_text "$errf" || llm_error_text "$outf"; then
+        status=llm_error; proposed=""; j=","
+        echo "call-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
+      else
+        status=parse_error; proposed=""; j=","
+        # Job log only (never the CSV, never raw output): failure class + byte count.
+        echo "parse-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
+      fi
     else status=ok; j=$(jaccard "$proposed" "$existing"); fi
     echo "$(date -u +%FT%TZ),$model,$num,$status,$(csv_escape "$proposed"),$(csv_escape "$existing"),${j},${lat}," >>"$out"
     rm -f "$errf" "$outf"
