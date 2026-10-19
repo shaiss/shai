@@ -216,8 +216,13 @@ async fn test_drain_truncation_keeps_utf8_char_boundary() {
     let result = Tool::execute(&tool, params, None).await;
     assert!(result.is_success(), "{:?}", result);
     if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        // Expected marker written out independently of drain_truncation_marker(),
+        // so a regression in the production formatter cannot pass this test.
+        assert_eq!(super::bash::DRAIN_BUFFER_MAX_BYTES, 65536);
+        const EXPECTED_MARKER: &str =
+            "\u{2026}[truncated: earlier output omitted, keeping last 65536 bytes]\u{2026}\n";
         let body = output
-            .strip_prefix(super::bash::drain_truncation_marker().as_str())
+            .strip_prefix(EXPECTED_MARKER)
             .expect("successful output over cap must carry the truncation marker");
         assert!(!body.contains('\u{FFFD}'), "tail started mid-character");
         assert!(body.chars().all(|c| c == '€'));

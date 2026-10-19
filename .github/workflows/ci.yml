@@ -7,6 +7,23 @@ on:
     branches: [ main ]
 
 jobs:
+  # Fork-only (shaiss/shai): offline self-tests for the Wave 0 shadow labeler.
+  # No secrets, no network, no shai binary; never runs the labeler itself.
+  wave0-selftest:
+    name: Wave 0 self-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: shellcheck run-shadow.sh
+        run: shellcheck -x wave0/run-shadow.sh
+
+      - name: All-empty alarm self-test
+        run: ./wave0/run-shadow.sh --test-all-empty-alarm
+
   build:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
