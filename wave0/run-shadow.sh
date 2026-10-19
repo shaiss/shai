@@ -81,11 +81,22 @@ check_failure_budget() { # uses attempted/failed/consec from main
   fi
 }
 
+# Issue #10: abort when too many successful parses still yield empty allow-listed labels.
+# "More than 75%" with integers: empty_ok * 4 > attempted * 3 (so 3/4 empty is OK, 4/4 fails).
+check_all_empty_alarm() { # $1=attempted $2=empty_ok → exit 1 if trip
+  local attempted=$1 empty_ok=$2
+  if (( attempted >= 4 )) && (( empty_ok * 4 > attempted * 3 )); then
+    echo "::error::all-empty alarm: ${empty_ok}/${attempted} attempts returned empty allow-listed labels (>75%); aborting"
+    return 1
+  fi
+  return 0
+}
+
 main() {
   local issues=$1 out=$2 model=${SHAI_MODEL:?SHAI_MODEL required}
   [[ -f "$out" ]] || echo "ts,model,issue,status,proposed,existing,jaccard,exact,latency_s,exit_code" >"$out"
   local allowed; allowed=$(grep -vE '^\s*(#|$)' "$ALLOWLIST" | paste -sd, -)
-  local first=1 usage0 usage1 i attempted=0 failed=0 consec=0
+  local first=1 usage0 usage1 i attempted=0 failed=0 consec=0 empty_ok=0
   usage0=$(key_usage) || { echo "::error::canary: cannot read key usage before first issue; aborting"; exit 1; }
   while IFS= read -r line; do
     local num title body existing prompt t0 rc errf outf proposed status j
@@ -132,7 +143,11 @@ PY
         # Job log only (never the CSV, never raw output): failure class + byte count.
         echo "parse-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
       fi
-    else status=ok; j=$(jaccard "$proposed" "$existing"); fi
+    else
+      status=ok; j=$(jaccard "$proposed" "$existing")
+      # Empty allow-listed list is still ok for a single issue, but count for #10 alarm.
+      [[ -z $proposed ]] && empty_ok=$((empty_ok + 1))
+    fi
     echo "$(date -u +%FT%TZ),$model,$num,$status,$(csv_escape "$proposed"),$(csv_escape "$existing"),${j},${lat}," >>"$out"
     rm -f "$errf" "$outf"
     if [[ $status == ok ]]; then consec=0; else failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; fi
@@ -150,9 +165,35 @@ PY
       echo "canary: ok (usage $usage0 -> $usage1)"
     fi
   done <"$issues"
+  check_all_empty_alarm "$attempted" "$empty_ok" || exit 1
 }
 
 if [[ "${1:-}" == "--self-check" ]]; then self_check; exit 0; fi
-[[ $# -eq 2 ]] || { echo "usage: $0 issues.jsonl out.csv | --self-check" >&2; exit 2; }
+if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
+  # Stand-in unit checks for issue #10 (no network, no key).
+  # Usage: $0 --test-all-empty-alarm
+  set +e
+  out=$(check_all_empty_alarm 4 4 2>&1); rc=$?; set -e
+  if [[ $rc -ne 1 ]] || ! grep -q 'all-empty alarm' <<<"$out"; then
+    echo "FAIL: all-empty (4/4) should abort"; exit 1
+  fi
+  set +e
+  out=$(check_all_empty_alarm 4 3 2>&1); rc=$?; set -e
+  if [[ $rc -ne 0 ]]; then echo "FAIL: 3/4 empty should be ok (not >75%)"; exit 1; fi
+  set +e
+  out=$(check_all_empty_alarm 8 5 2>&1); rc=$?; set -e
+  if [[ $rc -ne 0 ]]; then echo "FAIL: 5/8 empty (62.5%) should be ok"; exit 1; fi
+  set +e
+  out=$(check_all_empty_alarm 8 7 2>&1); rc=$?; set -e
+  if [[ $rc -ne 1 ]] || ! grep -q 'all-empty alarm' <<<"$out"; then
+    echo "FAIL: 7/8 empty should abort"; exit 1
+  fi
+  set +e
+  out=$(check_all_empty_alarm 3 3 2>&1); rc=$?; set -e
+  if [[ $rc -ne 0 ]]; then echo "FAIL: attempted<4 should not trip"; exit 1; fi
+  echo "ok: all-empty alarm stand-in tests passed"
+  exit 0
+fi
+[[ $# -eq 2 ]] || { echo "usage: $0 issues.jsonl out.csv | --self-check | --test-all-empty-alarm" >&2; exit 2; }
 self_check >/dev/null
 main "$1" "$2"
