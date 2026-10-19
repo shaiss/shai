@@ -338,8 +338,10 @@ impl AgentCore {
                         });
                     }
 
-                    // Emit TodoUpdated event after todo_write executes
-                    if tc_for_error.function.name == "todo_write" {
+                    // Emit TodoUpdated after todo_write executes. Use the resolved
+                    // tool_name (not the raw LLM function name) so namespaced /
+                    // harmony-suffixed aliases still refresh the TUI (Bugbot on #3).
+                    if call.tool_name == "todo_write" {
                         let todos = todo_storage.get_all().await;
                         if let Some(tx) = public_event_tx.clone() {
                             let _ = tx.send(AgentEvent::TodoUpdated { todos });
