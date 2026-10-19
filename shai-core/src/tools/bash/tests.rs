@@ -194,6 +194,35 @@ async fn test_drain_buffer_bounded_under_flood() {
     assert!(result.is_error(), "{:?}", result);
     let err = error_text(&result);
     assert!(err.contains("killed after"), "{}", err);
+    // Waived #9 thread: assert truncation actually happened on the flood.
+    assert!(
+        err.contains("truncated: earlier output omitted"),
+        "flood >64KiB must report truncation: {}",
+        &err[..err.len().min(300)]
+    );
+}
+
+#[tokio::test]
+async fn test_drain_truncation_keeps_utf8_char_boundary() {
+    // Waived #9 thread: 30000 x 3-byte '€' = 90000 bytes; excess (24464) is not a
+    // multiple of 3, so a naive cut would start mid-character.
+    let tool = BashTool::new();
+    let params = BashToolParams {
+        command: r#"python3 -c "import sys; sys.stdout.buffer.write('\u20ac'.encode()*30000); sys.stdout.buffer.flush()""#.to_string(),
+        timeout: Some(30),
+        working_dir: None,
+        env: HashMap::new(),
+    };
+    let result = Tool::execute(&tool, params, None).await;
+    assert!(result.is_success(), "{:?}", result);
+    if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        let body = output
+            .strip_prefix("…[truncated: earlier output omitted, keeping last 65536 bytes]…\n")
+            .expect("successful output over cap must carry the truncation marker");
+        assert!(!body.contains('\u{FFFD}'), "tail started mid-character");
+        assert!(body.chars().all(|c| c == '€'));
+        assert!(body.len() <= 64 * 1024);
+    }
 }
 
 #[tokio::test]

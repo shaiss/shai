@@ -93,7 +93,14 @@ impl BashTool {
                         // so a flood cannot exhaust memory (Cipher #6 / #11).
                         if guard.bytes.len() > DRAIN_BUFFER_MAX_BYTES {
                             let excess = guard.bytes.len() - DRAIN_BUFFER_MAX_BYTES;
-                            guard.bytes.drain(..excess);
+                            // Never start the kept tail mid-character: also drop any
+                            // UTF-8 continuation bytes (0b10xxxxxx) at the new head.
+                            let skip = guard.bytes[excess..]
+                                .iter()
+                                .take(3)
+                                .take_while(|b| (**b & 0xC0) == 0x80)
+                                .count();
+                            guard.bytes.drain(..excess + skip);
                             guard.truncated = true;
                         }
                     }
@@ -135,6 +142,19 @@ impl BashTool {
         }
     }
 
+    /// Tail for timeout errors, but keep the drain truncation marker visible
+    /// so the agent knows the head was dropped (#11).
+    fn tail_keep_marker(s: &str) -> String {
+        match s.strip_prefix(DRAIN_TRUNCATION_MARKER) {
+            Some(rest) => format!(
+                "{}{}",
+                DRAIN_TRUNCATION_MARKER,
+                Self::tail_chars(rest, PARTIAL_OUTPUT_TAIL_CHARS)
+            ),
+            None => Self::tail_chars(s, PARTIAL_OUTPUT_TAIL_CHARS),
+        }
+    }
+
     fn tail_chars(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
@@ -149,8 +169,8 @@ impl BashTool {
             "Command killed after {} seconds. If it legitimately needs longer, re-run with a larger `timeout` (capped by tools.bash.max_timeout_secs).",
             timeout_secs
         )];
-        let out = Self::tail_chars(stdout, PARTIAL_OUTPUT_TAIL_CHARS);
-        let err = Self::tail_chars(stderr, PARTIAL_OUTPUT_TAIL_CHARS);
+        let out = Self::tail_keep_marker(stdout);
+        let err = Self::tail_keep_marker(stderr);
         if !out.is_empty() {
             parts.push(format!("--- partial stdout ---\n{}", out));
         }
