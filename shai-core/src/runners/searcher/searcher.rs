@@ -8,6 +8,7 @@ use shai_llm::client::LlmClient;
 
 use crate::agent::brain::ThinkerDecision;
 use crate::agent::{Agent, AgentBuilder, AgentError, Brain, ThinkerContext};
+use crate::runners::compacter::compact_trace_if_needed;
 use crate::tools::{
     AnyTool, FetchTool, FindTool, LsTool, ReadTool, TodoReadTool, TodoStorage, TodoWriteTool,
 };
@@ -59,6 +60,13 @@ impl Brain for SearcherBrain {
         _budget: crate::agent::brain::ToolBudgetRef,
     ) -> Result<ThinkerDecision, AgentError> {
         let mut trace = context.trace.clone();
+
+        // Same session-level compaction as CoderBrain so max_trace_chars applies
+        // to searcher LLM requests (CodeRabbit on #97 / #2).
+        if context.max_trace_chars > 0 {
+            let metadata = context.tool_call_metadata.read().await.clone();
+            compact_trace_if_needed(&mut trace, context.max_trace_chars, &metadata);
+        }
 
         trace.insert(
             0,
