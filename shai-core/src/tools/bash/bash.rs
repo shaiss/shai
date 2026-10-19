@@ -12,11 +12,14 @@ use tokio_util::sync::CancellationToken;
 /// How much of the captured stdout/stderr to include in a timeout error.
 const PARTIAL_OUTPUT_TAIL_CHARS: usize = 8_000;
 /// Hard cap on captured stdout/stderr bytes in drain_pipe (keep a tail). Cipher #6.
-const DRAIN_BUFFER_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const DRAIN_BUFFER_MAX_BYTES: usize = 64 * 1024;
 /// Prefixed onto decoded output when the drain buffer dropped earlier bytes (#11).
-const DRAIN_TRUNCATION_MARKER: &str =
-    "…[truncated: earlier output omitted, keeping last 65536 bytes]…
-";
+pub(crate) fn drain_truncation_marker() -> String {
+    format!(
+        "…[truncated: earlier output omitted, keeping last {} bytes]…\n",
+        DRAIN_BUFFER_MAX_BYTES
+    )
+}
 
 struct DrainBuf {
     bytes: Vec<u8>,
@@ -117,7 +120,7 @@ impl BashTool {
         };
         let body = String::from_utf8_lossy(&guard.bytes);
         if guard.truncated {
-            format!("{}{}", DRAIN_TRUNCATION_MARKER, body)
+            format!("{}{}", drain_truncation_marker(), body)
         } else {
             body.into_owned()
         }
@@ -145,10 +148,11 @@ impl BashTool {
     /// Tail for timeout errors, but keep the drain truncation marker visible
     /// so the agent knows the head was dropped (#11).
     fn tail_keep_marker(s: &str) -> String {
-        match s.strip_prefix(DRAIN_TRUNCATION_MARKER) {
+        let marker = drain_truncation_marker();
+        match s.strip_prefix(marker.as_str()) {
             Some(rest) => format!(
                 "{}{}",
-                DRAIN_TRUNCATION_MARKER,
+                marker,
                 Self::tail_chars(rest, PARTIAL_OUTPUT_TAIL_CHARS)
             ),
             None => Self::tail_chars(s, PARTIAL_OUTPUT_TAIL_CHARS),

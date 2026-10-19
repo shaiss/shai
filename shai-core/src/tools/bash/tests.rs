@@ -217,7 +217,7 @@ async fn test_drain_truncation_keeps_utf8_char_boundary() {
     assert!(result.is_success(), "{:?}", result);
     if let crate::tools::types::ToolResult::Success { output, .. } = result {
         let body = output
-            .strip_prefix("…[truncated: earlier output omitted, keeping last 65536 bytes]…\n")
+            .strip_prefix(super::bash::drain_truncation_marker().as_str())
             .expect("successful output over cap must carry the truncation marker");
         assert!(!body.contains('\u{FFFD}'), "tail started mid-character");
         assert!(body.chars().all(|c| c == '€'));
