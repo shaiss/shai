@@ -82,21 +82,35 @@ check_failure_budget() { # uses attempted/failed/consec from main
 }
 
 # Issue #10: abort when too many successful parses still yield empty allow-listed labels.
-# "More than 75%" with integers: empty_ok * 4 > attempted * 3 (so 3/4 empty is OK, 4/4 fails).
-check_all_empty_alarm() { # $1=attempted $2=empty_ok → exit 1 if trip
-  local attempted=$1 empty_ok=$2
-  if (( attempted >= 4 )) && (( empty_ok * 4 > attempted * 3 )); then
-    echo "::error::all-empty alarm: ${empty_ok}/${attempted} attempts returned empty allow-listed labels (>75%); aborting"
+# "More than 75%" with integers: empty_rows * 4 > attempted * 3 (so 3/4 empty is OK, 4/4 fails).
+check_all_empty_alarm() { # $1=attempted $2=empty_rows → return 1 if trip
+  local attempted=$1 empty_rows=$2
+  if (( attempted >= 4 )) && (( empty_rows * 4 > attempted * 3 )); then
+    echo "::error::all-empty alarm: ${empty_rows}/${attempted} attempts returned empty allow-listed labels (>75%); aborting"
     return 1
   fi
   return 0
+}
+
+# Issue #14 L1: every finished row without allow-listed labels counts toward the alarm:
+# ok-but-empty, parse_error, llm_error and other errors (an error proposes nothing).
+tally_alarm() { # $1=status $2=proposed; updates empty_rows from the caller's scope
+  if [[ $1 != ok || -z $2 ]]; then empty_rows=$((empty_rows + 1)); fi
+}
+
+# Quota/5xx stop: no fallback (Cipher condition 3), but issue #14 L2: run the alarm
+# first so "N empty rows then a 429" is not reported green. Always exits.
+provider_stop() { # $1=status $2=issue; uses attempted/empty_rows from the caller
+  echo "::warning::$1 from provider on #$2 (${SHAI_MODEL:-?}); logged and stopping (no fallback)."
+  check_all_empty_alarm "$attempted" "$empty_rows" || exit 1
+  exit 0
 }
 
 main() {
   local issues=$1 out=$2 model=${SHAI_MODEL:?SHAI_MODEL required}
   [[ -f "$out" ]] || echo "ts,model,issue,status,proposed,existing,jaccard,exact,latency_s,exit_code" >"$out"
   local allowed; allowed=$(grep -vE '^\s*(#|$)' "$ALLOWLIST" | paste -sd, -)
-  local first=1 usage0 usage1 i attempted=0 failed=0 consec=0 empty_ok=0
+  local first=1 usage0 usage1 i attempted=0 failed=0 consec=0 empty_rows=0
   usage0=$(key_usage) || { echo "::error::canary: cannot read key usage before first issue; aborting"; exit 1; }
   while IFS= read -r line; do
     local num title body existing prompt t0 rc errf outf proposed status j
@@ -112,12 +126,10 @@ main() {
       status=$(classify_error "$(cat "$errf" "$outf")")
       # Cipher condition 4: no raw output in the CSV, only the error class and exit code.
       echo "$(date -u +%FT%TZ),$model,$num,$status,,$(csv_escape "$existing"),,,${lat},$rc" >>"$out"
-      if [[ $status == quota || $status == 5xx ]]; then
-        echo "::warning::$status from provider on #$num ($model); logged and stopping (no fallback)."
-        rm -f "$errf" "$outf"; exit 0
-      fi
       rm -f "$errf" "$outf"
-      attempted=$((attempted+1)); failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; continue
+      if [[ $status == quota || $status == 5xx ]]; then provider_stop "$status" "$num"; fi
+      attempted=$((attempted+1)); tally_alarm "$status" ""
+      failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; continue
     fi
     # Pull the last JSON object with a labels array; keep only allow-listed labels.
     proposed=$(python3 - "$outf" "$allowed" <<'PY'
@@ -145,9 +157,9 @@ PY
       fi
     else
       status=ok; j=$(jaccard "$proposed" "$existing")
-      # Empty allow-listed list is still ok for a single issue, but count for #10 alarm.
-      [[ -z $proposed ]] && empty_ok=$((empty_ok + 1))
     fi
+    # Empty allow-listed list is still ok for a single issue, but counts for the #10 alarm.
+    tally_alarm "$status" "$proposed"
     echo "$(date -u +%FT%TZ),$model,$num,$status,$(csv_escape "$proposed"),$(csv_escape "$existing"),${j},${lat}," >>"$out"
     rm -f "$errf" "$outf"
     if [[ $status == ok ]]; then consec=0; else failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; fi
@@ -165,7 +177,7 @@ PY
       echo "canary: ok (usage $usage0 -> $usage1)"
     fi
   done <"$issues"
-  check_all_empty_alarm "$attempted" "$empty_ok" || exit 1
+  check_all_empty_alarm "$attempted" "$empty_rows" || exit 1
 }
 
 if [[ "${1:-}" == "--self-check" ]]; then self_check; exit 0; fi
@@ -191,6 +203,34 @@ if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
   set +e
   out=$(check_all_empty_alarm 3 3 2>&1); rc=$?; set -e
   if [[ $rc -ne 0 ]]; then echo "FAIL: attempted<4 should not trip"; exit 1; fi
+  # Issue #14: drive the same tally_alarm/provider_stop helpers main() uses.
+  # Tokens: label=ok with labels, empty=ok with no labels, parse_error|llm_error|other, quota|5xx.
+  simulate() {
+    local attempted=0 empty_rows=0 s
+    for s in "$@"; do
+      case $s in
+        quota|5xx) provider_stop "$s" sim ;;
+        label) attempted=$((attempted+1)); tally_alarm ok bug ;;
+        empty) attempted=$((attempted+1)); tally_alarm ok "" ;;
+        *) attempted=$((attempted+1)); tally_alarm "$s" "" ;;
+      esac
+    done
+    check_all_empty_alarm "$attempted" "$empty_rows" || exit 1
+    exit 0
+  }
+  expect() { # $1=want rc, rest=rows
+    local want=$1 rc; shift
+    set +e; out=$( (simulate "$@") 2>&1 ); rc=$?; set -e
+    if [[ $rc -ne $want ]]; then echo "FAIL: [$*] expected rc=$want got rc=$rc"; exit 1; fi
+  }
+  expect 1 empty empty empty parse_error         # L1: 3 empty + 1 error of 4 aborts
+  expect 1 empty empty empty llm_error
+  expect 1 empty empty empty other
+  expect 0 label empty empty parse_error         # 3/4 without labels is not >75%
+  expect 1 empty empty empty empty empty empty empty quota   # L2: 7 empty then 429 aborts
+  expect 1 empty empty empty empty 5xx           # L2: 5xx path also runs the alarm
+  expect 0 label label label label empty quota   # healthy run then quota stays exit 0
+  expect 0 empty empty quota                     # attempted<4 before quota: no trip
   echo "ok: all-empty alarm stand-in tests passed"
   exit 0
 fi
