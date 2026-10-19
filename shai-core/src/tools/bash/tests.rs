@@ -175,7 +175,6 @@ async fn test_max_timeout_caps_huge_value() {
 #[tokio::test]
 async fn test_drain_buffer_bounded_under_flood() {
     // Cipher #6: flooding stdout must not grow the drain buffer without bound.
-    // Produce >64KiB quickly within a short timeout; tool must still return.
     let tool = BashTool::with_config(BashToolConfig {
         default_timeout_secs: 5,
         max_timeout_secs: 5,
@@ -193,9 +192,81 @@ async fn test_drain_buffer_bounded_under_flood() {
         "flood+timeout should still finish quickly"
     );
     assert!(result.is_error(), "{:?}", result);
-    // Partial output may be truncated to the tail; just ensure we got something or the kill msg.
     let err = error_text(&result);
     assert!(err.contains("killed after"), "{}", err);
+    // Waived #9 thread: assert truncation actually happened on the flood.
+    assert!(
+        err.contains("truncated: earlier output omitted"),
+        "flood >64KiB must report truncation: {}",
+        &err[..err.len().min(300)]
+    );
+}
+
+#[tokio::test]
+async fn test_drain_truncation_keeps_utf8_char_boundary() {
+    // Waived #9 thread: 30000 x 3-byte '€' = 90000 bytes; excess (24464) is not a
+    // multiple of 3, so a naive cut would start mid-character.
+    let tool = BashTool::new();
+    let params = BashToolParams {
+        command: r#"python3 -c "import sys; sys.stdout.buffer.write('\u20ac'.encode()*30000); sys.stdout.buffer.flush()""#.to_string(),
+        timeout: Some(30),
+        working_dir: None,
+        env: HashMap::new(),
+    };
+    let result = Tool::execute(&tool, params, None).await;
+    assert!(result.is_success(), "{:?}", result);
+    if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        let body = output
+            .strip_prefix("…[truncated: earlier output omitted, keeping last 65536 bytes]…\n")
+            .expect("successful output over cap must carry the truncation marker");
+        assert!(!body.contains('\u{FFFD}'), "tail started mid-character");
+        assert!(body.chars().all(|c| c == '€'));
+        assert!(body.len() <= 64 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn test_drain_truncation_marker_on_success_over_cap() {
+    // Cipher #11: successful command >64KiB must keep the tail, drop the head,
+    // and surface a clear truncation marker (not silent).
+    let tool = BashTool::new();
+    let params = BashToolParams {
+        command: r#"python3 -c "
+import sys
+head = b'HEAD_UNIQUE_MARKER'
+tail = b'TAIL_UNIQUE_MARKER'
+# 80 KiB of filler between head and tail so the 64 KiB cap must drop the head.
+sys.stdout.buffer.write(head + b'x'*(80*1024) + tail)
+sys.stdout.buffer.flush()
+""#
+        .to_string(),
+        timeout: Some(30),
+        working_dir: None,
+        env: HashMap::new(),
+    };
+    let result = Tool::execute(&tool, params, None).await;
+    assert!(result.is_success(), "{:?}", result);
+    if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        assert!(
+            output.contains("truncated: earlier output omitted"),
+            "missing truncation marker: {}",
+            &output[..output.len().min(200)]
+        );
+        assert!(
+            output.contains("TAIL_UNIQUE_MARKER"),
+            "tail of flood must be kept"
+        );
+        assert!(
+            !output.contains("HEAD_UNIQUE_MARKER"),
+            "head must have been dropped by the 64 KiB cap"
+        );
+        // Marker + at most 64KiB body (UTF-8 ASCII here) — allow small slack for marker.
+        assert!(
+            output.len() <= 64 * 1024 + 200,
+            "output should stay near the cap, got {}",
+            output.len()
+        );
+    }
 }
 
 #[test]
