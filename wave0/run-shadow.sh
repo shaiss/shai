@@ -120,10 +120,10 @@ print(",".join(sorted(l for l in d.get("labels",[]) if l in allowed)))
 PY
 )
     attempted=$((attempted+1))
-    # shai exits 0 on LLM errors. Only treat as llm_error when we did NOT get
-    # allow-listed labels — stderr also carries the prompt/reasoning/JSON and can
-    # contain tokens like "429"/"quota" in normal successful output (Bugbot on #1).
-    if [[ $proposed == __PARSE_ERROR__ ]] || [[ -z $proposed ]]; then
+    # shai exits 0 on LLM errors. Only treat as llm_error/parse_error when JSON
+    # parse failed (__PARSE_ERROR__). An empty allow-listed label list after a
+    # successful parse is still status=ok (Bugbot: empty labels ≠ call failure).
+    if [[ $proposed == __PARSE_ERROR__ ]]; then
       if llm_error_text "$errf" || llm_error_text "$outf"; then
         status=llm_error; proposed=""; j=","
         echo "call-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
