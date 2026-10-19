@@ -45,7 +45,7 @@ impl SearcherBrain {
             .llm
             .chat(request)
             .await
-            .map_err(|e| AgentError::LlmError(e.to_string()))?;
+            .map_err(|e| AgentError::LlmError(shai_llm::describe_llm_error(&e.to_string())))?;
 
         Ok(response.choices[0].message.clone())
     }
