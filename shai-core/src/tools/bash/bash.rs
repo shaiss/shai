@@ -13,6 +13,24 @@ use tokio_util::sync::CancellationToken;
 const PARTIAL_OUTPUT_TAIL_CHARS: usize = 8_000;
 /// Hard cap on captured stdout/stderr bytes in drain_pipe (keep a tail). Cipher #6.
 const DRAIN_BUFFER_MAX_BYTES: usize = 64 * 1024;
+/// Prefixed onto decoded output when the drain buffer dropped earlier bytes (#11).
+const DRAIN_TRUNCATION_MARKER: &str =
+    "…[truncated: earlier output omitted, keeping last 65536 bytes]…
+";
+
+struct DrainBuf {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl DrainBuf {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+}
 
 pub struct BashTool {
     config: BashToolConfig,
@@ -61,7 +79,7 @@ impl BashTool {
     /// split across read chunks are not corrupted (review on #4).
     async fn drain_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         reader: R,
-        buf: Arc<Mutex<Vec<u8>>>,
+        buf: Arc<Mutex<DrainBuf>>,
     ) {
         let mut reader = BufReader::new(reader);
         let mut chunk = [0u8; 8192];
@@ -70,12 +88,13 @@ impl BashTool {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut guard) = buf.lock() {
-                        guard.extend_from_slice(&chunk[..n]);
+                        guard.bytes.extend_from_slice(&chunk[..n]);
                         // Bound growth: keep only the trailing DRAIN_BUFFER_MAX_BYTES
-                        // so a flood cannot exhaust memory (Cipher #6).
-                        if guard.len() > DRAIN_BUFFER_MAX_BYTES {
-                            let excess = guard.len() - DRAIN_BUFFER_MAX_BYTES;
-                            guard.drain(..excess);
+                        // so a flood cannot exhaust memory (Cipher #6 / #11).
+                        if guard.bytes.len() > DRAIN_BUFFER_MAX_BYTES {
+                            let excess = guard.bytes.len() - DRAIN_BUFFER_MAX_BYTES;
+                            guard.bytes.drain(..excess);
+                            guard.truncated = true;
                         }
                     }
                 }
@@ -84,9 +103,17 @@ impl BashTool {
         }
     }
 
-    fn snapshot(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-        let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
-        String::from_utf8_lossy(&bytes).into_owned()
+    fn snapshot(buf: &Arc<Mutex<DrainBuf>>) -> String {
+        let guard = match buf.lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        let body = String::from_utf8_lossy(&guard.bytes);
+        if guard.truncated {
+            format!("{}{}", DRAIN_TRUNCATION_MARKER, body)
+        } else {
+            body.into_owned()
+        }
     }
 
     /// Wait briefly for readers after kill; abort any that are still running so
@@ -167,8 +194,8 @@ impl BashTool {
 
         let mut child = cmd.spawn()?;
 
-        let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stdout_buf = Arc::new(Mutex::new(DrainBuf::new()));
+        let stderr_buf = Arc::new(Mutex::new(DrainBuf::new()));
 
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
