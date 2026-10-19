@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shadow-run shai as a labeler. Appends rows to the agreement CSV. Never applies labels.
-# On quota (429/402/credit limit) or a 5xx error: log the row and exit 0 (Cipher condition 3: no fallback).
+# On a transient quota (429) or 5xx error: log the row and exit 0 (Cipher condition 3: no fallback).
+# Out of credits (HTTP 402 / insufficient credits): log the row and exit 1 so the job goes red.
 set -euo pipefail
 # Cipher: OVH_API_KEY must never be set (shai's anonymous-OVH path would send it). Record, then drop it.
 OVH_KEY_WAS_SET=${OVH_API_KEY+1}
@@ -53,8 +54,13 @@ u=a|b; print(f"{(len(a&b)/len(u) if u else 1.0):.3f},{int(a==b)}")
 PY
 }
 
-classify_error() { # stderr text -> quota|5xx|other
-  if grep -qiE '(^|[^0-9])(429|402)([^0-9]|$)|rate.?limit|quota|insufficient (credits|funds)|credit limit' <<<"$1"; then echo quota
+classify_error() { # stderr text -> credits|quota|5xx|other
+  # Order matters: an explicit 402 is out of credits; 429/rate-limit text is transient even when
+  # it mentions credits (OpenRouter: "Rate limit exceeded ... Add 10 credits to unlock ...").
+  if grep -qiE '(^|[^0-9])402([^0-9]|$)' <<<"$1"; then echo credits
+  elif grep -qiE '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' <<<"$1"; then echo quota
+  elif grep -qiE 'requires more credits|insufficient (credits|funds)|credit limit' <<<"$1"; then echo credits
+  elif grep -qiE 'quota' <<<"$1"; then echo quota
   elif grep -qiE '(^|[^0-9])5[0-9]{2}([^0-9]|$)|bad gateway|service unavailable|gateway timeout' <<<"$1"; then echo 5xx
   else echo other; fi
 }
@@ -66,7 +72,7 @@ key_usage() { # prints OpenRouter key usage; key goes to curl via stdin config, 
 
 usage_increased() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[2])>float(sys.argv[1]) else 1)' "$1" "$2"; }
 
-llm_error_text() { grep -qiE 'LLM error|rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|quota' "$1"; }
+llm_error_text() { grep -qiE 'LLM error|rate.?limit|too many requests|(^|[^0-9])(429|402)([^0-9]|$)|quota|requires more credits' "$1"; }
 
 failure_type() { # $1 stdout file, $2 stderr file -> empty|ratelimit_text|no_json. Never echoes content.
   if grep -qiE 'rate.?limit|too many requests|(^|[^0-9])429([^0-9]|$)|quota' "$1" "$2"; then echo ratelimit_text
@@ -98,13 +104,23 @@ tally_alarm() { # $1=status $2=proposed; updates empty_rows from the caller's sc
   if [[ $1 != ok || -z $2 ]]; then empty_rows=$((empty_rows + 1)); fi
 }
 
-# Quota/5xx stop: no fallback (Cipher condition 3), but issue #14 L2: run the alarm
-# first so "N empty rows then a 429" is not reported green. Always exits.
-provider_stop() { # $1=status $2=issue; uses attempted/empty_rows from the caller
+# Provider stop: no fallback (Cipher condition 3). Issue #14 L2: run the alarm first in
+# every path so "N empty rows then a 429" is not reported green. Always exits.
+# credits (402, out of money) exits 1: the account needs a top-up, so the job must go red.
+# quota (429) / 5xx are transient: exit 0 with a warning unless the alarm trips.
+provider_stop() { # $1=credits|quota|5xx $2=issue; uses attempted/empty_rows from the caller
+  local alarm=0
+  check_all_empty_alarm "$attempted" "$empty_rows" || alarm=1
+  if [[ $1 == credits ]]; then
+    echo "::error::out of credits (HTTP 402) from provider on #$2 (${SHAI_MODEL:-?}); logged and stopping (no fallback). Top up the OpenRouter account."
+    exit 1
+  fi
   echo "::warning::$1 from provider on #$2 (${SHAI_MODEL:-?}); logged and stopping (no fallback)."
-  check_all_empty_alarm "$attempted" "$empty_rows" || exit 1
+  (( alarm == 0 )) || exit 1
   exit 0
 }
+
+is_provider_stop() { [[ $1 == credits || $1 == quota || $1 == 5xx ]]; }
 
 main() {
   local issues=$1 out=$2 model=${SHAI_MODEL:?SHAI_MODEL required}
@@ -127,7 +143,7 @@ main() {
       # Cipher condition 4: no raw output in the CSV, only the error class and exit code.
       echo "$(date -u +%FT%TZ),$model,$num,$status,,$(csv_escape "$existing"),,,${lat},$rc" >>"$out"
       rm -f "$errf" "$outf"
-      if [[ $status == quota || $status == 5xx ]]; then provider_stop "$status" "$num"; fi
+      if is_provider_stop "$status"; then provider_stop "$status" "$num"; fi
       attempted=$((attempted+1)); tally_alarm "$status" ""
       failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; continue
     fi
@@ -148,6 +164,14 @@ PY
     # successful parse is still status=ok (Bugbot: empty labels ≠ call failure).
     if [[ $proposed == __PARSE_ERROR__ ]]; then
       if llm_error_text "$errf" || llm_error_text "$outf"; then
+        # shai v0.2.2 exits 0 on provider errors, so classify them here too (labeler run
+        # 39319608521: an rc=0 HTTP 402 was logged as llm_error and only the canary caught it).
+        local pstatus; pstatus=$(classify_error "$(cat "$errf" "$outf")")
+        if is_provider_stop "$pstatus"; then
+          echo "$(date -u +%FT%TZ),$model,$num,$pstatus,,$(csv_escape "$existing"),,,${lat},0" >>"$out"
+          rm -f "$errf" "$outf"; attempted=$((attempted-1))   # not an attempt, same as the rc != 0 path
+          provider_stop "$pstatus" "$num"
+        fi
         status=llm_error; proposed=""; j=","
         echo "call-failure: issue=#$num model=$model type=$(failure_type "$outf" "$errf") stdout_bytes=$(wc -c <"$outf") stderr_bytes=$(wc -c <"$errf")" >&2
       else
@@ -181,6 +205,43 @@ PY
 }
 
 if [[ "${1:-}" == "--self-check" ]]; then self_check; exit 0; fi
+# Offline replay of real provider errors through main(), for --test-all-empty-alarm.
+# A fake shai prints a recorded stderr and exits with a chosen code; key usage is read from a
+# file:// URL with a dummy key. No network, no real key, no shai binary.
+test_provider_errors_replay() {
+  local d; d=$(mktemp -d)
+  cat >"$d/fake-shai" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+cat "$FAKE_STDERR" >&2
+exit "${FAKE_RC:-0}"
+SH
+  chmod +x "$d/fake-shai"
+  echo '{"data":{"usage":1.0}}' >"$d/key.json"
+  echo '{"number":859,"title":"t","body":"b","labels":["bug"]}' >"$d/issues.jsonl"
+  # Sanitised from labeler run 39319608521 (google/gemini-3.8-flash on OpenRouter).
+  printf '%s\n' '● Error: LLM error: 402: {"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 5598.","code":402,"metadata":{"limit_source":"openrouter_credits"}}}' >"$d/e402"
+  printf '%s\n' '● Error: LLM error: 429: {"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429}}' >"$d/e429"
+  replay() { # $1=stderr fixture $2=fake rc $3=want exit $4=want CSV status $5=want log text
+    local rc log row
+    rm -f "$d/out.csv"
+    set +e
+    log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
+              OPENROUTER_KEY_URL="file://$d/key.json" FAKE_STDERR="$d/$1" FAKE_RC="$2"
+            main "$d/issues.jsonl" "$d/out.csv") 2>&1 ); rc=$?
+    set -e
+    row=$(sed -n 2p "$d/out.csv" | cut -d, -f4)
+    if [[ $rc -ne $3 || $row != "$4" ]] || ! grep -q -- "$5" <<<"$log"; then
+      echo "FAIL: replay $1 rc=$2 -> exit $rc status '$row' (want exit $3 status '$4' log '$5')"; exit 1
+    fi
+  }
+  replay e402 0 1 credits '::error::out of credits'   # shai exit 0 + 402: credits row, red job
+  replay e429 0 0 quota   '::warning::quota'          # shai exit 0 + 429: existing quota stop
+  replay e402 1 1 credits '::error::out of credits'   # nonzero exit + 402: same
+  replay e429 1 0 quota   '::warning::quota'          # nonzero exit + 429: unchanged
+  rm -rf "$d"
+}
+
 if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
   # Stand-in unit checks for issue #10 (no network, no key).
   # Usage: $0 --test-all-empty-alarm
@@ -204,12 +265,12 @@ if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
   out=$(check_all_empty_alarm 3 3 2>&1); rc=$?; set -e
   if [[ $rc -ne 0 ]]; then echo "FAIL: attempted<4 should not trip"; exit 1; fi
   # Issue #14: drive the same tally_alarm/provider_stop helpers main() uses.
-  # Tokens: label=ok with labels, empty=ok with no labels, parse_error|llm_error|other, quota|5xx.
+  # Tokens: label=ok with labels, empty=ok with no labels, parse_error|llm_error|other, credits|quota|5xx.
   simulate() {
     local attempted=0 empty_rows=0 s
     for s in "$@"; do
       case $s in
-        quota|5xx) provider_stop "$s" sim ;;
+        credits|quota|5xx) provider_stop "$s" sim ;;
         label) attempted=$((attempted+1)); tally_alarm ok bug ;;
         empty) attempted=$((attempted+1)); tally_alarm ok "" ;;
         *) attempted=$((attempted+1)); tally_alarm "$s" "" ;;
@@ -231,6 +292,17 @@ if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
   expect 1 empty empty empty empty 5xx           # L2: 5xx path also runs the alarm
   expect 0 label label label label empty quota   # healthy run then quota stays exit 0
   expect 0 empty empty quota                     # attempted<4 before quota: no trip
+  expect 1 credits                               # 402 out of credits is always red
+  expect 1 label label label label credits       # ...even after a healthy run
+  set +e; out=$( (simulate empty empty empty empty empty empty empty credits) 2>&1 ); set -e
+  if ! grep -q 'all-empty alarm' <<<"$out"; then echo "FAIL: alarm must run before the credits stop"; exit 1; fi
+  for c in "LLM error: 402: requires more credits:credits" "LLM error: 429: Rate limit exceeded. Add 10 credits to unlock:quota" \
+           "LLM error: 503 Service Unavailable:5xx" "insufficient credits:credits" "LLM error: boom:other" \
+           "LLM error: 402: Payment Required:credits" "LLM error: 429: credit limit for free models:quota"; do
+    got=$(classify_error "${c%:*}")
+    if [[ $got != "${c##*:}" ]]; then echo "FAIL: classify_error '${c%:*}' -> $got, want ${c##*:}"; exit 1; fi
+  done
+  test_provider_errors_replay
   echo "ok: all-empty alarm stand-in tests passed"
   exit 0
 fi
