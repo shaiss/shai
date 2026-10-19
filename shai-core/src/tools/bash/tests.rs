@@ -35,9 +35,7 @@ async fn test_bash_tool_execution() {
     let tool = BashTool::new();
     let params = BashToolParams {
         command: "echo hello".to_string(),
-        // Explicit 0 so this unit test is not subject to the 300s default
-        // (still finishes instantly either way).
-        timeout: Some(0),
+        timeout: Some(30),
         working_dir: None,
         env: HashMap::new(),
     };
@@ -49,7 +47,7 @@ async fn test_bash_tool_execution() {
         let metadata = metadata.unwrap();
         assert_eq!(metadata["exit_code"], json!(0));
         assert_eq!(metadata["success"], json!(true));
-        assert_eq!(metadata["timeout"], json!("none"));
+        assert_eq!(metadata["timeout"], json!(30));
     } else {
         panic!("Expected success result");
     }
@@ -59,7 +57,6 @@ async fn test_bash_tool_execution() {
 async fn test_timeout_keeps_partial_stdout() {
     let tool = BashTool::new();
     let params = BashToolParams {
-        // Print something, flush, then sleep past the 1s timeout.
         command: "echo PARTIAL_MARKER; sleep 5".to_string(),
         timeout: Some(1),
         working_dir: None,
@@ -91,20 +88,24 @@ async fn test_timeout_keeps_partial_stdout() {
         err
     );
     assert!(
-        err.contains("re-run with a larger `timeout`") || err.contains("timeout: 0"),
+        err.contains("re-run with a larger `timeout`"),
         "missing hint: {}",
         err
     );
     assert!(
         !err.to_lowercase().contains("nohup"),
-        "must not suggest nohup (issue #7 / review on #4): {}",
+        "must not suggest nohup (issue #7): {}",
+        err
+    );
+    assert!(
+        !err.contains("timeout: 0"),
+        "must not tell the model to pass timeout:0 (#5): {}",
         err
     );
 }
 
 #[tokio::test]
 async fn test_omitted_timeout_uses_default_from_config() {
-    // Tiny default so the test is fast; omit params.timeout.
     let tool = BashTool::with_config(BashToolConfig {
         default_timeout_secs: 1,
         max_timeout_secs: 1800,
@@ -123,28 +124,28 @@ async fn test_omitted_timeout_uses_default_from_config() {
 }
 
 #[tokio::test]
-async fn test_timeout_zero_disables_limit() {
+async fn test_model_timeout_zero_uses_default_not_unlimited() {
+    // Cipher #5: model passing timeout:0 must not disable the hang fix.
     let tool = BashTool::with_config(BashToolConfig {
         default_timeout_secs: 1,
         max_timeout_secs: 1800,
     });
     let params = BashToolParams {
-        // Would hit the 1s default if 0 did not opt out.
-        command: "sleep 2; echo SURVIVED".to_string(),
+        command: "echo ZERO_IGNORED; sleep 5".to_string(),
         timeout: Some(0),
         working_dir: None,
         env: HashMap::new(),
     };
+    let started = Instant::now();
     let result = Tool::execute(&tool, params, None).await;
     assert!(
-        result.is_success(),
-        "timeout 0 should disable limit: {:?}",
-        result
+        started.elapsed().as_secs() < 4,
+        "timeout:0 from model must not run unlimited"
     );
-    if let crate::tools::types::ToolResult::Success { output, metadata } = result {
-        assert!(output.contains("SURVIVED"));
-        assert_eq!(metadata.unwrap()["timeout"], json!("none"));
-    }
+    assert!(result.is_error(), "{:?}", result);
+    let err = error_text(&result);
+    assert!(err.contains("killed after 1"), "{}", err);
+    assert!(err.contains("ZERO_IGNORED"), "{}", err);
 }
 
 #[tokio::test]
@@ -166,26 +167,59 @@ async fn test_max_timeout_caps_huge_value() {
     let err = error_text(&result);
     assert!(err.contains("killed after 1"), "{}", err);
     assert!(err.contains("CAPPED"), "{}", err);
-    // Effective timeout recorded in metadata
     if let crate::tools::types::ToolResult::Error { metadata, .. } = result {
         assert_eq!(metadata.unwrap()["timeout"], json!(1));
     }
+}
+
+#[tokio::test]
+async fn test_drain_buffer_bounded_under_flood() {
+    // Cipher #6: flooding stdout must not grow the drain buffer without bound.
+    // Produce >64KiB quickly within a short timeout; tool must still return.
+    let tool = BashTool::with_config(BashToolConfig {
+        default_timeout_secs: 5,
+        max_timeout_secs: 5,
+    });
+    let params = BashToolParams {
+        command: r#"python3 -c "import sys; sys.stdout.buffer.write(b'x'*200000); sys.stdout.buffer.flush(); import time; time.sleep(5)""#.to_string(),
+        timeout: Some(1),
+        working_dir: None,
+        env: HashMap::new(),
+    };
+    let started = Instant::now();
+    let result = Tool::execute(&tool, params, None).await;
+    assert!(
+        started.elapsed().as_secs() < 4,
+        "flood+timeout should still finish quickly"
+    );
+    assert!(result.is_error(), "{:?}", result);
+    // Partial output may be truncated to the tail; just ensure we got something or the kill msg.
+    let err = error_text(&result);
+    assert!(err.contains("killed after"), "{}", err);
 }
 
 #[test]
 fn test_resolve_timeout_helpers_exported() {
     let cfg = BashToolConfig::default();
     assert_eq!(resolve_timeout_secs(None, &cfg), Some(300));
-    assert_eq!(resolve_timeout_secs(Some(0), &cfg), None);
+    assert_eq!(resolve_timeout_secs(Some(0), &cfg), Some(300));
 }
 
 #[tokio::test]
-async fn test_utf8_multibyte_not_corrupted_across_pipe_reads() {
+async fn test_utf8_multibyte_split_across_8kb_boundary() {
+    // Cipher #8: force a 3-byte UTF-8 codepoint (€ = e2 82 ac) to straddle the
+    // 8192-byte read boundary so per-chunk decoding would corrupt it.
     let tool = BashTool::new();
-    // ~20KB of a 2-byte UTF-8 character so output spans multiple 8KB reads.
     let params = BashToolParams {
-        command: r#"python3 -c "import sys; sys.stdout.buffer.write(b'\xc3\xa9'*12000); sys.stdout.buffer.flush()""#.to_string(),
-        timeout: Some(10),
+        command: r#"python3 -c "
+import sys
+# 8191 ASCII bytes fill the first read leaving 1 byte free; then a 3-byte euro
+# starts in that last byte and finishes in the next read.
+sys.stdout.buffer.write(b'a'*8191 + '\u20ac'.encode('utf-8')*2000)
+sys.stdout.buffer.flush()
+""#
+        .to_string(),
+        timeout: Some(15),
         working_dir: None,
         env: HashMap::new(),
     };
@@ -194,12 +228,11 @@ async fn test_utf8_multibyte_not_corrupted_across_pipe_reads() {
     if let crate::tools::types::ToolResult::Success { output, .. } = result {
         assert!(
             !output.contains('\u{FFFD}'),
-            "replacement char present: corrupted UTF-8"
+            "replacement char present: corrupted UTF-8 across chunk boundary"
         );
-        assert_eq!(output.chars().count(), 12000);
-        assert!(
-            output.chars().all(|c| c == 'é'),
-            "unexpected char in output"
-        );
+        assert!(output.starts_with(&"a".repeat(8191)));
+        let euros: String = output.chars().skip(8191).collect();
+        assert_eq!(euros.chars().count(), 2000);
+        assert!(euros.chars().all(|c| c == '€'), "unexpected char after pad");
     }
 }

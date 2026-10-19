@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 /// How much of the captured stdout/stderr to include in a timeout error.
 const PARTIAL_OUTPUT_TAIL_CHARS: usize = 8_000;
+/// Hard cap on captured stdout/stderr bytes in drain_pipe (keep a tail). Cipher #6.
+const DRAIN_BUFFER_MAX_BYTES: usize = 64 * 1024;
 
 pub struct BashTool {
     config: BashToolConfig,
@@ -69,6 +71,12 @@ impl BashTool {
                 Ok(n) => {
                     if let Ok(mut guard) = buf.lock() {
                         guard.extend_from_slice(&chunk[..n]);
+                        // Bound growth: keep only the trailing DRAIN_BUFFER_MAX_BYTES
+                        // so a flood cannot exhaust memory (Cipher #6).
+                        if guard.len() > DRAIN_BUFFER_MAX_BYTES {
+                            let excess = guard.len() - DRAIN_BUFFER_MAX_BYTES;
+                            guard.drain(..excess);
+                        }
                     }
                 }
                 Err(_) => break,
@@ -111,7 +119,7 @@ impl BashTool {
 
     fn format_timeout_error(timeout_secs: u32, stdout: &str, stderr: &str) -> String {
         let mut parts = vec![format!(
-            "Command killed after {} seconds. If it legitimately needs longer, re-run with a larger `timeout` (or `timeout: 0` to disable).",
+            "Command killed after {} seconds. If it legitimately needs longer, re-run with a larger `timeout` (capped by tools.bash.max_timeout_secs).",
             timeout_secs
         )];
         let out = Self::tail_chars(stdout, PARTIAL_OUTPUT_TAIL_CHARS);
@@ -230,7 +238,7 @@ SECURITY WARNING:
 Timeouts:
 - Default timeout is 300 seconds when `timeout` is omitted (configurable via agent `tools.bash.default_timeout_secs`).
 - Pass `timeout` (seconds) to override; values above `tools.bash.max_timeout_secs` (default 1800) are capped.
-- Pass `timeout: 0` to disable the timeout for a long-running command.
+- `timeout: 0` is ignored (uses the agent default). Unlimited runs are operator-config only (`tools.bash.default_timeout_secs = 0`).
 - On timeout the process is killed and any partial stdout/stderr captured so far is returned.
 
 Development Workflow:

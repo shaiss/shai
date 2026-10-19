@@ -5,11 +5,13 @@ use std::collections::HashMap;
 /// Per-agent bash tool limits. Nested under `AgentConfig.tools.bash`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BashToolConfig {
-    /// Applied when the tool call omits `timeout`. `0` disables the default
-    /// (no limit unless the call sets one). Default: 300 seconds.
+    /// Applied when the tool call omits `timeout` (or when the model passes
+    /// `0`, which is ignored — unlimited is operator-config only). Set to `0`
+    /// here to disable the default timeout for this agent. Default: 300.
     #[serde(default = "default_bash_default_timeout_secs")]
     pub default_timeout_secs: u32,
-    /// Hard cap on any requested timeout (including the default). Default: 1800.
+    /// Hard cap on any model-requested timeout (including the default).
+    /// Default: 1800. `0` means no cap (operator only).
     #[serde(default = "default_bash_max_timeout_secs")]
     pub max_timeout_secs: u32,
 }
@@ -35,8 +37,10 @@ fn default_bash_max_timeout_secs() -> u32 {
 pub struct BashToolParams {
     /// The bash command to execute
     pub command: String,
-    /// Timeout in seconds. Omit to use the agent default (300s). Pass `0` for
-    /// no timeout. Values above the agent max (default 1800s) are capped.
+    /// Timeout in seconds. Omit to use the agent default (300s). Values are
+    /// capped by `tools.bash.max_timeout_secs` (default 1800). `0` is **not**
+    /// unlimited — it is ignored and the agent default applies (unlimited is
+    /// operator-config only via `tools.bash.default_timeout_secs = 0`).
     pub timeout: Option<u32>,
     /// Working directory for command execution (optional)
     pub working_dir: Option<String>,
@@ -47,19 +51,19 @@ pub struct BashToolParams {
 
 /// Resolve the effective timeout for a bash call.
 ///
-/// - `params_timeout == Some(0)` → no limit (explicit opt-out)
-/// - `params_timeout == Some(n)` → `min(n, max)`, or no limit if `max == 0`
-/// - `params_timeout == None` → default (or no limit if default is 0), then capped
+/// - `params_timeout == Some(0)` → **ignored** (model cannot opt out); treat as omit
+/// - `params_timeout == Some(n)` → `min(n, max)` (or uncapped if operator max is 0)
+/// - `params_timeout == None` → default; `default_timeout_secs == 0` → no limit (operator)
 pub fn resolve_timeout_secs(params_timeout: Option<u32>, config: &BashToolConfig) -> Option<u32> {
     let requested = match params_timeout {
-        Some(0) => return None,
-        Some(n) => n,
-        None => {
+        // Cipher #5: model-facing `timeout: 0` must not disable the hang fix.
+        Some(0) | None => {
             if config.default_timeout_secs == 0 {
                 return None;
             }
             config.default_timeout_secs
         }
+        Some(n) => n,
     };
     if config.max_timeout_secs == 0 {
         Some(requested)
@@ -84,9 +88,14 @@ mod resolve_tests {
     }
 
     #[test]
-    fn zero_opts_out() {
+    fn model_zero_uses_default_not_unlimited() {
         let cfg = BashToolConfig::default();
-        assert_eq!(resolve_timeout_secs(Some(0), &cfg), None);
+        assert_eq!(resolve_timeout_secs(Some(0), &cfg), Some(300));
+        let cfg = BashToolConfig {
+            default_timeout_secs: 60,
+            max_timeout_secs: 1800,
+        };
+        assert_eq!(resolve_timeout_secs(Some(0), &cfg), Some(60));
     }
 
     #[test]
@@ -97,12 +106,15 @@ mod resolve_tests {
     }
 
     #[test]
-    fn default_zero_means_unlimited_when_omitted() {
+    fn operator_default_zero_means_unlimited_when_omitted() {
         let cfg = BashToolConfig {
             default_timeout_secs: 0,
             max_timeout_secs: 1800,
         };
         assert_eq!(resolve_timeout_secs(None, &cfg), None);
+        // Model still cannot pass 0 to mean unlimited when operator default is 0:
+        // Some(0) is treated as omit → still None (operator unlimited).
+        assert_eq!(resolve_timeout_secs(Some(0), &cfg), None);
         assert_eq!(resolve_timeout_secs(Some(10), &cfg), Some(10));
     }
 }
