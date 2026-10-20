@@ -209,7 +209,10 @@ impl LlmClient {
             "ollama" => {
                 let base_url = Self::get_or_env(env_values, "OLLAMA_BASE_URL")
                     .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
-                Ok(Self::ollama(base_url))
+                let api_key = Self::get_or_env(env_values, "OLLAMA_API_KEY");
+                Ok(Self {
+                    provider: Box::new(OllamaProvider::with_api_key(Some(base_url), api_key)),
+                })
             }
             "mistral" => {
                 let api_key = Self::get_or_env(env_values, "MISTRAL_API_KEY")
