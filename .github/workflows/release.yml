@@ -6,6 +6,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build for ${{ matrix.os }}
@@ -39,9 +43,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          targets: ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -49,16 +53,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools
 
-      - name: Add musl target (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: rustup target add x86_64-unknown-linux-musl
-
       # No actions/cache: tag/release builds must not restore main-scope caches.
       # A poisoned cache entry (registry, git deps, or target/) could otherwise
       # be restored into a release job and ship into published artifacts.
 
       - name: Build binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
 
       - name: Prepare binary (Unix)
         if: matrix.os != 'windows-latest'
@@ -93,7 +95,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # required to upload release assets via gh
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
