@@ -21,6 +21,9 @@ use shai_core::{
 
 use super::theme::ThemePalette;
 
+/// Columns moved per Left/Right key press in the preview.
+const H_SCROLL_STEP: usize = 4;
+
 pub enum PermissionModalAction {
     Nope,
     Response {
@@ -38,6 +41,7 @@ pub struct PermissionWidget<'a> {
     selected_index: usize,
     preview_text: Text<'a>,
     scroll_offset: usize,
+    h_scroll_offset: usize,
     scroll_state: ScrollbarState,
     palette: ThemePalette,
 }
@@ -68,6 +72,7 @@ impl PermissionWidget<'_> {
             remaining_perms: total,
             preview_text,
             scroll_offset: 0,
+            h_scroll_offset: 0,
             scroll_state: ScrollbarState::new(content_length),
             palette,
         }
@@ -96,6 +101,22 @@ impl PermissionWidget<'_> {
             self.scroll_offset += 1;
             self.scroll_state = self.scroll_state.position(self.scroll_offset);
         }
+    }
+
+    pub fn scroll_left(&mut self) {
+        self.h_scroll_offset = self.h_scroll_offset.saturating_sub(H_SCROLL_STEP);
+    }
+
+    pub fn scroll_right(&mut self) {
+        let max_width = self
+            .preview_text
+            .lines
+            .iter()
+            .map(|line| line.width())
+            .max()
+            .unwrap_or(0);
+        let max_scroll = max_width.saturating_sub(1);
+        self.h_scroll_offset = (self.h_scroll_offset + H_SCROLL_STEP).min(max_scroll);
     }
 
     pub fn get_selected(&self) -> PermissionResponse {
@@ -129,6 +150,16 @@ impl PermissionWidget<'_> {
                 for _ in 0..5 {
                     self.scroll_down();
                 }
+                PermissionModalAction::Nope
+            }
+            KeyCode::Left => {
+                // Scroll preview left
+                self.scroll_left();
+                PermissionModalAction::Nope
+            }
+            KeyCode::Right => {
+                // Scroll preview right
+                self.scroll_right();
                 PermissionModalAction::Nope
             }
             KeyCode::Enter => {
@@ -211,8 +242,8 @@ impl PermissionWidget<'_> {
         f.render_widget(block, tool);
 
         // Render scrollable paragraph with colors
-        let paragraph =
-            Paragraph::new(self.preview_text.clone()).scroll((self.scroll_offset as u16, 0));
+        let paragraph = Paragraph::new(self.preview_text.clone())
+            .scroll((self.scroll_offset as u16, self.h_scroll_offset as u16));
         f.render_widget(paragraph, inner);
 
         // Render scrollbar if content is longer than area
@@ -240,5 +271,83 @@ impl PermissionWidget<'_> {
         let text = Text::from(lines);
         let p = Paragraph::new(text);
         f.render_widget(p, modal);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn make_widget(preview: &str) -> PermissionWidget<'static> {
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            operation: "run command".to_string(),
+            call: ToolCall {
+                tool_call_id: "test-id".to_string(),
+                tool_name: "bash".to_string(),
+                parameters: serde_json::json!({"command": "echo"}),
+            },
+            preview: None,
+        };
+        let mut widget = PermissionWidget::new(
+            "req-1".to_string(),
+            request,
+            1,
+            super::super::theme::Theme::Dark.palette(),
+        );
+        widget.preview_text = Text::from(preview.to_string());
+        widget
+    }
+
+    fn press(widget: &mut PermissionWidget, code: KeyCode) {
+        let action = widget.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
+        assert!(matches!(action, PermissionModalAction::Nope));
+    }
+
+    fn render(widget: &PermissionWidget) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
+        terminal.draw(|f| widget.draw(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn left_right_scroll_preview_horizontally() {
+        let mut widget = make_widget("0123456789abcdefghij");
+        assert_eq!(widget.h_scroll_offset, 0);
+
+        press(&mut widget, KeyCode::Left);
+        assert_eq!(widget.h_scroll_offset, 0, "cannot scroll before column 0");
+
+        press(&mut widget, KeyCode::Right);
+        assert_eq!(widget.h_scroll_offset, H_SCROLL_STEP);
+
+        for _ in 0..20 {
+            press(&mut widget, KeyCode::Right);
+        }
+        assert_eq!(widget.h_scroll_offset, 19, "stops at the last column");
+
+        press(&mut widget, KeyCode::Left);
+        assert_eq!(widget.h_scroll_offset, 19 - H_SCROLL_STEP);
+    }
+
+    #[test]
+    fn horizontal_scroll_reveals_cut_off_text() {
+        let mut widget = make_widget("0123456789abcdefghijKLMNOPQRST");
+        assert!(render(&widget).contains("0123"));
+        assert!(!render(&widget).contains("QRST"));
+
+        for _ in 0..4 {
+            press(&mut widget, KeyCode::Right);
+        }
+        let screen = render(&widget);
+        assert!(screen.contains("ghijKLMN"));
+        assert!(!screen.contains("0123"));
     }
 }
