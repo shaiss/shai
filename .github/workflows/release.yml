@@ -4,10 +4,18 @@ on:
   release:
     types: [created]
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -30,12 +38,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -43,54 +53,63 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools
 
-      - name: Add musl target (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
+      # No actions/cache: tag/release builds must not restore main-scope caches.
+      # A poisoned cache entry (registry, git deps, or target/) could otherwise
+      # be restored into a release job and ship into published artifacts.
 
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
 
       - name: Prepare binary (Unix)
         if: matrix.os != 'windows-latest'
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+          ASSET: ${{ matrix.asset_name }}
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
-          strip ${{ matrix.asset_name }}
+          cp "target/${TARGET}/release/${BINARY_NAME}" "$ASSET"
+          strip "$ASSET"
+          shasum -a 256 "$ASSET"
 
       - name: Prepare binary (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
-
-      - name: Upload binary to release
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+          ASSET: ${{ matrix.asset_name }}
+        run: |
+          cp "target/${TARGET}/release/${BINARY_NAME}" "$ASSET"
+          shasum -a 256 "$ASSET"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ${{ matrix.asset_name }}
-          asset_name: ${{ matrix.asset_name }}
-          asset_content_type: application/octet-stream
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to upload release assets via gh
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+          path: .
+
+      - name: Upload assets and SHA256SUMS to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          sha256sum shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64
+          gh release upload -R "$GITHUB_REPOSITORY" "$TAG" \
+            shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64
+          sha256sum shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64 > SHA256SUMS
+          gh release upload -R "$GITHUB_REPOSITORY" "$TAG" SHA256SUMS --clobber
