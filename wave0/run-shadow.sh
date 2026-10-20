@@ -72,6 +72,20 @@ key_usage() { # prints OpenRouter key usage; key goes to curl via stdin config, 
 
 usage_increased() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[2])>float(sys.argv[1]) else 1)' "$1" "$2"; }
 
+# Canary deadline. OpenRouter settles a request's cost a little after it finishes, and the
+# key usage it reports can lag further (observed 16-26 s, once more than 30 s), so poll until
+# a deadline rather than for a fixed few tries. Still fails hard if usage never moves.
+CANARY_WAIT_S=${CANARY_WAIT_S:-120}
+CANARY_POLL_S=${CANARY_POLL_S:-10}
+
+# Best-effort OpenRouter generation id (the response `id`, "gen-...") from shai's output, for
+# looking a call up on OpenRouter later. Prints "unavailable" when shai did not print one
+# (shai v0.2.2 does not). Only the id is extracted; nothing else from the output is logged.
+gen_id_of() {
+  local g; g=$(grep -ohE '(^|[^0-9A-Za-z_-])gen-[0-9A-Za-z-]{6,120}' "$@" 2>/dev/null | tail -n1 | grep -oE 'gen-[0-9A-Za-z-]+' || true)
+  printf '%s' "${g:-unavailable}"
+}
+
 llm_error_text() { grep -qiE 'LLM error|rate.?limit|too many requests|(^|[^0-9])(429|402)([^0-9]|$)|quota|requires more credits' "$1"; }
 
 failure_type() { # $1 stdout file, $2 stderr file -> empty|ratelimit_text|no_json. Never echoes content.
@@ -138,6 +152,7 @@ main() {
     printf '%s' "$prompt" | timeout 300 "$SHAI_BIN" --tools "$TOOLS" --temperature 0 >"$outf" 2>"$errf"
     rc=$?; set -e
     local lat=$(( $(date +%s) - t0 )); proposed=""
+    echo "call: issue=#$num model=$model rc=$rc latency_s=$lat gen_id=$(gen_id_of "$errf" "$outf")"
     if [[ $rc -ne 0 ]]; then
       status=$(classify_error "$(cat "$errf" "$outf")")
       # Cipher condition 4: no raw output in the CSV, only the error class and exit code.
@@ -188,17 +203,21 @@ PY
     rm -f "$errf" "$outf"
     if [[ $status == ok ]]; then consec=0; else failed=$((failed+1)); consec=$((consec+1)); check_failure_budget; fi
     if (( first )); then # canary: the first call must bill this key, else shai is not using it
-      first=0; usage1=""
-      for i in 1 2 3 4 5 6; do
-        usage1=$(key_usage) || usage1=""
+      first=0; usage1=""; i=0
+      local c0 cnow; c0=$(date +%s)
+      while :; do
+        i=$((i+1)); usage1=$(key_usage) || usage1=""
         [[ -n $usage1 ]] && usage_increased "$usage0" "$usage1" && break
-        sleep 5
+        cnow=$(date +%s)
+        (( cnow - c0 >= CANARY_WAIT_S )) && break
+        sleep "$CANARY_POLL_S"
       done
+      cnow=$(date +%s)
       if [[ -z $usage1 ]] || ! usage_increased "$usage0" "$usage1"; then
-        echo "::error::canary: key usage did not increase after issue #$num ($usage0 -> ${usage1:-?}, try $i); aborting"
+        echo "::error::canary: key usage did not increase after issue #$num ($usage0 -> ${usage1:-?}, elapsed $((cnow - c0))s of ${CANARY_WAIT_S}s, poll $i); aborting"
         exit 1
       fi
-      echo "canary: ok (usage $usage0 -> $usage1)"
+      echo "canary: ok (usage $usage0 -> $usage1, elapsed $((cnow - c0))s, poll $i)"
     fi
   done <"$issues"
   check_all_empty_alarm "$attempted" "$empty_rows" || exit 1
@@ -213,7 +232,13 @@ test_provider_errors_replay() {
   cat >"$d/fake-shai" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
-cat "$FAKE_STDERR" >&2
+# Slow-settling counter: bump key usage FAKE_BUMP_AFTER seconds after the call returns.
+if [[ -n ${FAKE_BUMP_AFTER:-} ]]; then
+  nohup bash -c 'sleep "$1"; printf "%s\n" "{\"data\":{\"usage\":1.5}}" >"$2.tmp" && mv "$2.tmp" "$2"' _ \
+    "$FAKE_BUMP_AFTER" "$FAKE_KEY_FILE" >/dev/null 2>&1 &
+fi
+[[ -z ${FAKE_STDOUT:-} ]] || cat "$FAKE_STDOUT"
+[[ -z ${FAKE_STDERR:-} ]] || cat "$FAKE_STDERR" >&2
 exit "${FAKE_RC:-0}"
 SH
   chmod +x "$d/fake-shai"
@@ -239,7 +264,35 @@ SH
   replay e429 0 0 quota   '::warning::quota'          # shai exit 0 + 429: existing quota stop
   replay e402 1 1 credits '::error::out of credits'   # nonzero exit + 402: same
   replay e429 1 0 quota   '::warning::quota'          # nonzero exit + 429: unchanged
+  test_canary_deadline "$d"
   rm -rf "$d"
+}
+
+# Canary deadline: a successful call, then key usage that settles late, never, or too late.
+test_canary_deadline() { # $1=scratch dir from test_provider_errors_replay
+  local d=$1
+  printf '%s\n' '{"labels":["bug"],"reason":"r"}' >"$d/ok.out"
+  printf '%s\n' 'id: gen-1729000000-AbCdEf012345' >"$d/gen.err"
+  : >"$d/none.err"
+  canary() { # $1=bump after (s, "" = never) $2=wait s $3=want exit $4=want log text $5=stderr fixture
+    local rc log
+    rm -f "$d/out.csv"; echo '{"data":{"usage":1.0}}' >"$d/key.json"
+    set +e
+    log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
+              OPENROUTER_KEY_URL="file://$d/key.json" FAKE_KEY_FILE="$d/key.json" FAKE_BUMP_AFTER="$1" \
+              FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S=1
+            main "$d/issues.jsonl" "$d/out.csv") 2>&1 ); rc=$?
+    set -e
+    if [[ $rc -ne $3 ]] || ! grep -q -- "$4" <<<"$log" || grep -q 'offline-dummy' <<<"$log"; then
+      echo "FAIL: canary bump=${1:-never} wait=$2 -> exit $rc (want exit $3 log '$4')"; exit 1
+    fi
+    sleep 1   # let a late bump finish before the next case rewrites key.json
+  }
+  canary 3 10 0 'canary: ok (usage 1.0 -> 1.5, elapsed '  gen.err   # slow settle (3 s) passes
+  canary 3 10 0 'gen_id=gen-1729000000-AbCdEf012345'      gen.err   # generation id logged
+  canary 0 10 0 'gen_id=unavailable'                      none.err  # no id printed: say so
+  canary "" 3 1 '::error::canary: key usage did not increase after issue #859 (1.0 -> 1.0, elapsed ' none.err  # never moves: red
+  canary 6 2 1 'elapsed [0-9]*s of 2s'                    none.err  # settles after the deadline: red
 }
 
 if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
