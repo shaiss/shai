@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
     Frame,
 };
-use shai_core::config::config::ShaiConfig;
+use shai_core::config::config::{ProviderConfig, ShaiConfig};
 use std::io;
 
 use super::auth::NavAction;
@@ -48,6 +48,38 @@ impl ModalConfig {
 
     fn is_add_provider_selected(&self) -> bool {
         self.selected_index == self.config.providers.len()
+    }
+}
+
+/// Host (and port) of `url`, without scheme, credentials, path or query.
+fn url_host(url: &str) -> Option<&str> {
+    let url = url.trim();
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// List label for a configured provider. The host of its `*_BASE_URL`, when set, is
+/// appended so that entries of the same provider and model can be told apart.
+/// Nothing derived from API keys is ever shown.
+fn provider_label(provider_config: &ProviderConfig) -> String {
+    let mut base_urls: Vec<_> = provider_config
+        .env_vars
+        .iter()
+        .filter(|(name, _)| name.ends_with("_BASE_URL"))
+        .collect();
+    base_urls.sort();
+    let host = base_urls.into_iter().find_map(|(_, url)| url_host(url));
+
+    match host {
+        Some(host) => format!(
+            "{} - {} @ {}",
+            provider_config.provider, provider_config.model, host
+        ),
+        None => format!("{} - {}", provider_config.provider, provider_config.model),
     }
 }
 
@@ -163,8 +195,10 @@ impl ModalConfig {
                 ""
             };
             let line = format!(
-                "{}{} - {}{}",
-                prefix, provider_config.provider, provider_config.model, selected_indicator
+                "{}{}{}",
+                prefix,
+                provider_label(provider_config),
+                selected_indicator
             );
 
             if i == self.selected_index {
@@ -285,6 +319,73 @@ mod tests {
 
         assert!(matches!(action, NavAction::Next));
         assert_eq!(modal.error_message, None);
+    }
+
+    fn provider(name: &str, model: &str, env: &[(&str, &str)]) -> ProviderConfig {
+        ProviderConfig {
+            provider: name.to_string(),
+            env_vars: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            model: model.to_string(),
+            tool_method: shai_llm::ToolCallMethod::FunctionCall,
+        }
+    }
+
+    #[test]
+    fn url_host_strips_scheme_credentials_path_and_query() {
+        assert_eq!(
+            url_host("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+            Some("oai.endpoints.kepler.ai.cloud.ovh.net")
+        );
+        assert_eq!(
+            url_host("http://localhost:11434/v1"),
+            Some("localhost:11434")
+        );
+        assert_eq!(
+            url_host("https://user:secret@proxy.example.com/v1?key=abc"),
+            Some("proxy.example.com")
+        );
+        assert_eq!(url_host("example.com/v1"), Some("example.com"));
+        assert_eq!(url_host("  "), None);
+        assert_eq!(url_host("https:///v1"), None);
+    }
+
+    #[test]
+    fn provider_label_appends_base_url_host_only() {
+        let anonymous = provider(
+            "ovhcloud",
+            "Qwen3-32B",
+            &[(
+                "OVH_BASE_URL",
+                "https://qwen-3-32b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat/v1",
+            )],
+        );
+        let with_key = provider(
+            "ovhcloud",
+            "Qwen3-32B",
+            &[
+                ("OVH_API_KEY", "sk-very-secret-key"),
+                (
+                    "OVH_BASE_URL",
+                    "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+                ),
+            ],
+        );
+        let no_url = provider("openai", "gpt-4o", &[("OPENAI_API_KEY", "sk-other")]);
+
+        assert_eq!(
+            provider_label(&anonymous),
+            "ovhcloud - Qwen3-32B @ qwen-3-32b.endpoints.kepler.ai.cloud.ovh.net"
+        );
+        assert_eq!(
+            provider_label(&with_key),
+            "ovhcloud - Qwen3-32B @ oai.endpoints.kepler.ai.cloud.ovh.net"
+        );
+        assert_eq!(provider_label(&no_url), "openai - gpt-4o");
+        assert!(!provider_label(&with_key).contains("sk-"));
+        assert!(!provider_label(&no_url).contains("sk-"));
     }
 
     #[test]
