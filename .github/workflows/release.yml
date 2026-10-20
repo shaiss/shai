@@ -35,6 +35,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -92,7 +94,8 @@ jobs:
       - name: Upload binary to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset_name }}"
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload -R "$GITHUB_REPOSITORY" "$TAG" "${{ matrix.asset_name }}"
 
   checksums:
     name: Publish SHA256SUMS
@@ -104,7 +107,8 @@ jobs:
       - name: Download assets and upload SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          gh release download "${{ github.event.release.tag_name }}" --pattern 'shai-*'
-          sha256sum shai-* > SHA256SUMS
-          gh release upload "${{ github.event.release.tag_name }}" SHA256SUMS
+          gh release download -R "$GITHUB_REPOSITORY" "$TAG" --pattern 'shai-*'
+          sha256sum shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64 > SHA256SUMS
+          gh release upload -R "$GITHUB_REPOSITORY" "$TAG" SHA256SUMS --clobber
