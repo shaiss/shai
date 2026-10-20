@@ -210,7 +210,8 @@ PY
         [[ -n $usage1 ]] && usage_increased "$usage0" "$usage1" && break
         cnow=$(date +%s)
         (( cnow - c0 >= CANARY_WAIT_S )) && break
-        sleep "$CANARY_POLL_S"
+        # Never sleep past the deadline, so the last poll lands on it.
+        sleep $(( CANARY_POLL_S < CANARY_WAIT_S - (cnow - c0) ? CANARY_POLL_S : CANARY_WAIT_S - (cnow - c0) ))
       done
       cnow=$(date +%s)
       if [[ -z $usage1 ]] || ! usage_increased "$usage0" "$usage1"; then
@@ -275,14 +276,14 @@ test_canary_deadline() { # $1=scratch dir from test_provider_errors_replay
   printf '%s\n' '{"labels":["bug"],"reason":"r"}' >"$d/ok.out"
   printf '%s\n' 'id: gen-1729000000-AbCdEf012345' >"$d/gen.err"
   : >"$d/none.err"
-  canary() { # $1=bump after (s, "" = never) $2=wait s $3=want exit $4=want log text $5=stderr fixture
+  canary() { # $1=bump after (s, "" = never) $2=wait s $3=want exit $4=want log text $5=stderr fixture [$6=poll s]
     local rc log
     rm -f "$d/out.csv"; echo '{"data":{"usage":1.0}}' >"$d/key.json"
     set +e
     # shellcheck disable=SC2030,SC2031  # exports are meant to stay inside this subshell
     log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
               OPENROUTER_KEY_URL="file://$d/key.json" FAKE_KEY_FILE="$d/key.json" FAKE_BUMP_AFTER="$1" \
-              FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S=1
+              FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S="${6:-1}"
             main "$d/issues.jsonl" "$d/out.csv") 2>&1 ); rc=$?
     set -e
     if [[ $rc -ne $3 ]] || ! grep -q -- "$4" <<<"$log" || grep -q 'offline-dummy' <<<"$log"; then
@@ -295,6 +296,7 @@ test_canary_deadline() { # $1=scratch dir from test_provider_errors_replay
   canary 0 10 0 'gen_id=unavailable'                      none.err  # no id printed: say so
   canary "" 3 1 '::error::canary: key usage did not increase after issue #859 (1.0 -> 1.0, elapsed ' none.err  # never moves: red
   canary 6 2 1 'elapsed [0-9]*s of 2s'                    none.err  # settles after the deadline: red
+  canary 4 2 1 'elapsed 2s of 2s, poll 2'                 none.err 10  # poll > wait: sleep clamps to the deadline
 }
 
 if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
