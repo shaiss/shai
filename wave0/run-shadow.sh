@@ -251,6 +251,7 @@ SH
     local rc log row
     rm -f "$d/out.csv"
     set +e
+    # shellcheck disable=SC2030,SC2031  # exports are meant to stay inside this subshell
     log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
               OPENROUTER_KEY_URL="file://$d/key.json" FAKE_STDERR="$d/$1" FAKE_RC="$2"
             main "$d/issues.jsonl" "$d/out.csv") 2>&1 ); rc=$?
@@ -278,6 +279,7 @@ test_canary_deadline() { # $1=scratch dir from test_provider_errors_replay
     local rc log
     rm -f "$d/out.csv"; echo '{"data":{"usage":1.0}}' >"$d/key.json"
     set +e
+    # shellcheck disable=SC2030,SC2031  # exports are meant to stay inside this subshell
     log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
               OPENROUTER_KEY_URL="file://$d/key.json" FAKE_KEY_FILE="$d/key.json" FAKE_BUMP_AFTER="$1" \
               FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S=1
