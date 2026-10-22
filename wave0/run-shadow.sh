@@ -75,14 +75,28 @@ usage_increased() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[2])>flo
 # Canary deadline. OpenRouter settles a request's cost a little after it finishes, and the
 # key usage it reports can lag further (observed 16-26 s, once more than 30 s), so poll until
 # a deadline rather than for a fixed few tries. Still fails hard if usage never moves.
-CANARY_WAIT_S=${CANARY_WAIT_S:-120}
-CANARY_POLL_S=${CANARY_POLL_S:-10}
+# Unset -> default; set but empty/invalid -> main() refuses before any call (fail closed).
+CANARY_WAIT_S=${CANARY_WAIT_S-120}
+CANARY_POLL_S=${CANARY_POLL_S-10}
 
-# Best-effort OpenRouter generation id (the response `id`, "gen-...") from shai's output, for
-# looking a call up on OpenRouter later. Prints "unavailable" when shai did not print one
-# (shai v0.2.2 does not). Only the id is extracted; nothing else from the output is logged.
+check_canary_secs() { # $1=name $2=value: whole seconds, 1..3600, no sign/decimals/leading zero
+  if [[ ! $2 =~ ^[1-9][0-9]{0,3}$ ]] || (( $2 > 3600 )); then
+    echo "::error::$1 must be a whole number of seconds from 1 to 3600 (got '$2'); refusing to run"
+    exit 1
+  fi
+}
+
+# Best-effort OpenRouter generation id (the response `id`) from shai's output, for looking a
+# call up on OpenRouter later. Prints "unavailable" when shai did not print one (shai v0.2.2
+# does not). Only the id is extracted; nothing else from the output is logged.
+# Shape: OpenRouter's GET /api/v1/generation reference gives the id pattern ^gen-[0-9A-Za-z-]+$
+# (max 128) with example "gen-3bhGkxlo4XFrqiabUM7NDtwDzWwG"; live responses use
+# "gen-<10-digit unix time>-<alphanumerics>". Accept exactly those two forms as a whole token:
+#   gen-<10 digits>-<16..40 alnum>   or   gen-<20..64 alnum>
+GEN_ID_RE='gen-([0-9]{10}-[0-9A-Za-z]{16,40}|[0-9A-Za-z]{20,64})'
 gen_id_of() {
-  local g; g=$(grep -ohE '(^|[^0-9A-Za-z_-])gen-[0-9A-Za-z-]{6,120}' "$@" 2>/dev/null | tail -n1 | grep -oE 'gen-[0-9A-Za-z-]+' || true)
+  local g; g=$(grep -ohE "(^|[^0-9A-Za-z_-])${GEN_ID_RE}([^0-9A-Za-z_-]|\$)" "$@" 2>/dev/null \
+    | tail -n1 | grep -oE "$GEN_ID_RE" || true)
   printf '%s' "${g:-unavailable}"
 }
 
@@ -138,6 +152,7 @@ is_provider_stop() { [[ $1 == credits || $1 == quota || $1 == 5xx ]]; }
 
 main() {
   local issues=$1 out=$2 model=${SHAI_MODEL:?SHAI_MODEL required}
+  check_canary_secs CANARY_WAIT_S "$CANARY_WAIT_S"; check_canary_secs CANARY_POLL_S "$CANARY_POLL_S"
   [[ -f "$out" ]] || echo "ts,model,issue,status,proposed,existing,jaccard,exact,latency_s,exit_code" >"$out"
   local allowed; allowed=$(grep -vE '^\s*(#|$)' "$ALLOWLIST" | paste -sd, -)
   local first=1 usage0 usage1 i attempted=0 failed=0 consec=0 empty_rows=0
@@ -274,29 +289,47 @@ SH
 test_canary_deadline() { # $1=scratch dir from test_provider_errors_replay
   local d=$1
   printf '%s\n' '{"labels":["bug"],"reason":"r"}' >"$d/ok.out"
-  printf '%s\n' 'id: gen-1729000000-AbCdEf012345' >"$d/gen.err"
+  printf '%s\n' 'id: gen-1729000000-AbCdEfGhIjKlMnOpQrSt' >"$d/gen.err"        # live-response form
+  printf '%s\n' 'id: gen-3bhGkxlo4XFrqiabUM7NDtwDzWwG' >"$d/gendoc.err"          # API-reference example
+  printf '%s\n' 'see gen-ai-toolkit-v2, xgen-1729000000-AbCdEfGhIjKlMnOpQrSt, gen-1234567890, gen-1729000000-AbCdEfGhIjKlMnOpQrSt_x' >"$d/lookalike.err"
+  local n=0 log=""
   : >"$d/none.err"
   canary() { # $1=bump after (s, "" = never) $2=wait s $3=want exit $4=want log text $5=stderr fixture [$6=poll s]
-    local rc log
-    rm -f "$d/out.csv"; echo '{"data":{"usage":1.0}}' >"$d/key.json"
+    local rc k
+    # A fresh key file per case: a late bump left over from an earlier case writes to that
+    # case's file and can never satisfy this one.
+    n=$((n+1)); k="$d/key.$n.json"
+    rm -f "$d/out.csv"; echo '{"data":{"usage":1.0}}' >"$k"
     set +e
     # shellcheck disable=SC2030,SC2031  # exports are meant to stay inside this subshell
     log=$( (export SHAI_BIN="$d/fake-shai" SHAI_MODEL=test/model OPENROUTER_API_KEY=offline-dummy \
-              OPENROUTER_KEY_URL="file://$d/key.json" FAKE_KEY_FILE="$d/key.json" FAKE_BUMP_AFTER="$1" \
-              FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S="${6:-1}"
+              OPENROUTER_KEY_URL="file://$k" FAKE_KEY_FILE="$k" FAKE_BUMP_AFTER="$1" \
+              FAKE_STDOUT="$d/ok.out" FAKE_STDERR="$d/$5" FAKE_RC=0 CANARY_WAIT_S="$2" CANARY_POLL_S="${6-1}"
             main "$d/issues.jsonl" "$d/out.csv") 2>&1 ); rc=$?
     set -e
     if [[ $rc -ne $3 ]] || ! grep -q -- "$4" <<<"$log" || grep -q 'offline-dummy' <<<"$log"; then
       echo "FAIL: canary bump=${1:-never} wait=$2 -> exit $rc (want exit $3 log '$4')"; exit 1
     fi
-    sleep 1   # let a late bump finish before the next case rewrites key.json
   }
   canary 3 10 0 'canary: ok (usage 1.0 -> 1.5, elapsed '  gen.err   # slow settle (3 s) passes
-  canary 3 10 0 'gen_id=gen-1729000000-AbCdEf012345'      gen.err   # generation id logged
+  canary 3 10 0 'gen_id=gen-1729000000-AbCdEfGhIjKlMnOpQrSt' gen.err    # generation id logged
+  canary 0 10 0 'gen_id=gen-3bhGkxlo4XFrqiabUM7NDtwDzWwG'  gendoc.err  # API-reference id form
+  canary 0 10 0 'gen_id=unavailable'                      lookalike.err  # look-alikes rejected
   canary 0 10 0 'gen_id=unavailable'                      none.err  # no id printed: say so
   canary "" 3 1 '::error::canary: key usage did not increase after issue #859 (1.0 -> 1.0, elapsed ' none.err  # never moves: red
   canary 6 2 1 'elapsed [0-9]*s of 2s'                    none.err  # settles after the deadline: red
   canary 4 2 1 'elapsed 2s of 2s, poll 2'                 none.err 10  # poll > wait: sleep clamps to the deadline
+  # Invalid timing values fail closed before any call (no "call:" line, no CSV data row).
+  local v name
+  for name in CANARY_WAIT_S CANARY_POLL_S; do
+    for v in 0 -5 "" abc 1.5 010 3601; do
+      if [[ $name == CANARY_WAIT_S ]]; then canary 0 "$v" 1 "::error::CANARY_WAIT_S must be a whole number" none.err
+      else canary 0 5 1 "::error::CANARY_POLL_S must be a whole number" none.err "$v"; fi
+      if grep -q '^call:' <<<"$log" || [[ -e $d/out.csv ]]; then
+        echo "FAIL: $name='$v' must refuse before any call"; exit 1
+      fi
+    done
+  done
 }
 
 if [[ "${1:-}" == "--test-all-empty-alarm" ]]; then
