@@ -256,8 +256,20 @@ impl PermissionWidget<'_> {
             .border_style(Style::default().fg(self.palette.border));
 
         let inner = block.inner(tool);
-        self.preview_width.set(inner.width);
-        if self.max_line_width() > inner.width as usize {
+        // The vertical scrollbar takes the rightmost column, so text gets one column less.
+        // It is only drawn with room for a track between its two arrows (height > 2).
+        let show_scrollbar =
+            self.preview_text.lines.len() > inner.height as usize && inner.height > 2;
+        let text_area = if show_scrollbar {
+            Rect {
+                width: inner.width.saturating_sub(1),
+                ..inner
+            }
+        } else {
+            inner
+        };
+        self.preview_width.set(text_area.width);
+        if self.max_line_width() > text_area.width as usize {
             block = block.title_bottom(
                 Line::from(" ←/→ scroll ")
                     .right_aligned()
@@ -270,10 +282,10 @@ impl PermissionWidget<'_> {
         let h_offset = self.h_scroll_offset.min(self.max_h_scroll());
         let paragraph = Paragraph::new(self.preview_text.clone())
             .scroll((self.scroll_offset as u16, h_offset as u16));
-        f.render_widget(paragraph, inner);
+        f.render_widget(paragraph, text_area);
 
         // Render scrollbar if content is longer than area
-        if self.preview_text.lines.len() > inner.height as usize {
+        if show_scrollbar {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(Style::default().fg(self.palette.border));
             f.render_stateful_widget(scrollbar, inner, &mut self.scroll_state.clone());
@@ -324,6 +336,7 @@ mod tests {
             super::super::theme::Theme::Dark.palette(),
         );
         widget.preview_text = Text::from(preview.to_string());
+        widget.scroll_state = ScrollbarState::new(widget.preview_text.lines.len());
         widget
     }
 
@@ -333,7 +346,11 @@ mod tests {
     }
 
     fn render(widget: &PermissionWidget) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
+        render_sized(widget, 24, 12)
+    }
+
+    fn render_sized(widget: &PermissionWidget, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| widget.draw(f, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
         buffer
@@ -395,6 +412,24 @@ mod tests {
         let screen = render(&widget);
         assert!(screen.contains("efghijKLMNOPQRST"));
         assert!(!screen.contains("0123"));
+    }
+
+    #[test]
+    fn last_column_visible_when_vertical_scrollbar_is_shown() {
+        // Ten lines in a four-line pane (24x14 terminal), so the vertical
+        // scrollbar takes the rightmost of the 16 columns and text gets 15.
+        let mut widget = make_widget("0123456789abcdefghiZ\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+        let screen = render_sized(&widget, 24, 14);
+        assert!(screen.contains('▲'), "scrollbar is drawn: {screen:?}");
+        for _ in 0..10 {
+            press(&mut widget, KeyCode::Right);
+        }
+        assert_eq!(widget.h_scroll_offset, 20 - 15);
+        let screen = render_sized(&widget, 24, 14);
+        assert!(
+            screen.contains("56789abcdefghiZ▲"),
+            "last character sits just left of the scrollbar: {screen:?}"
+        );
     }
 
     #[test]
