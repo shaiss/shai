@@ -191,6 +191,11 @@ impl Brain for CoderBrain {
         let message = brain_decision.choices.into_iter().next().unwrap().message;
         if let ChatMessage::Assistant { tool_calls, .. } = &message {
             if tool_calls.as_ref().is_none_or(|calls| calls.is_empty()) {
+                // A turn with neither tool calls nor any text would pause the
+                // agent with nothing on screen: the user sees it "just stop".
+                if let Some(err) = empty_response_error(&message) {
+                    return Err(err);
+                }
                 return Ok(match token_usage {
                     Some((input_tokens, output_tokens, cached_tokens)) => {
                         ThinkerDecision::agent_pause_with_tokens(
@@ -218,6 +223,37 @@ impl Brain for CoderBrain {
     }
 }
 
+/// Error for an assistant turn that carries no tool call, no text and no
+/// reasoning. Small local models do this when stuck; without an error the agent
+/// pauses silently (ovh/shai issue 101, "gets into a loop and quits").
+/// Returns `None` when the message has something to show or is not an assistant turn.
+pub(crate) fn empty_response_error(message: &ChatMessage) -> Option<AgentError> {
+    let ChatMessage::Assistant {
+        content,
+        reasoning_content,
+        tool_calls,
+        ..
+    } = message
+    else {
+        return None;
+    };
+    if tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+        return None;
+    }
+    let content_empty = content.as_ref().is_none_or(|c| match c {
+        ChatMessageContent::Text(t) => t.trim().is_empty(),
+        _ => false,
+    });
+    let reasoning_empty = reasoning_content
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty());
+    (content_empty && reasoning_empty).then(|| {
+        AgentError::InvalidResponse(
+            "the model returned an empty response (no answer and no tool call), so the agent stopped. Send another message to continue, or try a different model.".to_string(),
+        )
+    })
+}
+
 /// Coder agent factory — returns AgentCore directly so callers can configure working_dir.
 pub fn coder(llm: Arc<LlmClient>, model: String) -> AgentCore {
     let fs_log = Arc::new(crate::tools::FsOperationLog::new());
@@ -227,4 +263,53 @@ pub fn coder(llm: Arc<LlmClient>, model: String) -> AgentCore {
         .tools(tools)
         .set_todo_storage(todo_storage)
         .build()
+}
+
+#[cfg(test)]
+mod empty_response_tests {
+    use super::*;
+    use openai_dive::v1::resources::chat::{Function, ToolCall};
+
+    fn assistant(
+        content: Option<&str>,
+        reasoning: Option<&str>,
+        tool_calls: Option<Vec<ToolCall>>,
+    ) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: content.map(|c| ChatMessageContent::Text(c.to_string())),
+            reasoning: None,
+            reasoning_content: reasoning.map(String::from),
+            refusal: None,
+            name: None,
+            audio: None,
+            tool_calls,
+        }
+    }
+
+    #[test]
+    fn empty_turn_is_an_error_the_user_can_see() {
+        for msg in [
+            assistant(None, None, None),
+            assistant(Some(""), None, None),
+            assistant(Some("  \n\t"), Some(" "), Some(vec![])),
+        ] {
+            let err = empty_response_error(&msg).expect("empty turn must be reported");
+            assert!(err.to_string().contains("empty response"), "{err}");
+        }
+    }
+
+    #[test]
+    fn turns_with_text_reasoning_or_tool_calls_pass() {
+        let call = ToolCall {
+            id: "1".into(),
+            r#type: "function".into(),
+            function: Function {
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        assert!(empty_response_error(&assistant(Some("done"), None, None)).is_none());
+        assert!(empty_response_error(&assistant(None, Some("thinking"), None)).is_none());
+        assert!(empty_response_error(&assistant(None, None, Some(vec![call]))).is_none());
+    }
 }
