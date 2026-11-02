@@ -94,6 +94,10 @@ impl ReadTool {
     /// listed `.github/workflows/`, then read the bare `codecov-upload.yml`).
     /// Bounded in depth and entries so a huge tree cannot stall a failed read.
     fn suggest_paths(root: &Path, missing: &Path) -> Vec<String> {
+        Self::suggest_paths_bounded(root, missing, SUGGEST_MAX_ENTRIES)
+    }
+
+    fn suggest_paths_bounded(root: &Path, missing: &Path, max_entries: usize) -> Vec<String> {
         let Some(wanted) = missing.file_name() else {
             return Vec::new();
         };
@@ -102,16 +106,21 @@ impl ReadTool {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((root.to_path_buf(), 0usize));
         while let Some((dir, depth)) = queue.pop_front() {
+            if visited >= max_entries {
+                break;
+            }
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
-            let mut entries: Vec<_> = entries.flatten().collect();
+            // Never hold more than the remaining entry budget in memory, so a
+            // single huge directory cannot defeat SUGGEST_MAX_ENTRIES.
+            let mut entries: Vec<_> = entries
+                .flatten()
+                .take(max_entries.saturating_sub(visited))
+                .collect();
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 visited += 1;
-                if visited > SUGGEST_MAX_ENTRIES {
-                    return found;
-                }
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
@@ -459,6 +468,20 @@ mod tests {
         assert_eq!(found.len(), SUGGEST_MAX_RESULTS);
         assert!(ReadTool::suggest_paths(dir.path(), Path::new("nope.txt")).is_empty());
         assert!(ReadTool::suggest_paths(dir.path(), Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn test_suggest_paths_enforces_entry_budget_inside_one_directory() {
+        // The match sorts after 50 decoys; a budget of 10 must stop before reaching it.
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..50 {
+            fs::write(dir.path().join(format!("a{i:02}.txt")), "x").unwrap();
+        }
+        fs::write(dir.path().join("zz-target.txt"), "x").unwrap();
+        let tight = ReadTool::suggest_paths_bounded(dir.path(), Path::new("zz-target.txt"), 10);
+        assert!(tight.is_empty(), "budget ignored: {tight:?}");
+        let roomy = ReadTool::suggest_paths_bounded(dir.path(), Path::new("zz-target.txt"), 1000);
+        assert_eq!(roomy.len(), 1);
     }
 
     #[tokio::test]

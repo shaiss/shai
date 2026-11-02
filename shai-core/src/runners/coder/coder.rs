@@ -223,14 +223,17 @@ impl Brain for CoderBrain {
     }
 }
 
-/// Error for an assistant turn that carries no tool call, no text and no
-/// reasoning. Small local models do this when stuck; without an error the agent
-/// pauses silently (ovh/shai issue 101, "gets into a loop and quits").
-/// Returns `None` when the message has something to show or is not an assistant turn.
+/// Error for an assistant turn that carries no tool call and nothing to show
+/// (no text, no reasoning). Small local models do this when stuck; without an
+/// error the agent pauses silently (ovh/shai issue 101, "gets into a loop and quits").
+/// A refusal is reported with the provider's own text, because no front end
+/// renders `refusal`. Returns `None` when the message has something to show or
+/// is not an assistant turn.
 pub(crate) fn empty_response_error(message: &ChatMessage) -> Option<AgentError> {
     let ChatMessage::Assistant {
         content,
         reasoning_content,
+        refusal,
         tool_calls,
         ..
     } = message
@@ -247,11 +250,18 @@ pub(crate) fn empty_response_error(message: &ChatMessage) -> Option<AgentError> 
     let reasoning_empty = reasoning_content
         .as_deref()
         .is_none_or(|r| r.trim().is_empty());
-    (content_empty && reasoning_empty).then(|| {
-        AgentError::InvalidResponse(
-            "the model returned an empty response (no answer and no tool call), so the agent stopped. Send another message to continue, or try a different model.".to_string(),
-        )
-    })
+    if !(content_empty && reasoning_empty) {
+        return None;
+    }
+    if let Some(refusal) = refusal.as_deref().filter(|r| !r.trim().is_empty()) {
+        return Some(AgentError::InvalidResponse(format!(
+            "the model refused to answer: {}",
+            refusal.trim()
+        )));
+    }
+    Some(AgentError::InvalidResponse(
+        "the model returned an empty response (no answer and no tool call), so the agent stopped. Send another message to continue, or try a different model.".to_string(),
+    ))
 }
 
 /// Coder agent factory — returns AgentCore directly so callers can configure working_dir.
@@ -275,11 +285,20 @@ mod empty_response_tests {
         reasoning: Option<&str>,
         tool_calls: Option<Vec<ToolCall>>,
     ) -> ChatMessage {
+        assistant_with_refusal(content, reasoning, tool_calls, None)
+    }
+
+    fn assistant_with_refusal(
+        content: Option<&str>,
+        reasoning: Option<&str>,
+        tool_calls: Option<Vec<ToolCall>>,
+        refusal: Option<&str>,
+    ) -> ChatMessage {
         ChatMessage::Assistant {
             content: content.map(|c| ChatMessageContent::Text(c.to_string())),
             reasoning: None,
             reasoning_content: reasoning.map(String::from),
-            refusal: None,
+            refusal: refusal.map(String::from),
             name: None,
             audio: None,
             tool_calls,
@@ -296,6 +315,24 @@ mod empty_response_tests {
             let err = empty_response_error(&msg).expect("empty turn must be reported");
             assert!(err.to_string().contains("empty response"), "{err}");
         }
+    }
+
+    #[test]
+    fn refusal_keeps_the_providers_explanation() {
+        let msg = assistant_with_refusal(None, None, None, Some("I can't help with that."));
+        let err = empty_response_error(&msg).expect("refusal must be reported");
+        let text = err.to_string();
+        assert!(
+            text.contains("refused") && text.contains("I can't help with that."),
+            "{text}"
+        );
+        assert!(!text.contains("empty response"), "{text}");
+        // blank refusal falls back to the generic message
+        let blank = assistant_with_refusal(None, None, None, Some("  "));
+        assert!(empty_response_error(&blank)
+            .unwrap()
+            .to_string()
+            .contains("empty response"));
     }
 
     #[test]
