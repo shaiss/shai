@@ -413,4 +413,77 @@ mod integration_tests {
         assert!(read_files.contains(&config_path.to_string_lossy().to_string()));
         assert!(read_files.contains(&script_path.to_string_lossy().to_string()));
     }
+
+    /// ovh/shai issue 101: `ls` printed bare names, so a model that listed
+    /// `.github/workflows` then read `codecov-upload.yml` (no directory) and failed.
+    /// Every entry `ls` prints must be readable verbatim.
+    #[tokio::test]
+    async fn test_ls_entries_are_readable_verbatim_by_read() {
+        let temp_dir = tempdir().unwrap();
+        let workflows = temp_dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("codecov-upload.yml"), "name: codecov\n").unwrap();
+        std::fs::write(workflows.join("claude.yml"), "name: claude\n").unwrap();
+
+        let ls_tool = LsTool::new();
+        let read_tool = ReadTool::new(Arc::new(FsOperationLog::new()));
+
+        for (recursive, long_format) in [(false, false), (false, true), (true, false)] {
+            let directory = if recursive {
+                temp_dir.path().join(".github")
+            } else {
+                workflows.clone()
+            };
+            let listing = ls_tool
+                .execute(
+                    LsToolParams {
+                        directory: directory.to_string_lossy().to_string(),
+                        recursive,
+                        show_hidden: true,
+                        long_format,
+                        max_depth: None,
+                        max_files: None,
+                    },
+                    None,
+                )
+                .await;
+            let crate::tools::types::ToolResult::Success { output, .. } = listing else {
+                panic!("ls should succeed");
+            };
+
+            let yml_entries: Vec<String> = output
+                .lines()
+                .filter(|l| l.trim_end().ends_with(".yml"))
+                .map(|l| l.split_whitespace().last().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                yml_entries.len(),
+                2,
+                "recursive={recursive} long={long_format}: {output}"
+            );
+            for entry in yml_entries {
+                assert!(
+                    entry.contains("workflows"),
+                    "entry must carry its directory, got bare `{entry}`"
+                );
+                let read = read_tool
+                    .execute(
+                        ReadToolParams {
+                            files: vec![ReadFileSpec {
+                                path: entry.clone(),
+                                offset: None,
+                                limit: None,
+                                outline: false,
+                            }],
+                        },
+                        None,
+                    )
+                    .await;
+                assert!(
+                    read.is_success(),
+                    "read of ls entry `{entry}` failed: {read}"
+                );
+            }
+        }
+    }
 }
