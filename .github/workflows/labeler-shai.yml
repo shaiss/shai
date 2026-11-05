@@ -15,13 +15,6 @@ on:
         description: "Space-separated print-bench issue numbers (blank = recent open issues)"
         required: false
         default: ""
-  schedule:
-    - cron: "22 13 * * 1-5"   # weekdays 9:22 AM ET (EDT)
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/labeler-shai.yml"
-      - "wave0/**"
 
 permissions:
   contents: read   # Cipher condition 1: nothing else
