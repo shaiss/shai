@@ -75,6 +75,10 @@ struct Cli {
     /// Remove specific tools (comma-separated), also from the --agent's tools
     #[arg(long)]
     remove: Option<String>,
+    /// Headless mode only: allow tools that write files, run bash or use the
+    /// network. Without it, headless runs only read-only tools and deny the rest
+    #[arg(long)]
+    yes: bool,
     /// Set the LLM sampling temperature (default: 0.0)
     #[arg(long)]
     temperature: Option<f32>,
@@ -168,6 +172,10 @@ enum Commands {
         /// Maximum number of concurrent sessions (None = unlimited)
         #[arg(long)]
         max_sessions: Option<usize>,
+        /// Allow tools that write files, run bash or use the network in every
+        /// session. Without it, sessions run only read-only tools and deny the rest
+        #[arg(long)]
+        yes: bool,
     },
     /// Import configuration from .claude or .cursor into AGENTS.md
     Import {
@@ -265,8 +273,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent,
             ephemeral,
             max_sessions,
+            yes,
         }) => {
-            handle_serve(host, port, agent, ephemeral, max_sessions).await?;
+            handle_serve(host, port, agent, ephemeral, max_sessions, yes).await?;
         }
         Some(Commands::Import { overwrite }) => {
             handle_import(overwrite)?;
@@ -313,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.trace,
                     cli.agent,
                     cli.temperature,
+                    cli.yes,
                 )
                 .await;
                 return Ok(());
@@ -340,6 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cli.trace,
                         cli.agent,
                         cli.temperature,
+                        cli.yes,
                     )
                     .await;
                     return Ok(());
@@ -456,6 +467,7 @@ async fn handle_fix(
     trace: bool,
     agent_name: Option<String>,
     temperature: Option<f32>,
+    yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let initial_trace: Vec<ChatMessage> = prompt
         .into_iter()
@@ -469,7 +481,7 @@ async fn handle_fix(
     if let Some(temp) = temperature {
         app.set_temperature(temp);
     }
-    app.run(initial_trace, tools, remove, trace, agent_name)
+    app.run(initial_trace, tools, remove, trace, agent_name, yes)
         .await
 }
 
@@ -690,6 +702,7 @@ async fn handle_serve(
     _agent: Option<String>,
     ephemeral: bool,
     max_sessions: Option<usize>,
+    yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
@@ -703,7 +716,8 @@ async fn handle_serve(
     let addr = format!("{}:{}", host, port);
     let config = shai_http::ServerConfig::new(addr)
         .with_ephemeral(ephemeral)
-        .with_max_sessions(max_sessions);
+        .with_max_sessions(max_sessions)
+        .with_allow_all_tools(yes);
 
     shai_http::start_server(config).await?;
 
@@ -794,5 +808,32 @@ fn list_skills() {
                 skill.source()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod yes_flag_tests {
+    use super::*;
+
+    #[test]
+    fn headless_yes_defaults_off() {
+        let cli = Cli::try_parse_from(["shai", "-p", "hi"]).unwrap();
+        assert!(!cli.yes);
+        let cli = Cli::try_parse_from(["shai", "-p", "hi", "--yes"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn serve_yes_defaults_off() {
+        let cli = Cli::try_parse_from(["shai", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve { yes: false, .. })
+        ));
+        let cli = Cli::try_parse_from(["shai", "serve", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve { yes: true, .. })
+        ));
     }
 }

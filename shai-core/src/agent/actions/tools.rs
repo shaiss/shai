@@ -375,6 +375,12 @@ impl AgentCore {
                 || tool.capabilities() == [ToolCapability::Read]
                 || claims.read().await.is_sudo();
 
+            // Non-interactive sessions (headless CLI, HTTP server) have nobody
+            // to answer a prompt: deny at once instead of waiting forever
+            if !can_run && claims.read().await.is_non_interactive() {
+                return ToolResult::error(headless_denial(&call.tool_name, tool.capabilities()));
+            }
+
             // request permission if needed (|| is short-circuiting, so won't call if can_run is true)
             let can_run = can_run
                 || match Self::request_permission_if_needed(
@@ -508,6 +514,29 @@ impl AgentCore {
                     .map(|tool| (tool, tool_call))
             })
     }
+}
+
+/// Tool result for a call refused in a non-interactive session.
+fn headless_denial(tool_name: &str, capabilities: &[ToolCapability]) -> String {
+    let needs: Vec<&str> = capabilities
+        .iter()
+        .filter_map(|c| match c {
+            ToolCapability::Read => None,
+            ToolCapability::Write => Some("write"),
+            ToolCapability::Network => Some("network"),
+        })
+        .collect();
+    format!(
+        "permission denied (headless; pass --yes to allow): tool '{}' needs {} access, \
+         and this non-interactive session only runs read-only tools. \
+         Do not retry this tool; tell the user it needs --yes.",
+        tool_name,
+        if needs.is_empty() {
+            "elevated".to_string()
+        } else {
+            needs.join(" and ")
+        }
+    )
 }
 
 /// Map a tool name emitted by the LLM onto an available tool.
@@ -727,6 +756,140 @@ mod tests {
         )
         .await;
         assert!(result.is_success());
+    }
+
+    fn headless_claims() -> ClaimManager {
+        let mut claims = ClaimManager::new();
+        claims.non_interactive();
+        claims
+    }
+
+    /// Run a tool the way headless / HTTP sessions do: an event channel exists
+    /// (stdout printer or SSE stream) but nobody answers permission prompts.
+    /// Returns None if the call blocked instead of answering immediately.
+    async fn exec_headless(
+        tool: Arc<dyn AnyTool>,
+        call: ToolCall,
+        claims: ClaimManager,
+    ) -> (Option<ToolResult>, bool) {
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (_internal_tx, internal_rx) = broadcast::channel(16);
+        let handle = AgentCore::spawn_tool_exec(
+            tool,
+            call,
+            CancellationToken::new(),
+            Arc::new(RwLock::new(claims)),
+            Some(event_tx),
+            internal_rx,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .ok()
+            .map(|r| r.expect("tool execution task panicked"));
+        let mut prompted = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, AgentEvent::PermissionRequired { .. }) {
+                prompted = true;
+            }
+        }
+        (result, prompted)
+    }
+
+    fn assert_headless_denied(result: Option<ToolResult>, prompted: bool, tool: &str) {
+        assert!(
+            !prompted,
+            "headless must not emit a permission prompt for {tool}"
+        );
+        let result = result.unwrap_or_else(|| panic!("headless {tool} call blocked"));
+        assert!(
+            result.is_error(),
+            "headless {tool} should be refused: {result:?}"
+        );
+        let text = result.to_string();
+        assert!(
+            text.contains("permission denied") && text.contains("--yes"),
+            "unclear denial for {tool}: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_denies_bash_immediately() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let marker = dir.path().join("ran");
+        let (result, prompted) = exec_headless(
+            make_tool("bash"),
+            make_call(
+                "bash",
+                serde_json::json!({"command": format!("touch {}", marker.display())}),
+            ),
+            headless_claims(),
+        )
+        .await;
+        assert_headless_denied(result, prompted, "bash");
+        assert!(!marker.exists(), "denied bash call must not run");
+    }
+
+    #[tokio::test]
+    async fn headless_denies_write_tool_immediately() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let target = dir.path().join("out.txt");
+        let (result, prompted) = exec_headless(
+            make_tool("write"),
+            make_call(
+                "write",
+                serde_json::json!({"files": [{"path": target.to_string_lossy(), "content": "x"}]}),
+            ),
+            headless_claims(),
+        )
+        .await;
+        assert_headless_denied(result, prompted, "write");
+        assert!(!target.exists(), "denied write call must not write");
+    }
+
+    #[tokio::test]
+    async fn headless_denies_network_tool_immediately() {
+        let (result, prompted) = exec_headless(
+            make_tool("fetch"),
+            make_call("fetch", serde_json::json!({"url": "http://127.0.0.1:9/"})),
+            headless_claims(),
+        )
+        .await;
+        assert_headless_denied(result, prompted, "fetch");
+    }
+
+    #[tokio::test]
+    async fn headless_allows_read_only_tools() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::File::create(dir.path().join("file.txt")).expect("failed to create file");
+        let (result, prompted) = exec_headless(
+            make_tool("ls"),
+            make_call(
+                "ls",
+                serde_json::json!({"directory": dir.path().to_string_lossy()}),
+            ),
+            headless_claims(),
+        )
+        .await;
+        assert!(!prompted);
+        let result = result.expect("headless ls blocked");
+        assert!(result.is_success(), "{result:?}");
+        assert!(result.to_string().contains("file.txt"));
+    }
+
+    #[tokio::test]
+    async fn headless_with_yes_runs_bash() {
+        let mut claims = headless_claims();
+        claims.sudo();
+        let (result, prompted) = exec_headless(
+            make_tool("bash"),
+            make_call("bash", serde_json::json!({"command": "echo headless-yes"})),
+            claims,
+        )
+        .await;
+        assert!(!prompted);
+        let result = result.expect("headless --yes bash blocked");
+        assert!(result.is_success(), "{result:?}");
+        assert!(result.to_string().contains("headless-yes"));
     }
 
     fn names(list: &[&str]) -> Vec<String> {

@@ -17,6 +17,7 @@ These flags work with most commands.
 | `--temperature <float>` | Set the LLM sampling temperature |
 | `--tools <list>` | Only allow these built-in tools (comma-separated, headless mode). With `--agent`, restricts the agent's tools: tools it does not have are not added, and its MCP tools are dropped |
 | `--remove <list>` | Remove specific tools (comma-separated, headless mode), also from the `--agent`'s tools |
+| `--yes` | Headless mode only: allow tools that write files, run bash or use the network. Without it, headless runs only read-only tools and denies the rest (see [Headless permissions](#headless-permissions)) |
 | `--list-tools` | List all available tools |
 | `-v`, `--version` | Show version information |
 
@@ -82,6 +83,7 @@ shai serve                              # Default: 127.0.0.1:3000
 shai serve --port 8080                  # Custom port
 shai serve --host 0.0.0.0 --port 8080  # Bind to all interfaces
 shai serve --ephemeral                 # New agent per request
+shai serve --yes                       # Let sessions write files, run bash and use the network
 shai serve -a myagent                  # Use a specific agent
 ```
 
@@ -91,6 +93,7 @@ shai serve -a myagent                  # Use a specific agent
 | `-p`, `--port` | `3000` | Port to bind to |
 | `--ephemeral` | `false` | Spawn new agent per request |
 | `--max-sessions` | unlimited | Maximum number of concurrent sessions |
+| `--yes` | `false` | Allow tools that write files, run bash or use the network in every session. Without it, sessions run only read-only tools: HTTP clients cannot answer a permission prompt, so any other tool is denied immediately |
 | `-a`, `--agent` | — | Agent name to serve |
 
 ### `shai on` / `shai off` / `shai status`
@@ -117,21 +120,34 @@ shai import --overwrite # Overwrite existing AGENTS.md
 Run shai without the TUI for scripting and automation:
 
 ```bash
-# Explicit prompt
-shai -p "make me a hello world in main.py"
+# Explicit prompt (read-only tools)
+shai -p "explain what main.py does"
+
+# Let it write files and run bash
+shai --yes -p "make me a hello world in main.py"
 
 # Piped input
-echo "make me a hello world in main.py" | shai
+echo "make me a hello world in main.py" | shai --yes
 
 # With agent
-shai -a myagent -p "fix this bug"
+shai -a myagent --yes -p "fix this bug"
 
 # With temperature
-shai -p "rewrite this function" --temperature 0.5
+shai -p "review this function" --temperature 0.5
 
 # Chain commands
-echo "make me a hello world in main.py" | shai --trace | shai -p "now run it!"
+echo "make me a hello world in main.py" | shai --yes --trace | shai --yes -p "now run it!"
 ```
+
+### Headless permissions
+
+Headless mode has nobody to answer a permission prompt, so it never asks:
+
+- Read-only tools (`read`, `ls`, `find`, `todo_read`, `todo_write`, `skill`) run normally.
+- Any tool that writes files, runs bash or uses the network (`write`, `edit`, `bash`, `fetch`, `memory_write`, `memory_remove`, and all MCP tools) is denied immediately. The model gets a `permission denied (headless; pass --yes to allow)` tool result.
+- `--yes` allows every tool, which was the headless behavior before this flag existed.
+
+`--tools` and `--remove` still decide which tools the model sees; `--yes` only decides whether the ones it sees may write, run bash or use the network. `shai serve` follows the same rules, with its own `--yes` flag.
 
 ## Interactive Pipe Mode
 

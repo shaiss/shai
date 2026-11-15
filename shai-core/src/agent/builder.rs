@@ -187,6 +187,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Permissions for an agent that runs without anyone to answer a prompt
+    /// (headless CLI, HTTP server). Tools that only read run; every other
+    /// tool is denied immediately. `allow_all` (`--yes`) grants everything.
+    pub fn headless_permissions(mut self, allow_all: bool) -> Self {
+        self.permissions.non_interactive();
+        if allow_all {
+            self.permissions.sudo();
+        } else {
+            self.permissions.no_sudo();
+        }
+        self
+    }
+
     /// Build the AgentCore with required runtime fields
     pub fn build(mut self) -> AgentCore {
         if let Some(goal) = self.goal {

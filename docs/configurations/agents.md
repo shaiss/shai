@@ -129,6 +129,7 @@ You can also run an agent in headless mode:
 
 ```bash
 shai -a myagent -p "your prompt here"
+shai -a myagent --yes -p "your prompt here"   # allow writes, bash and network tools
 ```
 
 Or switch agents from within the TUI using the `/agent` slash command (keeps conversation context).
