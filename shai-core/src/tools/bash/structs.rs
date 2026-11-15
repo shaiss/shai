@@ -56,7 +56,7 @@ pub struct BashToolParams {
 /// - `params_timeout == None` → default; `default_timeout_secs == 0` → no limit (operator)
 pub fn resolve_timeout_secs(params_timeout: Option<u32>, config: &BashToolConfig) -> Option<u32> {
     let requested = match params_timeout {
-        // Cipher #5: model-facing `timeout: 0` must not disable the hang fix.
+        // A model-facing `timeout: 0` must not disable the hang fix.
         Some(0) | None => {
             if config.default_timeout_secs == 0 {
                 return None;

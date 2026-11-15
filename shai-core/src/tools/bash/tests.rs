@@ -13,6 +13,17 @@ fn error_text(result: &crate::tools::types::ToolResult) -> String {
     }
 }
 
+/// Own working directory for tests that assert on exact output. The process
+/// cwd is shared across tests, and runner tests `set_current_dir` into a
+/// `TempDir` that is later deleted; a child inheriting that cwd prints
+/// `shell-init: error retrieving current directory` on stderr, which the tool
+/// appends to stdout. Keep the returned `TempDir` alive for the whole test.
+fn isolated_dir() -> (tempfile::TempDir, Option<String>) {
+    let dir = tempfile::TempDir::new().expect("temp working dir");
+    let path = dir.path().to_string_lossy().into_owned();
+    (dir, Some(path))
+}
+
 #[test]
 fn test_bash_tool_permissions() {
     let tool = BashTool::new();
@@ -94,12 +105,12 @@ async fn test_timeout_keeps_partial_stdout() {
     );
     assert!(
         !err.to_lowercase().contains("nohup"),
-        "must not suggest nohup (issue #7): {}",
+        "must not suggest nohup: {}",
         err
     );
     assert!(
         !err.contains("timeout: 0"),
-        "must not tell the model to pass timeout:0 (#5): {}",
+        "must not tell the model to pass timeout:0: {}",
         err
     );
 }
@@ -125,7 +136,7 @@ async fn test_omitted_timeout_uses_default_from_config() {
 
 #[tokio::test]
 async fn test_model_timeout_zero_uses_default_not_unlimited() {
-    // Cipher #5: model passing timeout:0 must not disable the hang fix.
+    // A model passing timeout:0 must not disable the hang fix.
     let tool = BashTool::with_config(BashToolConfig {
         default_timeout_secs: 1,
         max_timeout_secs: 1800,
@@ -174,7 +185,7 @@ async fn test_max_timeout_caps_huge_value() {
 
 #[tokio::test]
 async fn test_drain_buffer_bounded_under_flood() {
-    // Cipher #6: flooding stdout must not grow the drain buffer without bound.
+    // Flooding stdout must not grow the drain buffer without bound.
     let tool = BashTool::with_config(BashToolConfig {
         default_timeout_secs: 5,
         max_timeout_secs: 5,
@@ -194,7 +205,7 @@ async fn test_drain_buffer_bounded_under_flood() {
     assert!(result.is_error(), "{:?}", result);
     let err = error_text(&result);
     assert!(err.contains("killed after"), "{}", err);
-    // Waived #9 thread: assert truncation actually happened on the flood.
+    // Assert truncation actually happened on the flood.
     assert!(
         err.contains("truncated: earlier output omitted"),
         "flood >64KiB must report truncation: {}",
@@ -204,13 +215,14 @@ async fn test_drain_buffer_bounded_under_flood() {
 
 #[tokio::test]
 async fn test_drain_truncation_keeps_utf8_char_boundary() {
-    // Waived #9 thread: 30000 x 3-byte '€' = 90000 bytes; excess (24464) is not a
+    // 30000 x 3-byte '€' = 90000 bytes; excess (24464) is not a
     // multiple of 3, so a naive cut would start mid-character.
+    let (_wd_guard, wd) = isolated_dir();
     let tool = BashTool::new();
     let params = BashToolParams {
         command: r#"python3 -c "import sys; sys.stdout.buffer.write('\u20ac'.encode()*30000); sys.stdout.buffer.flush()""#.to_string(),
         timeout: Some(30),
-        working_dir: None,
+        working_dir: wd,
         env: HashMap::new(),
     };
     let result = Tool::execute(&tool, params, None).await;
@@ -232,8 +244,9 @@ async fn test_drain_truncation_keeps_utf8_char_boundary() {
 
 #[tokio::test]
 async fn test_drain_truncation_marker_on_success_over_cap() {
-    // Cipher #11: successful command >64KiB must keep the tail, drop the head,
+    // A successful command >64KiB must keep the tail, drop the head,
     // and surface a clear truncation marker (not silent).
+    let (_wd_guard, wd) = isolated_dir();
     let tool = BashTool::new();
     let params = BashToolParams {
         command: r#"python3 -c "
@@ -246,7 +259,7 @@ sys.stdout.buffer.flush()
 ""#
         .to_string(),
         timeout: Some(30),
-        working_dir: None,
+        working_dir: wd,
         env: HashMap::new(),
     };
     let result = Tool::execute(&tool, params, None).await;
@@ -283,8 +296,9 @@ fn test_resolve_timeout_helpers_exported() {
 
 #[tokio::test]
 async fn test_utf8_multibyte_split_across_8kb_boundary() {
-    // Cipher #8: force a 3-byte UTF-8 codepoint (€ = e2 82 ac) to straddle the
+    // Force a 3-byte UTF-8 codepoint (€ = e2 82 ac) to straddle the
     // 8192-byte read boundary so per-chunk decoding would corrupt it.
+    let (_wd_guard, wd) = isolated_dir();
     let tool = BashTool::new();
     let params = BashToolParams {
         command: r#"python3 -c "
@@ -296,7 +310,7 @@ sys.stdout.buffer.flush()
 ""#
         .to_string(),
         timeout: Some(15),
-        working_dir: None,
+        working_dir: wd,
         env: HashMap::new(),
     };
     let result = Tool::execute(&tool, params, None).await;

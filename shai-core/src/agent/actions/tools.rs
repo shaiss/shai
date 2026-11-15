@@ -85,7 +85,7 @@ impl AgentCore {
                     // Answer the tool call in the trace so the LLM sees the error
                     // (and the list of available tools) on its next step. Without
                     // this the assistant tool_call has no matching tool message and
-                    // the model keeps retrying the same unknown tool (ovh/shai#89).
+                    // the model keeps retrying the same unknown tool.
                     trace.write().await.push(ChatMessage::Tool {
                         tool_call_id: tc_for_error.id.clone(),
                         content: ChatMessageContent::Text(tool_result.to_string()),
@@ -328,8 +328,7 @@ impl AgentCore {
                     // Emit tool call finish event
                     let tool_was_denied = result.is_denied();
                     info!(target: "agent::tool_completed", call = ?tc_for_error.function.name.clone(), result = ?result);
-                    // Capture resolved name before moving `call` into ToolCallCompleted
-                    // (Cipher HOLD on #3 tip 1bcc316 — E0382 use-after-move).
+                    // Capture the resolved name before `call` moves into ToolCallCompleted.
                     let resolved_tool_name = call.tool_name.clone();
                     if let Some(tx) = public_event_tx.clone() {
                         let _ = tx.send(AgentEvent::ToolCallCompleted {
@@ -343,7 +342,7 @@ impl AgentCore {
 
                     // Emit TodoUpdated after todo_write executes. Use the resolved
                     // tool_name (not the raw LLM function name) so namespaced /
-                    // harmony-suffixed aliases still refresh the TUI (Bugbot on #3).
+                    // harmony-suffixed aliases still refresh the TUI.
                     if resolved_tool_name == "todo_write" {
                         let todos = todo_storage.get_all().await;
                         if let Some(tx) = public_event_tx.clone() {
@@ -517,7 +516,7 @@ impl AgentCore {
 /// (notably gpt-oss, trained on the harmony format with built-in `browser.search`
 /// style tools) emit: a namespace prefix (`functions.find`), trailing harmony
 /// control tokens (`find<|channel|>commentary`), and the generic `search`/`grep`
-/// names for the `find` tool (ovh/shai#89).
+/// names for the `find` tool.
 fn resolve_tool_name(requested: &str, available: &[String]) -> Option<String> {
     let has = |name: &str| available.iter().any(|a| a == name);
 
