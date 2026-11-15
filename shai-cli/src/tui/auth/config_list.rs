@@ -10,7 +10,7 @@ use ratatui::{
 use shai_core::config::config::{ProviderConfig, ShaiConfig};
 use std::collections::HashMap;
 use std::io;
-use url::Url;
+use url::{Host, Url};
 
 use super::auth::NavAction;
 use shai_llm::client::LlmClient;
@@ -54,40 +54,113 @@ impl ModalConfig {
 }
 
 /// Host (and non-default port) of an http(s) base URL. Returns `None` for anything
-/// that does not parse cleanly as an http(s) URL, so the raw value is never shown.
+/// that does not parse cleanly as an http(s) URL to a plausible endpoint, so the raw
+/// value (which may be a pasted key) is never shown.
 fn url_host(raw: &str) -> Option<String> {
-    let url = Url::parse(raw.trim()).ok()?;
+    let raw = raw.trim();
+    let url = Url::parse(raw).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    // An '@' that did not end up in the userinfo means credentials were split at a
-    // '/', '?' or '#' inside them, so the "host" may be part of a secret.
-    if raw.contains('@') && url.username().is_empty() && url.password().is_none() {
-        return None;
+    // Any '@' outside the userinfo means credentials were split at a '/', '?' or
+    // '#' inside them, so the "host" may be part of a secret. That holds whether or
+    // not the parser found a (partial) userinfo before the split.
+    if raw.contains('@') {
+        let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+        let authority_end = after_scheme
+            .find(['/', '?', '#', '\\'])
+            .unwrap_or(after_scheme.len());
+        if after_scheme[authority_end..].contains('@') {
+            return None;
+        }
     }
-    let host = url.host_str().filter(|host| !host.is_empty())?;
+    let host = match url.host()? {
+        Host::Ipv4(_) | Host::Ipv6(_) => url.host_str()?.to_string(),
+        Host::Domain(domain) if is_plausible_domain(domain) => domain.to_string(),
+        Host::Domain(_) => return None,
+    };
     Some(match url.port() {
         Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
+        None => host,
     })
 }
 
-/// "<provider> - <model>", plus " @ <host>" when the config has a usable `*_BASE_URL`.
-fn base_label(provider_config: &ProviderConfig) -> String {
+/// `localhost`, or a dotted hostname none of whose labels looks like a secret.
+/// Single-label names are rejected: `https://sk-...` parses with the key as host.
+fn is_plausible_domain(domain: &str) -> bool {
+    if domain.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let labels: Vec<&str> = domain.trim_end_matches('.').split('.').collect();
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|label| !label.is_empty() && !is_key_like(label))
+}
+
+/// Common API-key prefixes, or a long unbroken run of mixed letters and digits.
+fn is_key_like(label: &str) -> bool {
+    const KEY_PREFIXES: [&str; 6] = ["sk-", "sk_", "pk-", "pk_", "rk-", "key-"];
+    let label = label.to_ascii_lowercase();
+    if KEY_PREFIXES.iter().any(|prefix| label.starts_with(prefix)) {
+        return true;
+    }
+    label.split(['-', '_']).any(|part| {
+        part.len() >= 20
+            && part.chars().any(|c| c.is_ascii_digit())
+            && part.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+/// One provider row: `head` ("<provider> - <model>"), the optional base URL host,
+/// and `tail` (the duplicate markers). Only the host is shortened to fit.
+#[derive(Debug, Clone, PartialEq)]
+struct ProviderLabel {
+    head: String,
+    host: Option<String>,
+    tail: String,
+}
+
+impl ProviderLabel {
+    fn full(&self) -> String {
+        self.fit(usize::MAX)
+    }
+
+    /// The label in at most `width` columns where possible: the host is cut (with
+    /// "…") or dropped before the head or the markers lose any text.
+    fn fit(&self, width: usize) -> String {
+        let cols = |s: &str| Span::raw(s).width();
+        let mut out = self.head.clone();
+        if let Some(host) = &self.host {
+            const SEP: &str = " @ ";
+            let room = width.saturating_sub(cols(&self.head) + cols(&self.tail) + cols(SEP));
+            if cols(host) <= room {
+                out.push_str(SEP);
+                out.push_str(host);
+            } else if room >= 4 {
+                // Hosts are ASCII (the URL parser punycodes them), one column per char.
+                out.push_str(SEP);
+                out.extend(host.chars().take(room - 1));
+                out.push('…');
+            }
+        }
+        out.push_str(&self.tail);
+        out
+    }
+}
+
+/// "<provider> - <model>", plus the host when the config has a usable `*_BASE_URL`.
+fn base_label(provider_config: &ProviderConfig) -> ProviderLabel {
     let mut base_urls: Vec<_> = provider_config
         .env_vars
         .iter()
         .filter(|(name, _)| name.ends_with("_BASE_URL"))
         .collect();
     base_urls.sort();
-    let host = base_urls.into_iter().find_map(|(_, url)| url_host(url));
-
-    match host {
-        Some(host) => format!(
-            "{} - {} @ {}",
-            provider_config.provider, provider_config.model, host
-        ),
-        None => format!("{} - {}", provider_config.provider, provider_config.model),
+    ProviderLabel {
+        head: format!("{} - {}", provider_config.provider, provider_config.model),
+        host: base_urls.into_iter().find_map(|(_, url)| url_host(url)),
+        tail: String::new(),
     }
 }
 
@@ -100,10 +173,10 @@ fn has_api_key(provider_config: &ProviderConfig) -> bool {
         .any(|(name, value)| name.ends_with("_API_KEY") && !value.trim().is_empty())
 }
 
-/// List labels for all configured providers. Labels that would otherwise be
-/// identical get "(api key)" / "(anonymous)", and a 1-based position if that still
-/// does not tell them apart.
-fn provider_labels(providers: &[ProviderConfig]) -> Vec<String> {
+/// Labels for all configured providers. Labels that would otherwise be identical
+/// get "(api key)" / "(anonymous)", and a 1-based position if that still does not
+/// tell them apart.
+fn provider_labels(providers: &[ProviderConfig]) -> Vec<ProviderLabel> {
     fn counts(labels: &[String]) -> HashMap<&str, usize> {
         let mut counts = HashMap::new();
         for label in labels {
@@ -112,36 +185,27 @@ fn provider_labels(providers: &[ProviderConfig]) -> Vec<String> {
         counts
     }
 
-    let base: Vec<String> = providers.iter().map(base_label).collect();
+    let mut labels: Vec<ProviderLabel> = providers.iter().map(base_label).collect();
+    let base: Vec<String> = labels.iter().map(ProviderLabel::full).collect();
     let base_counts = counts(&base);
-    let marked: Vec<String> = base
-        .iter()
-        .zip(providers)
-        .map(|(label, provider_config)| {
-            if base_counts[label.as_str()] > 1 {
-                let marker = if has_api_key(provider_config) {
-                    "api key"
-                } else {
-                    "anonymous"
-                };
-                format!("{label} ({marker})")
+    for ((label, key), provider_config) in labels.iter_mut().zip(&base).zip(providers) {
+        if base_counts[key.as_str()] > 1 {
+            let marker = if has_api_key(provider_config) {
+                "api key"
             } else {
-                label.clone()
-            }
-        })
-        .collect();
+                "anonymous"
+            };
+            label.tail = format!(" ({marker})");
+        }
+    }
+    let marked: Vec<String> = labels.iter().map(ProviderLabel::full).collect();
     let marked_counts = counts(&marked);
-    marked
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            if marked_counts[label.as_str()] > 1 {
-                format!("{label} #{}", i + 1)
-            } else {
-                label.clone()
-            }
-        })
-        .collect()
+    for (i, (label, key)) in labels.iter_mut().zip(&marked).enumerate() {
+        if marked_counts[key.as_str()] > 1 {
+            label.tail.push_str(&format!(" #{}", i + 1));
+        }
+    }
+    labels
 }
 
 impl ModalConfig {
@@ -245,6 +309,8 @@ impl ModalConfig {
         let labels = provider_labels(&self.config.providers);
 
         // Show existing providers
+        // Inside the rounded border and the 1-column padding on each side.
+        let label_width = layout_areas[0].width.saturating_sub(4) as usize;
         for (i, label) in labels.iter().enumerate() {
             let prefix = if i == self.selected_index {
                 "● "
@@ -256,7 +322,9 @@ impl ModalConfig {
             } else {
                 ""
             };
-            let line = format!("{}{}{}", prefix, label, selected_indicator);
+            let room = label_width
+                .saturating_sub(Span::raw(prefix).width() + Span::raw(selected_indicator).width());
+            let line = format!("{}{}{}", prefix, label.fit(room), selected_indicator);
 
             if i == self.selected_index {
                 lines.push(Line::from(vec![Span::styled(
@@ -392,11 +460,22 @@ mod tests {
 
     const SECRET: &str = "sk-very-secret-key";
 
+    fn full_labels(providers: &[ProviderConfig]) -> Vec<String> {
+        provider_labels(providers)
+            .iter()
+            .map(ProviderLabel::full)
+            .collect()
+    }
+
     fn render_list(config: ShaiConfig) -> String {
+        render_list_sized(config, 100)
+    }
+
+    fn render_list_sized(config: ShaiConfig, width: u16) -> String {
         use ratatui::{backend::TestBackend, Terminal};
 
         let modal = ModalConfig::from_config(config, None);
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
         terminal
             .draw(|frame| modal.draw(frame, frame.area()))
             .unwrap();
@@ -455,10 +534,97 @@ mod tests {
     }
 
     #[test]
+    fn url_host_rejects_at_after_authority_even_with_userinfo() {
+        for raw in [
+            "https://user:pa@secret-fragment/rest@proxy.example.com/v1",
+            "https://user:pa@secret.fragment/rest@proxy.example.com/v1",
+            "https://user@secret.fragment?rest@proxy.example.com/v1",
+            "https://user:pa@secret.fragment#rest@proxy.example.com/v1",
+            "https://proxy.example.com/v1?key=a@b",
+        ] {
+            assert_eq!(url_host(raw), None, "{raw}");
+        }
+        // A well-formed userinfo still shows only the host.
+        assert_eq!(
+            url_host("https://user:pass@proxy.example.com:8443/v1").as_deref(),
+            Some("proxy.example.com:8443")
+        );
+    }
+
+    #[test]
+    fn url_host_rejects_key_like_or_single_label_hosts() {
+        for raw in [
+            "https://sk-very-secret-key",
+            "https://sk-very-secret-key/v1",
+            "http://ollama:11434/v1",
+            "https://sk-proj-abc.example.com/v1",
+            "https://a1b2c3d4e5f6g7h8i9j0k1l2.example.com/v1",
+        ] {
+            assert_eq!(url_host(raw), None, "{raw}");
+        }
+        for (raw, host) in [
+            ("http://127.0.0.1:11434/v1", "127.0.0.1:11434"),
+            ("http://[::1]:11434/v1", "[::1]:11434"),
+            ("http://LOCALHOST:11434/v1", "localhost:11434"),
+            ("https://api.openai.com/v1", "api.openai.com"),
+            (
+                "https://deepseek-r1-distill-llama-70b.endpoints.kepler.ai.cloud.ovh.net/v1",
+                "deepseek-r1-distill-llama-70b.endpoints.kepler.ai.cloud.ovh.net",
+            ),
+        ] {
+            assert_eq!(url_host(raw).as_deref(), Some(host), "{raw}");
+        }
+    }
+
+    #[test]
+    fn narrow_list_keeps_markers_and_positions() {
+        let url = (
+            "OVH_BASE_URL",
+            "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        );
+        let config = ShaiConfig {
+            providers: vec![
+                provider("ovhcloud", "Qwen3-32B", &[url]),
+                provider("ovhcloud", "Qwen3-32B", &[url, ("OVH_API_KEY", SECRET)]),
+                provider("ovhcloud", "Qwen3-32B", &[url, ("OVH_API_KEY", "sk-other")]),
+            ],
+            ..ShaiConfig::default()
+        };
+        let screen = render_list_sized(config, 60);
+        let rows: Vec<&str> = screen.lines().filter(|l| l.contains("ovhcloud")).collect();
+        assert_eq!(rows.len(), 3, "{screen}");
+        assert!(rows[0].contains("(anonymous) (current)"), "{screen}");
+        assert!(rows[1].contains("(api key) #2"), "{screen}");
+        assert!(rows[2].contains("(api key) #3"), "{screen}");
+        for row in &rows {
+            assert!(row.contains("ovhcloud - Qwen3-32B @ oai.end"), "{screen}");
+            assert!(row.contains('…'), "host is shortened: {screen}");
+        }
+    }
+
+    #[test]
+    fn fit_shortens_only_the_host() {
+        let label = ProviderLabel {
+            head: "ovhcloud - Qwen3-32B".to_string(),
+            host: Some("oai.endpoints.kepler.ai.cloud.ovh.net".to_string()),
+            tail: " (api key) #2".to_string(),
+        };
+        assert_eq!(
+            label.fit(100),
+            "ovhcloud - Qwen3-32B @ oai.endpoints.kepler.ai.cloud.ovh.net (api key) #2"
+        );
+        let fitted = label.fit(45);
+        assert_eq!(fitted, "ovhcloud - Qwen3-32B @ oai.endp… (api key) #2");
+        assert_eq!(Span::raw(fitted.as_str()).width(), 45);
+        // No room for a useful host: drop it, keep head and markers.
+        assert_eq!(label.fit(20), "ovhcloud - Qwen3-32B (api key) #2");
+    }
+
+    #[test]
     fn scheme_less_raw_key_in_base_url_is_not_shown() {
         let misconfigured = provider("ovhcloud", "Qwen3-32B", &[("OVH_BASE_URL", SECRET)]);
         assert_eq!(url_host(SECRET), None);
-        assert_eq!(base_label(&misconfigured), "ovhcloud - Qwen3-32B");
+        assert_eq!(base_label(&misconfigured).full(), "ovhcloud - Qwen3-32B");
     }
 
     #[test]
@@ -485,7 +651,7 @@ mod tests {
             ),
             provider("openai", "gpt-4o", &[("OPENAI_API_KEY", SECRET)]),
         ];
-        let labels = provider_labels(&providers);
+        let labels = full_labels(&providers);
         assert_eq!(
             labels,
             vec![
@@ -513,7 +679,7 @@ mod tests {
             ],
             ..ShaiConfig::default()
         };
-        let labels = provider_labels(&config.providers);
+        let labels = full_labels(&config.providers);
         assert_eq!(
             labels,
             vec![
@@ -551,7 +717,7 @@ mod tests {
         ];
         let host = "ovhcloud - Qwen3-32B @ oai.endpoints.kepler.ai.cloud.ovh.net";
         assert_eq!(
-            provider_labels(&providers),
+            full_labels(&providers),
             vec![
                 format!("{host} (anonymous)"),
                 format!("{host} (api key) #2"),
