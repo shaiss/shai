@@ -23,6 +23,10 @@ jobs:
             target: x86_64-unknown-linux-musl
             binary_name: shai
             asset_name: shai-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary_name: shai
+            asset_name: shai-linux-aarch64
           #- os: windows-latest
           #  target: x86_64-pc-windows-msvc
           #  binary_name: shai.exe
@@ -48,7 +52,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
 
       - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools
@@ -108,8 +112,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          sha256sum shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64
+          sha256sum shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64
           gh release upload -R "$GITHUB_REPOSITORY" "$TAG" \
-            shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64
-          sha256sum shai-linux-x86_64 shai-macos-x86_64 shai-macos-aarch64 > SHA256SUMS
+            shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64
+          sha256sum shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64 > SHA256SUMS
           gh release upload -R "$GITHUB_REPOSITORY" "$TAG" SHA256SUMS --clobber

@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_context_overflow_vllm_negative_max_tokens() {
-        // Error body reported in ovh/shai#97 (OVHcloud gpt-oss-120b)
+        // Error body reported in #97 (OVHcloud gpt-oss-120b)
         let raw = r#"{"message":"{\"error\":{\"message\":\"max_tokens must be at least 1, got -17032.\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}}"}"#;
         let msg = describe_context_overflow(raw).expect("should be detected");
         assert!(msg.starts_with("Context window exceeded"));

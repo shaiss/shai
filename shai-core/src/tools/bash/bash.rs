@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 /// How much of the captured stdout/stderr to include in a timeout error.
 const PARTIAL_OUTPUT_TAIL_CHARS: usize = 8_000;
-/// Hard cap on captured stdout/stderr bytes in drain_pipe (keep a tail). Cipher #6.
+/// Hard cap on captured stdout/stderr bytes in drain_pipe (keep a tail).
 pub(crate) const DRAIN_BUFFER_MAX_BYTES: usize = 64 * 1024;
-/// Prefixed onto decoded output when the drain buffer dropped earlier bytes (#11).
+/// Prefixed onto decoded output when the drain buffer dropped earlier bytes.
 pub(crate) fn drain_truncation_marker() -> String {
     format!(
         "…[truncated: earlier output omitted, keeping last {} bytes]…\n",
@@ -79,7 +79,7 @@ impl BashTool {
     /// Read stdout/stderr into a shared byte buffer so a timeout/cancel can
     /// still report what was emitted before the process was killed.
     /// Bytes are decoded once at snapshot time so multibyte UTF-8 characters
-    /// split across read chunks are not corrupted (review on #4).
+    /// split across read chunks are not corrupted.
     async fn drain_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         reader: R,
         buf: Arc<Mutex<DrainBuf>>,
@@ -93,7 +93,7 @@ impl BashTool {
                     if let Ok(mut guard) = buf.lock() {
                         guard.bytes.extend_from_slice(&chunk[..n]);
                         // Bound growth: keep only the trailing DRAIN_BUFFER_MAX_BYTES
-                        // so a flood cannot exhaust memory (Cipher #6 / #11).
+                        // so a flood cannot exhaust memory.
                         if guard.bytes.len() > DRAIN_BUFFER_MAX_BYTES {
                             let excess = guard.bytes.len() - DRAIN_BUFFER_MAX_BYTES;
                             // Never start the kept tail mid-character: also drop any
@@ -146,7 +146,7 @@ impl BashTool {
     }
 
     /// Tail for timeout errors, but keep the drain truncation marker visible
-    /// so the agent knows the head was dropped (#11).
+    /// so the agent knows the head was dropped.
     fn tail_keep_marker(s: &str) -> String {
         let marker = drain_truncation_marker();
         match s.strip_prefix(marker.as_str()) {
