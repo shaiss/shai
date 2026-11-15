@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: OVH SAS
+#
 # `curl` stand-in used by CI to run install.sh against binaries built in the
 # same workflow run, so the script is tested before a release exists.
 #
