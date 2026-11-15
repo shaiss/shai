@@ -1,4 +1,5 @@
 use super::structs::{resolve_timeout_secs, BashToolConfig, BashToolParams};
+use crate::tools::env_scrub::secret_env_names;
 use crate::tools::{tool, ToolResult};
 use serde_json::json;
 use std::collections::HashMap;
@@ -203,6 +204,11 @@ impl BashTool {
 
         if let Some(working_dir) = &params.working_dir {
             cmd.current_dir(working_dir);
+        }
+
+        // Provider keys are exported into our env; don't hand them to the model.
+        for name in secret_env_names() {
+            cmd.env_remove(name);
         }
 
         for (key, value) in &params.env {
