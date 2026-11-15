@@ -175,6 +175,10 @@ pub trait Tool: ToolDescription + Send + Sync {
 pub trait AnyTool: ToolDescription + Send + Sync {
     fn capabilities(&self) -> &[ToolCapability];
 
+    /// The concrete tool, so callers can tell tools apart by type
+    /// (e.g. a built-in from an MCP tool that reuses its name).
+    fn as_any(&self) -> &dyn std::any::Any;
+
     async fn execute_json(
         &self,
         params: serde_json::Value,
@@ -191,6 +195,10 @@ where
 {
     fn capabilities(&self) -> &[ToolCapability] {
         <T as Tool>::capabilities(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn execute_json(
