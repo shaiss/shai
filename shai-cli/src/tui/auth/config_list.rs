@@ -129,6 +129,12 @@ impl ProviderLabel {
     /// The label in at most `width` columns where possible: the host is cut (with
     /// "…") or dropped before the head or the markers lose any text.
     fn fit(&self, width: usize) -> String {
+        self.fit_shortened(width, None)
+    }
+
+    /// Like [`Self::fit`], but when `suffix_start` is set the host is shortened
+    /// with a middle ellipsis that keeps `host[suffix_start..]`.
+    fn fit_shortened(&self, width: usize, suffix_start: Option<usize>) -> String {
         let cols = |s: &str| Span::raw(s).width();
         let mut out = self.head.clone();
         if let Some(host) = &self.host {
@@ -140,13 +146,41 @@ impl ProviderLabel {
             } else if room >= 4 {
                 // Hosts are ASCII (the URL parser punycodes them), one column per char.
                 out.push_str(SEP);
-                out.extend(host.chars().take(room - 1));
-                out.push('…');
+                out.push_str(&shorten_host(host, room, suffix_start));
             }
         }
         out.push_str(&self.tail);
         out
     }
+}
+
+/// Cut `host` to `room` columns. Prefers a middle ellipsis that keeps the
+/// distinguishing tail when that tail fits; otherwise a leading cut.
+fn shorten_host(host: &str, room: usize, suffix_start: Option<usize>) -> String {
+    if let Some(suffix_start) = suffix_start {
+        if let Some(short) = shorten_middle(host, room, suffix_start) {
+            return short;
+        }
+    }
+    let mut short: String = host.chars().take(room - 1).collect();
+    short.push('…');
+    short
+}
+
+/// `prefix…tail` keeping `host[suffix_start..]`, if that tail fits in `room`.
+fn shorten_middle(host: &str, room: usize, suffix_start: usize) -> Option<String> {
+    let n = host.len();
+    if n <= room {
+        return Some(host.to_string());
+    }
+    let suffix_start = suffix_start.min(n);
+    let suffix_len = n - suffix_start;
+    let inner = room - 1;
+    if suffix_len == 0 || suffix_len > inner {
+        return None;
+    }
+    let prefix_len = inner - suffix_len;
+    Some(format!("{}…{}", &host[..prefix_len], &host[suffix_start..]))
 }
 
 /// "<provider> - <model>", plus the host when the config has a usable `*_BASE_URL`.
@@ -206,6 +240,71 @@ fn provider_labels(providers: &[ProviderConfig]) -> Vec<ProviderLabel> {
         }
     }
     labels
+}
+
+/// First index at which not all hosts share the same character, or `None`
+/// when they are identical.
+fn first_differing_index(hosts: &[&str]) -> Option<usize> {
+    if hosts.len() < 2 {
+        return None;
+    }
+    let min_len = hosts.iter().map(|h| h.len()).min()?;
+    for i in 0..min_len {
+        let b = hosts[0].as_bytes()[i];
+        if hosts.iter().any(|h| h.as_bytes()[i] != b) {
+            return Some(i);
+        }
+    }
+    if hosts.iter().any(|h| h.len() != min_len) {
+        Some(min_len)
+    } else {
+        None
+    }
+}
+
+fn collision_groups(fitted: &[String]) -> Vec<Vec<usize>> {
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, s) in fitted.iter().enumerate() {
+        groups.entry(s.as_str()).or_default().push(i);
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect()
+}
+
+/// Fit each label to its row width, then make any collisions distinguishable.
+/// Prefer a middle ellipsis that keeps the differing host tail; if that still
+/// collides (or the tail does not fit), add a 1-based position marker, reserved
+/// within the width so existing markers stay visible.
+fn fit_distinct(labels: &[ProviderLabel], rooms: &[usize]) -> Vec<String> {
+    let mut fitted: Vec<String> = labels
+        .iter()
+        .zip(rooms)
+        .map(|(label, &room)| label.fit(room))
+        .collect();
+
+    for group in collision_groups(&fitted) {
+        let hosts: Vec<&str> = group
+            .iter()
+            .filter_map(|&i| labels[i].host.as_deref())
+            .collect();
+        if let Some(suffix_start) = first_differing_index(&hosts) {
+            for &i in &group {
+                fitted[i] = labels[i].fit_shortened(rooms[i], Some(suffix_start));
+            }
+        }
+    }
+
+    for group in collision_groups(&fitted) {
+        for i in group {
+            let mut label = labels[i].clone();
+            label.tail.push_str(&format!(" #{}", i + 1));
+            fitted[i] = label.fit(rooms[i]);
+        }
+    }
+
+    fitted
 }
 
 impl ModalConfig {
@@ -311,7 +410,19 @@ impl ModalConfig {
         // Show existing providers
         // Inside the rounded border and the 1-column padding on each side.
         let label_width = layout_areas[0].width.saturating_sub(4) as usize;
-        for (i, label) in labels.iter().enumerate() {
+        let rooms: Vec<usize> = (0..labels.len())
+            .map(|i| {
+                let prefix = 2; // "● " / "○ "
+                let current = if i == self.config.selected_provider {
+                    Span::raw(" (current)").width()
+                } else {
+                    0
+                };
+                label_width.saturating_sub(prefix + current)
+            })
+            .collect();
+        let fitted = fit_distinct(&labels, &rooms);
+        for (i, fitted_label) in fitted.iter().enumerate() {
             let prefix = if i == self.selected_index {
                 "● "
             } else {
@@ -322,9 +433,7 @@ impl ModalConfig {
             } else {
                 ""
             };
-            let room = label_width
-                .saturating_sub(Span::raw(prefix).width() + Span::raw(selected_indicator).width());
-            let line = format!("{}{}{}", prefix, label.fit(room), selected_indicator);
+            let line = format!("{}{}{}", prefix, fitted_label, selected_indicator);
 
             if i == self.selected_index {
                 lines.push(Line::from(vec![Span::styled(
@@ -574,6 +683,84 @@ mod tests {
         ] {
             assert_eq!(url_host(raw).as_deref(), Some(host), "{raw}");
         }
+    }
+
+    #[test]
+    fn narrow_list_disambiguates_truncated_hosts() {
+        // Two non-current configs whose hosts share a long prefix: at width 40
+        // a leading cut would render both as "○ ovhcloud - Qwen3-32B @ abcdefghij…".
+        let config = ShaiConfig {
+            providers: vec![
+                provider("openai", "gpt-4o", &[]),
+                provider(
+                    "ovhcloud",
+                    "Qwen3-32B",
+                    &[("OVH_BASE_URL", "https://abcdefghija.example.com/v1")],
+                ),
+                provider(
+                    "ovhcloud",
+                    "Qwen3-32B",
+                    &[("OVH_BASE_URL", "https://abcdefghijb.example.com/v1")],
+                ),
+            ],
+            ..ShaiConfig::default()
+        };
+        let screen = render_list_sized(config, 40);
+        let rows: Vec<&str> = screen.lines().filter(|l| l.contains("ovhcloud")).collect();
+        assert_eq!(rows.len(), 2, "{screen}");
+        assert!(rows[0].contains("#2"), "{screen}");
+        assert!(rows[1].contains("#3"), "{screen}");
+        assert_ne!(rows[0].trim_end(), rows[1].trim_end(), "{screen}");
+        for row in &rows {
+            assert!(row.contains("ovhcloud - Qwen3-32B @"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn fit_distinct_leaves_non_colliding_labels_unchanged() {
+        let labels = vec![
+            ProviderLabel {
+                head: "ovhcloud - Qwen3-32B".to_string(),
+                host: Some("oai.endpoints.kepler.ai.cloud.ovh.net".to_string()),
+                tail: String::new(),
+            },
+            ProviderLabel {
+                head: "ovhcloud - Qwen3-32B".to_string(),
+                host: Some("qwen-3-32b.endpoints.kepler.ai.cloud.ovh.net".to_string()),
+                tail: String::new(),
+            },
+        ];
+        let rooms = [34usize, 34];
+        let fitted = fit_distinct(&labels, &rooms);
+        assert_eq!(fitted[0], labels[0].fit(34));
+        assert_eq!(fitted[1], labels[1].fit(34));
+        assert_ne!(fitted[0], fitted[1]);
+        assert!(!fitted[0].contains('#'), "{}", fitted[0]);
+        assert!(!fitted[1].contains('#'), "{}", fitted[1]);
+    }
+
+    #[test]
+    fn fit_distinct_keeps_distinguishing_host_tail_when_it_fits() {
+        // Difference is near the end, so a leading cut still collides at this
+        // width, but a middle ellipsis can keep the unique suffix.
+        let labels = vec![
+            ProviderLabel {
+                head: "ovhcloud - Qwen3-32B".to_string(),
+                host: Some("verylongsharedprefix.service-a.example.com".to_string()),
+                tail: String::new(),
+            },
+            ProviderLabel {
+                head: "ovhcloud - Qwen3-32B".to_string(),
+                host: Some("verylongsharedprefix.service-b.example.com".to_string()),
+                tail: String::new(),
+            },
+        ];
+        // Host room = width - 23; 17 columns yields "ver…a.example.com".
+        let width = 40;
+        assert_eq!(labels[0].fit(width), labels[1].fit(width));
+        let fitted = fit_distinct(&labels, &[width, width]);
+        assert_eq!(fitted[0], "ovhcloud - Qwen3-32B @ ver…a.example.com");
+        assert_eq!(fitted[1], "ovhcloud - Qwen3-32B @ ver…b.example.com");
     }
 
     #[test]
