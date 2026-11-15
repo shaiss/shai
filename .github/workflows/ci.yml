@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   # Fork-only (shaiss/shai): offline self-tests for the Wave 0 shadow labeler.
   # No secrets, no network, no shai binary; never runs the labeler itself.
@@ -34,6 +37,10 @@ jobs:
             target: x86_64-unknown-linux-musl
             binary_name: shai
             asset_name: shai-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary_name: shai
+            asset_name: shai-linux-aarch64
 #          - os: windows-latest
 #            target: x86_64-pc-windows-msvc
 #            binary_name: shai.exe
@@ -57,14 +64,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential musl-tools
 
       - name: Add musl target (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: rustup target add x86_64-unknown-linux-musl
+        if: endsWith(matrix.target, '-linux-musl')
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -110,3 +117,61 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
           retention-days: 10
+
+  install-script:
+    name: Test install.sh on ${{ matrix.platform }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - os: macos-latest
+            platform: macos-aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download the binary built for this platform
+        uses: actions/download-artifact@v4
+        with:
+          name: shai-${{ matrix.platform }}
+          path: ${{ runner.temp }}/assets
+
+      - name: Serve it as a release asset to install.sh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          assets="$RUNNER_TEMP/assets"
+          cp "$assets/shai-$PLATFORM" "$assets/shai-unstable-$PLATFORM"
+          mkdir -p "$RUNNER_TEMP/stub"
+          cp .github/scripts/release-api-stub.sh "$RUNNER_TEMP/stub/curl"
+          chmod +x "$RUNNER_TEMP/stub/curl"
+          {
+            echo "STUB_PLATFORM=$PLATFORM"
+            echo "STUB_ASSET_DIR=$assets"
+            echo "STUB_REAL_CURL=$(command -v curl)"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/stub" >> "$GITHUB_PATH"
+
+      - name: sh install.sh, then shai --version
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -o pipefail
+          expected="shai version $(grep -m1 '^version' shai-cli/Cargo.toml | cut -d'"' -f2)"
+          for release in latest unstable; do
+            echo "::group::SHAI_RELEASE=$release"
+            rm -f "$HOME/.local/bin/shai"
+            SHAI_RELEASE="$release" sh install.sh | tee install.log
+            grep -q "Detected platform: $PLATFORM" install.log
+            version="$("$HOME/.local/bin/shai" --version)"
+            echo "$version"
+            test "$version" = "$expected"
+            echo "::endgroup::"
+          done
