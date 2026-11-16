@@ -1,4 +1,5 @@
 use crate::config::agent::VerificationConfig;
+use crate::tools::env_scrub::secret_env_names;
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
@@ -47,6 +48,10 @@ async fn run_command(
 ) -> Option<String> {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
+    // Checks run code the model just wrote (build scripts, tests): no keys.
+    for name in secret_env_names() {
+        cmd.env_remove(name);
+    }
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -317,5 +322,17 @@ mod tests {
 
         let config = config_with(&[("python", &["false"])]);
         assert!(run_verification(&[], &None, &config).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_verification_command_does_not_inherit_secrets() {
+        const SECRET: &str = "SHAI_TEST_VERIFY_FOO_API_KEY";
+        std::env::set_var(SECRET, "sk-should-not-leak");
+        let args = vec!["env".to_string()];
+        let out = run_command(&args, "env", &None, 10).await;
+        std::env::remove_var(SECRET);
+        let out = out.expect("env prints its environment");
+        assert!(!out.contains(SECRET), "secret var leaked: {out}");
+        assert!(out.lines().any(|l| l.starts_with("PATH=")), "{out}");
     }
 }
