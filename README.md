@@ -70,14 +70,16 @@ shai --latest                # Restore the most recent session
 Run shai without the TUI for scripting and automation:
 
 ```bash
-shai -p "make me a hello world in main.py"
-echo "make me a hello world in main.py" | shai
+shai --yes -p "make me a hello world in main.py"
+echo "make me a hello world in main.py" | shai --yes
 ```
+
+Headless runs only read-only tools unless you pass `--yes`, which lets the agent write files, run bash and use the network. See [Headless permissions](docs/cli-reference.md#headless-permissions).
 
 Chain multiple shai calls together:
 
 ```bash
-echo "make me a hello world in main.py" | shai --trace | shai -p "now run it!"
+echo "make me a hello world in main.py" | shai --yes --trace | shai --yes -p "now run it!"
 ```
 
 ### Interactive Pipe Mode
@@ -94,7 +96,10 @@ Run shai as an HTTP service with SSE streaming support:
 
 ```bash
 shai serve --port 3000
+shai serve --port 3000 --yes   # let sessions write files, run bash and use the network
 ```
+
+Without `--yes`, sessions run only read-only tools; other tool calls are denied immediately.
 
 ![shai http](./docs/assets/shai-http.png)
 
