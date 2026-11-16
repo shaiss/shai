@@ -168,19 +168,25 @@ fn shorten_host(host: &str, room: usize, suffix_start: Option<usize>) -> String 
 }
 
 /// `prefix…tail` keeping `host[suffix_start..]`, if that tail fits in `room`.
+/// Lengths are counted in chars and cuts land on char boundaries; a
+/// `suffix_start` byte index inside a char keeps that whole char.
 fn shorten_middle(host: &str, room: usize, suffix_start: usize) -> Option<String> {
-    let n = host.len();
+    let n = host.chars().count();
     if n <= room {
         return Some(host.to_string());
     }
-    let suffix_start = suffix_start.min(n);
-    let suffix_len = n - suffix_start;
+    let mut suffix_start = suffix_start.min(host.len());
+    while !host.is_char_boundary(suffix_start) {
+        suffix_start -= 1;
+    }
+    let suffix = &host[suffix_start..];
+    let suffix_len = suffix.chars().count();
     let inner = room - 1;
     if suffix_len == 0 || suffix_len > inner {
         return None;
     }
-    let prefix_len = inner - suffix_len;
-    Some(format!("{}…{}", &host[..prefix_len], &host[suffix_start..]))
+    let prefix: String = host.chars().take(inner - suffix_len).collect();
+    Some(format!("{}…{}", prefix, suffix))
 }
 
 /// "<provider> - <model>", plus the host when the config has a usable `*_BASE_URL`.
@@ -761,6 +767,52 @@ mod tests {
         let fitted = fit_distinct(&labels, &[width, width]);
         assert_eq!(fitted[0], "ovhcloud - Qwen3-32B @ ver…a.example.com");
         assert_eq!(fitted[1], "ovhcloud - Qwen3-32B @ ver…b.example.com");
+    }
+
+    #[test]
+    fn shorten_middle_cuts_multibyte_host_on_char_boundaries() {
+        // Each 'ë' is two bytes: a byte-based prefix cut lands inside one.
+        let host = "ëëëëëëëëëë.one";
+        let suffix_start = host.find(".one").unwrap();
+        assert_eq!(
+            shorten_middle(host, 8, suffix_start),
+            Some("ëëë….one".to_string())
+        );
+    }
+
+    #[test]
+    fn shorten_middle_handles_suffix_start_inside_a_char() {
+        // 'ö' and 'ü' share their first byte, so the first differing byte
+        // index points inside the character; the whole character is kept.
+        let host = "ëëëëëëëëëë.ö";
+        let suffix_start = host.len() - 1;
+        assert!(!host.is_char_boundary(suffix_start));
+        assert_eq!(
+            shorten_middle(host, 6, suffix_start),
+            Some("ëëëë…ö".to_string())
+        );
+    }
+
+    #[test]
+    fn fit_distinct_keeps_multibyte_host_tail() {
+        let labels = vec![
+            ProviderLabel {
+                head: "custom - m".to_string(),
+                host: Some("ëëëëëëëëëëëëëëëëëëëë.ö.example".to_string()),
+                tail: String::new(),
+            },
+            ProviderLabel {
+                head: "custom - m".to_string(),
+                host: Some("ëëëëëëëëëëëëëëëëëëëë.ü.example".to_string()),
+                tail: String::new(),
+            },
+        ];
+        // Host room = width - 13 = 12 columns: a leading cut collides.
+        let width = 25;
+        assert_eq!(labels[0].fit(width), labels[1].fit(width));
+        let fitted = fit_distinct(&labels, &[width, width]);
+        assert_eq!(fitted[0], "custom - m @ ëë…ö.example");
+        assert_eq!(fitted[1], "custom - m @ ëë…ü.example");
     }
 
     #[test]
