@@ -49,9 +49,7 @@ async fn test_coder_brain_creation() {
     if skip_unless_live_llm("test_coder_brain_creation") {
         return;
     }
-    let (_llm_client, _model) = get_llm().await.expect("No LLM provider available");
-    let llm_client = Arc::new(LlmClient::first_from_env().expect("No LLM provider available"));
-    let model = llm_client.default_model().await.expect("default model");
+    let (llm_client, model) = get_llm().await.expect("No LLM provider available");
 
     let brain = CoderBrain::new(llm_client, model.clone());
 

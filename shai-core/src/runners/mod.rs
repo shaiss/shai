@@ -64,8 +64,10 @@ pub(crate) mod test_helpers {
         // Refuse the built-in anonymous default: live tests must hit a provider
         // the developer configured. The load error is not echoed, so no config
         // content can leak into test output.
-        crate::config::config::ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
-        let (client, model) = crate::config::config::ShaiConfig::get_llm().await?;
+        let config = crate::config::config::ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
+        // Build from the config loaded above: a second load could fall back to
+        // the anonymous default if the file changed in between.
+        let (client, model) = config.get_llm_from_config().await?;
         Ok((std::sync::Arc::new(client), model))
     }
 

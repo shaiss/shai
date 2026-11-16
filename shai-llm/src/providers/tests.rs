@@ -308,9 +308,9 @@ pub async fn test_provider_chat_stream(provider: Box<dyn LlmProvider>) {
 }
 
 /// Env var that opts in to tests that call a real LLM provider.
-const LIVE_LLM_TESTS_ENV: &str = "SHAI_LIVE_LLM_TESTS";
+pub(crate) const LIVE_LLM_TESTS_ENV: &str = "SHAI_LIVE_LLM_TESTS";
 
-fn live_llm_tests_enabled() -> bool {
+pub(crate) fn live_llm_tests_enabled() -> bool {
     std::env::var(LIVE_LLM_TESTS_ENV).as_deref() == Ok("1")
 }
 

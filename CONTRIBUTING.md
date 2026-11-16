@@ -16,12 +16,15 @@ Tests that call a real LLM provider are skipped unless you opt in with
 
     SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners::
     SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- tools::tests_llm
+    SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-llm
 
 The coder, searcher and tool tests use your `shai auth` config file and fail
 if there is none, rather than falling back to shai's built-in anonymous
 OVHcloud endpoint. The gerund tests read provider environment variables
-directly (e.g. `OPENROUTER_API_KEY`), falling back to a local Ollama. Either
-way they may cost tokens.
+directly (e.g. `OPENROUTER_API_KEY`), falling back to a local Ollama. The
+`shai-llm` provider tests read provider environment variables (e.g.
+`OPENAI_API_KEY`) and skip any provider whose key is unset. All of them may
+cost tokens.
 
 The gate only covers LLM calls. Other tests may still touch the network: for
 example, the MCP tests in `shai-core/src/tools/mcp` launch `uvx mcp-server-fetch`

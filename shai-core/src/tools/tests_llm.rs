@@ -21,9 +21,10 @@ mod llm_integration_tests {
         init_test_logging();
 
         // Same guard as runners::test_helpers::get_llm: never use the built-in
-        // anonymous default. The load error is not echoed.
-        ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
-        let (llm_client, model) = ShaiConfig::get_llm()
+        // anonymous default, and build from this one load. The load error is not echoed.
+        let config = ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
+        let (llm_client, model) = config
+            .get_llm_from_config()
             .await
             .map_err(|e| format!("No LLM provider available: {}", e))?;
 

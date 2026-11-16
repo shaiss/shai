@@ -329,10 +329,18 @@ impl ShaiConfig {
             tracing::warn!("Failed to load config, using default: {}", e);
             ShaiConfig::default()
         });
+        config.get_llm_from_config().await
+    }
 
-        config.set_env_vars();
+    /// Build the LLM client and default model from this already-loaded config.
+    /// Unlike [`ShaiConfig::get_llm`], this never loads the file again and never
+    /// falls back to [`ShaiConfig::default`].
+    pub async fn get_llm_from_config(
+        &self,
+    ) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
+        self.set_env_vars();
 
-        let llm = if let Some(provider_config) = config.get_selected_provider() {
+        let llm = if let Some(provider_config) = self.get_selected_provider() {
             LlmClient::create_provider(&provider_config.provider, &provider_config.env_vars)
                 .map_err(|e| {
                     format!(

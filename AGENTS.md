@@ -79,7 +79,9 @@ When using `-p` with cargo commands, always use the package name (e.g., `cargo b
   `shai-llm` per-provider tests) are skipped unless `SHAI_LIVE_LLM_TESTS=1`. A skipped test
   prints a one-line reason and passes. To run them:
   `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners::` and
-  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- tools::tests_llm` (they may cost tokens).
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- tools::tests_llm` and
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-llm` (they may cost tokens). The `shai-llm` tests
+  read provider env vars (e.g. `OPENAI_API_KEY`) and skip a provider whose key is unset.
   The coder, searcher and tool tests need a `shai auth` config file and fail without one
   (they never use the built-in anonymous endpoint); the gerund tests read provider env vars,
   falling back to a local Ollama. New tests that need a model must call `skip_unless_live_llm`

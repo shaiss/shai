@@ -9,4 +9,4 @@ pub mod ovhcloud;
 // pub mod mistral_native; // TODO: Complete implementation
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
