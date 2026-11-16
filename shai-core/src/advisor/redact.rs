@@ -219,6 +219,12 @@ fn can_be_known(value: &str) -> bool {
     value.chars().any(char::is_alphanumeric)
 }
 
+/// A JSON escape cut off at the end of a text: `\`, `\u`, `\u0` up to
+/// `\u00`, or a first half of a surrogate pair that lost its second.
+static UNFINISHED_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\\[uU][dD][89abAB][0-9a-fA-F]{2})?\\(?:[uU][0-9a-fA-F]{0,3})?$").unwrap()
+});
+
 /// `text` with its JSON escapes `\uXXXX` (either case, surrogate pairs
 /// joined) and `\/` decoded, and for each byte of the decoded text, the
 /// offset in `text` it comes from, with one more entry for its end.
@@ -440,7 +446,7 @@ static PUTTY_PRIVATE: LazyLock<Regex> = LazyLock::new(|| {
     // front of a line: a number and a hash, a diff mark, `file:12:` as
     // `grep -n` writes it.
     Regex::new(
-        r"(?m)^([^\n]{0,80}?Private-Lines: *\d+)[ \t]*\r?\n((?:(?:[ \t]*\d+(?::[ \t]*[0-9a-f]{8}[ \t]|\t|[:|]))?(?:[^\n:]{0,64}:\d+[:-])?[-+> ]?[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
+        r"(?m)^([^\n]{0,80}?Private-Lines: *\d+)[ \t]*\r?\n((?:(?:[ \t]*\d+(?::[ \t]*[0-9a-f]{8}[ \t]|\t|[:|-])|[^\n]{0,64}?[:-]\d+[:-])?[-+> ]?[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
     )
     .unwrap()
 });
@@ -710,7 +716,7 @@ static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // A call given a name and a value: `define('DB_PASSWORD', 'x')`,
         // `os.Setenv("API_TOKEN", "x")`, `headers.put("X-Api-Key", "x")`.
         format!(
-            r#"\b[A-Za-z_][\w.:]{{0,60}}\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{{0,80}})["']\s*,\s*{VALUE}"#
+            r#"\b[A-Za-z_][\w.:]{{0,60}}[ \t]*\(\s*["'](?P<name>[A-Za-z_][\w.-]{{0,80}})["']\s*,\s*{VALUE}"#
         ),
         // A setter named after what it sets: `ds.setPassword("x")`.
         format!(r#"\bset(?P<name>[A-Z][A-Za-z]{{0,40}})\s*\(\s*{VALUE}"#),
@@ -722,7 +728,7 @@ static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // A name and its value as attributes, in either order:
         // `<add key="Password" value="x"/>`, `<property value="x" name="password"/>`.
         format!(
-            r#"\b(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["'][^>\n]{{0,200}}?\bvalue\s*=\s*{VALUE}"#
+            r#"\b(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["'][^>]{{0,200}}?\bvalue\s*=\s*{VALUE}"#
         ),
         format!(
             r#"\bvalue\s*=\s*{VALUE}\s+(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["']"#
@@ -740,7 +746,10 @@ static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// when the name says it is a credential, or when the form says so alone.
 fn redact_handed_over(text: &str) -> String {
     let mut out = text.to_string();
-    for rule in HANDED_OVER.iter() {
+    for (index, rule) in HANDED_OVER.iter().enumerate() {
+        // The first rule takes any call: its second argument is often a
+        // default or a description rather than a value.
+        let any_call = index == 0;
         if !rule.is_match(&out) {
             continue;
         }
@@ -762,7 +771,18 @@ fn redact_handed_over(text: &str) -> String {
                 let placeholder = ["${", "#{", "$(", "%(", "{{"]
                     .iter()
                     .any(|mark| shown.starts_with(mark));
-                if !named || shown.is_empty() || shown == REDACTED || placeholder {
+                // A default or a description handed to a call: a number, a
+                // keyword, the name again, or words of a sentence.
+                let ordinary = any_call
+                    && (is_number_or_keyword(shown)
+                        || found
+                            .name("name")
+                            .is_some_and(|name| name.as_str().eq_ignore_ascii_case(shown))
+                        || (shown.contains(' ')
+                            && shown
+                                .chars()
+                                .all(|c| c.is_alphabetic() || c == ' ' || c == '.' || c == ',')));
+                if !named || shown.is_empty() || shown == REDACTED || placeholder || ordinary {
                     return whole.as_str().to_string();
                 }
                 let (start, end) = (value.start() - whole.start(), value.end() - whole.start());
@@ -1887,23 +1907,36 @@ impl Redactor {
     /// beginning is left at the end of the text: that beginning goes too.
     pub(crate) fn redact_truncated(&self, text: &str) -> String {
         // The longest beginning of a known value that the text ends with.
-        let cut = self
-            .known
-            .iter()
-            .filter_map(|secret| {
-                (MIN_CUT_SECRET_LEN..secret.len())
-                    .rev()
-                    .filter(|len| secret.is_char_boundary(*len))
-                    .find(|len| text.ends_with(&secret[..*len]))
+        let longest_prefix = |text: &str| {
+            self.known
+                .iter()
+                .filter_map(|secret| {
+                    (MIN_CUT_SECRET_LEN..secret.len())
+                        .rev()
+                        .filter(|len| secret.is_char_boundary(*len))
+                        .find(|len| text.ends_with(&secret[..*len]))
+                })
+                .max()
+        };
+        let raw = longest_prefix(text).map(|len| text.len() - len);
+        // The same, behind JSON escapes, an escape cut in two at the end
+        // left out.
+        let escaped = (text.contains("\\u") || text.contains("\\/"))
+            .then(|| {
+                let whole = UNFINISHED_ESCAPE
+                    .find(text)
+                    .map_or(text, |unfinished| &text[..unfinished.start()]);
+                let (decoded, origin) = decode_json_escapes(whole);
+                longest_prefix(&decoded).map(|len| origin[decoded.len() - len])
             })
-            .max();
-        let Some(len) = cut else {
+            .flatten();
+        let Some(cut) = [raw, escaped].into_iter().flatten().min() else {
             return self.redact(text);
         };
         // What looks like a beginning may be the end of a value that is
         // there in full, as in a password that repeats itself: a value the
         // cut would go through goes whole.
-        let mut start = text.len() - len;
+        let mut start = cut;
         while let Some(head) = self.known.iter().find_map(|secret| {
             (1..secret.len())
                 .filter(|head| secret.is_char_boundary(*head))
@@ -2600,6 +2633,22 @@ mod tests {
         let cut = format!("line\nheader: {}", &KEY[..KEY.len() - 5]);
         assert_eq!(redactor.redact_truncated(&cut), "line\nheader: [redacted]");
         assert_eq!(redactor.redact_truncated("nothing cut"), "nothing cut");
+        // Cut behind a JSON escape, or inside one.
+        let escaped = Redactor::new(
+            [("SOME_KEY", "abc+def/ghi=jkl0123")],
+            Vec::<(String, String)>::new(),
+            &[],
+        );
+        for cut in [
+            r#"{"k":"abc\u002Bdef\/gh"#,
+            r#"{"k":"abc\u002Bdef\/ghi=jk\u00"#,
+        ] {
+            let out = escaped.redact_truncated(cut);
+            assert!(
+                !out.contains("def") && out.ends_with(REDACTED),
+                "{cut} -> {out}"
+            );
+        }
         // A beginning too short to tell from ordinary text stays.
         assert_eq!(redactor.redact_truncated("the ovh"), "the ovh");
     }
@@ -3310,7 +3359,7 @@ mod tests {
             "-1.234567890123456e25",
         ] {
             let out = redactor.redact_json(&format!(r#"{{"pin": {number}}}"#));
-            assert!(!out.contains("1234567890123456"), "{number} -> {out}");
+            assert_eq!(out, r#"{"pin":"[redacted]"}"#, "{number}");
         }
     }
 
@@ -3327,7 +3376,7 @@ mod tests {
         assert!(!redactor.redact(cut).contains("lQOYBF8"));
 
         // As a listing shows it, with numbered lines.
-        for lead in ["-", "+", "key.ppk:12:"] {
+        for lead in ["-", "+", "key.ppk:12:", "11-", "key.ppk-11-"] {
             let text = format!(
                 "{lead}Private-Lines: 1\n{lead}AAABAQCs0123456789abcdef\n{lead}Private-MAC: 0a1b"
             );
@@ -3475,6 +3524,14 @@ mod tests {
                 "<add key=\"Password\" type=\"string\" value=\"[redacted]\" />",
             ),
             (
+                "<add key=\"Password\"\n     value=\"Sup3rS3cretPw\" />",
+                "<add key=\"Password\"\n     value=\"[redacted]\" />",
+            ),
+            (
+                "<add\n  key=\"ApiKey\"\n  value=\"abcd1234efgh5678\" />",
+                "<add\n  key=\"ApiKey\"\n  value=\"[redacted]\" />",
+            ),
+            (
                 "ALTER USER bob IDENTIFIED BY 'it\\'s-Sup3rS3cret';",
                 "ALTER USER bob IDENTIFIED BY '[redacted]';",
             ),
@@ -3506,6 +3563,11 @@ mod tests {
             "<password>${env.DB_PASSWORD}</password>",
             "ds.setUrl(\"jdbc:postgresql://db/app\");",
             "throw new Error(\"Invalid password \" + attempts + \" attempts left\");",
+            "EnvVar::required(\"OPENAI_API_KEY\", \"OpenAI API key\"),",
+            "os.environ.get(\"TOKENIZERS_PARALLELISM\", \"false\")",
+            "config.get(\"max_tokens\", \"4096\")",
+            "t(\"password\", \"Password\")",
+            "// a comment that ends in data.\n(\"secrets\", \"db_password.txt\"),",
         ] {
             assert_eq!(redactor.redact(input), input);
         }
