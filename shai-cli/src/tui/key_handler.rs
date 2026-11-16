@@ -84,11 +84,14 @@ impl App<'_> {
                             Duration::from_secs(2),
                         );
 
+                        let agent_name = self.agent_meta.name().map(|s| s.to_string());
+                        if !self.may_replace_agent(agent_name.as_deref()) {
+                            return Ok(());
+                        }
                         if let Some(agent) = self.agent.take() {
                             let _ = agent.controller.terminate().await;
                         }
 
-                        let agent_name = self.agent_meta.name().map(|s| s.to_string());
                         self.start_agent(agent_name.as_deref()).await.map_err(|e| {
                             io::Error::other(format!("Failed to start agent: {}", e))
                         })?;

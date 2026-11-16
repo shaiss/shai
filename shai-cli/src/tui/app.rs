@@ -283,10 +283,38 @@ impl App<'_> {
         Ok(())
     }
 
+    /// Whether the running agent may be replaced by one on the agent
+    /// `agent_name` (`None`: the primary model of the auth config). Not when
+    /// that would start from an auth config that is there and cannot be
+    /// read: the new agent would not start, and the session would be left
+    /// without one. The user is told why.
+    pub(crate) fn may_replace_agent(&mut self, agent_name: Option<&str>) -> bool {
+        if agent_name.is_some() {
+            return true;
+        }
+        self.may_replace_agent_given(SessionOptions::config_problem())
+    }
+
+    /// [`App::may_replace_agent`] for an agent on the auth config, given what
+    /// is wrong with that config file, if anything.
+    fn may_replace_agent_given(&mut self, config_problem: Option<String>) -> bool {
+        match config_problem {
+            Some(problem) => {
+                self.session_notices
+                    .push(format!("the agent was not replaced: {problem}"));
+                false
+            }
+            None => true,
+        }
+    }
+
     pub async fn swap_agent(
         &mut self,
         agent_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.may_replace_agent(agent_name) {
+            return Ok(());
+        }
         let trace = if let Some(ref agent) = self.agent {
             agent.controller.get_trace().await.ok()
         } else {
@@ -667,6 +695,22 @@ mod tests {
         app.show_unseen_switch();
         app.handle_agent_event(switched()).await.unwrap();
         assert_eq!(switch_lines(&app), 1);
+    }
+
+    #[test]
+    fn an_agent_is_not_replaced_by_one_that_could_not_start() {
+        let mut app = App::new();
+        assert!(app.may_replace_agent_given(None));
+        assert!(app.session_notices.is_empty());
+        assert!(!app.may_replace_agent_given(Some(
+            "the config file /x/auth.config.json could not be loaded (line 3)".to_string()
+        )));
+        assert_eq!(
+            app.session_notices,
+            ["the agent was not replaced: the config file /x/auth.config.json could not be loaded (line 3)"]
+        );
+        // An agent of its own config does not depend on that file.
+        assert!(app.may_replace_agent(Some("reviewer")));
     }
 
     #[test]
