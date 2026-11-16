@@ -57,10 +57,14 @@ pub(crate) mod test_helpers {
         });
     }
 
-    /// Helper to get an LLM client + model from ShaiConfig.
-    /// Falls back to environment variables if no config file exists.
+    /// Helper to get an LLM client + model from the `shai auth` config file.
+    /// Errors if no config file exists, instead of using the anonymous default.
     pub async fn get_llm() -> Result<(std::sync::Arc<LlmClient>, String), Box<dyn std::error::Error>>
     {
+        // Refuse the built-in anonymous default: live tests must hit a provider
+        // the developer configured. The load error is not echoed, so no config
+        // content can leak into test output.
+        crate::config::config::ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
         let (client, model) = crate::config::config::ShaiConfig::get_llm().await?;
         Ok((std::sync::Arc::new(client), model))
     }

@@ -20,6 +20,9 @@ mod llm_integration_tests {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         init_test_logging();
 
+        // Same guard as runners::test_helpers::get_llm. The message must not
+        // match the skip substrings below, so a missing config fails loudly.
+        ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
         let (llm_client, model) = ShaiConfig::get_llm()
             .await
             .map_err(|e| format!("No LLM provider available: {}", e))?;

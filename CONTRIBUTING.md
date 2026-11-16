@@ -17,9 +17,10 @@ Tests that call a real LLM provider are skipped unless you opt in with
     SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners::
     SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- tools::tests_llm
 
-The coder, searcher and tool tests use your `shai auth` config (falling back to
-provider environment variables); the gerund tests read provider environment
-variables directly (e.g. `OPENROUTER_API_KEY`), falling back to Ollama. Either
+The coder, searcher and tool tests use your `shai auth` config file and fail
+if there is none, rather than falling back to shai's built-in anonymous
+OVHcloud endpoint. The gerund tests read provider environment variables
+directly (e.g. `OPENROUTER_API_KEY`), falling back to a local Ollama. Either
 way they may cost tokens.
 
 The gate only covers LLM calls. Other tests may still touch the network: for
