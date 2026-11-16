@@ -459,16 +459,23 @@ impl CommandRegistry {
                 auth.run().await;
                 app.resume_event_reader();
 
-                // Recreate agent
-                app.start_agent(agent_name.as_deref()).await.ok();
-
-                if let Some(trace) = trace {
-                    if let Some(ref agent) = app.agent {
-                        let _ = agent.controller.load_trace(trace).await;
+                // Recreate agent. `start_agent` resolves what the session was
+                // asked for against the config as it is now.
+                match app.start_agent(agent_name.as_deref()).await {
+                    Ok(_) => {
+                        if let Some(trace) = trace {
+                            if let Some(ref agent) = app.agent {
+                                let _ = agent.controller.load_trace(trace).await;
+                            }
+                        }
+                        app.notify("Provider configuration updated", Duration::from_secs(2));
                     }
+                    // Say why there is no agent, instead of reporting an
+                    // update that started nothing.
+                    Err(error) => app
+                        .session_notices
+                        .push(format!("no agent was started: {error}")),
                 }
-
-                app.notify("Provider configuration updated", Duration::from_secs(2));
             }
             "/agent" => {
                 app.ui_state.agent_picker = Some(super::agent_picker::AgentPicker::new(

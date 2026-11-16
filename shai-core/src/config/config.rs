@@ -1,3 +1,5 @@
+use super::lenient::Lenient;
+use super::prewalk::PrewalkConfig;
 use super::roles::RolesConfig;
 use crate::tools::mcp::McpConfig;
 use json_comments::StripComments;
@@ -43,6 +45,8 @@ pub struct ShaiConfig {
     pub mcp_configs: HashMap<String, McpConfig>,
     /// Named secondary models, see [`crate::config::roles`].
     pub roles: RolesConfig,
+    /// One-shot handoff to another model, see [`crate::config::prewalk`].
+    pub prewalk: Lenient<PrewalkConfig>,
 }
 
 // Reading and writing are spelled out instead of derived for the sake of the
@@ -60,6 +64,7 @@ impl Serialize for ShaiConfig {
         map.serialize_entry("selected_provider", &self.selected_provider)?;
         map.serialize_entry("mcp_configs", &self.mcp_configs)?;
         self.roles.section().write("roles", &mut map)?;
+        self.prewalk.section().write("prewalk", &mut map)?;
         map.end()
     }
 }
@@ -93,6 +98,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                 let mut selected_provider = None;
                 let mut mcp_configs = None;
                 let mut roles = RolesConfig::default();
+                let mut prewalk = Lenient::unset();
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -103,6 +109,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                         "mcp_configs" => once(&mut mcp_configs, "mcp_configs", &mut map)?,
                         // Optional sections: every copy is kept as text.
                         "roles" => roles.section_mut().push(map.next_value()?),
+                        "prewalk" => prewalk.section_mut().push(map.next_value()?),
                         _ => {
                             map.next_value::<IgnoredAny>()?;
                         }
@@ -115,6 +122,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                         .ok_or_else(|| de::Error::missing_field("selected_provider"))?,
                     mcp_configs: mcp_configs.unwrap_or_default(),
                     roles,
+                    prewalk,
                 })
             }
         }
@@ -137,6 +145,7 @@ impl ShaiConfig {
     fn from_pulled_json(config_json: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config: ShaiConfig = serde_json::from_str(config_json)?;
         config.roles = RolesConfig::default();
+        config.prewalk = Lenient::unset();
         Ok(config)
     }
 
@@ -412,6 +421,7 @@ impl Default for ShaiConfig {
             selected_provider: 0,
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
+            prewalk: Lenient::unset(),
         }
     }
 }
@@ -455,6 +465,7 @@ mod tests {
             selected_provider: 0,
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
+            prewalk: Lenient::unset(),
         };
         config.add_provider(
             provider.to_string(),
@@ -537,12 +548,14 @@ mod tests {
                     {"provider": "ollama", "env_vars": {}, "model": "llama3", "tool_method": "FunctionCall"}
                 ],
                 "selected_provider": 0,
-                "roles": {"planner": "ollama/other"}
+                "roles": {"planner": "ollama/other"},
+                "prewalk": {"into": "planner"}
             }"#,
         )
         .unwrap();
         assert_eq!(pulled.providers.len(), 1);
         assert!(pulled.roles.is_unset());
+        assert!(pulled.prewalk.is_unset());
         assert!(pulled.resolve_role("planner").unwrap().is_none());
     }
 

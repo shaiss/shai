@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::headless::tools::ToolConfig;
+use crate::session_options::SessionOptions;
 
 use super::tools::{list_all_tools, restrict_toolbox, ToolName};
 use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
@@ -22,6 +23,7 @@ pub enum AgentKind {
 pub struct AppHeadless {
     kind: AgentKind,
     temperature: Option<f32>,
+    session_options: SessionOptions,
 }
 
 impl AppHeadless {
@@ -29,7 +31,12 @@ impl AppHeadless {
         Self {
             kind: AgentKind::Coder,
             temperature: None,
+            session_options: SessionOptions::default(),
         }
+    }
+
+    pub fn set_session_options(&mut self, session_options: SessionOptions) {
+        self.session_options = session_options;
     }
 
     pub fn set_temperature(&mut self, temperature: f32) {
@@ -61,7 +68,7 @@ impl AppHeadless {
             return Ok(());
         }
 
-        let agent = if let Some(agent_name) = agent_name {
+        let mut agent = if let Some(agent_name) = agent_name {
             // Use custom agent from config
             let mut builder = AgentBuilder::create(Some(agent_name.clone()))
                 .await
@@ -124,6 +131,14 @@ impl AppHeadless {
 
         if let Some(temp) = self.temperature {
             *agent.temperature.write().await = temp;
+        }
+
+        // One line on stderr when a handoff is armed, or when one was asked
+        // for and this agent cannot take it. The switch itself is announced,
+        // also in one line, by the event handler below.
+        let mut session_options = self.session_options.clone();
+        if let Some(notice) = session_options.arm(&mut agent) {
+            eprintln!("{}", shai_core::agent::output::notice_line(&notice));
         }
 
         let result = agent
