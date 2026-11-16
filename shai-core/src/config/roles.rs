@@ -292,8 +292,10 @@ impl RolesConfig {
         validate_role_name(role)?;
         let entries = self.checked_entries()?;
         match entries.into_iter().find(|(name, _)| name == role) {
-            None | Some((_, serde_json::Value::Null)) => Ok(None),
+            None => Ok(None),
             Some((_, serde_json::Value::String(reference))) => Ok(Some(reference)),
+            // `null` included: a value was written, and it is not a
+            // reference. Only a role that is not listed is turned off.
             Some(_) => Err(RoleError::InvalidRoleEntry {
                 role: role.to_string(),
             }),
@@ -1015,10 +1017,17 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // A null entry is the same as no entry, and is not listed.
+        // A null entry is not the same as no entry: something was written,
+        // and it is not a reference.
         let cfg = parse_with_roles(r#"{"planner": null}"#);
-        assert!(cfg.resolve_role("planner").unwrap().is_none());
-        assert!(cfg.roles.names().is_empty());
+        assert!(matches!(
+            cfg.resolve_role("planner"),
+            Err(RoleError::InvalidRoleEntry { .. })
+        ));
+        assert!(matches!(
+            cfg.resolve_model_target("planner"),
+            Err(RoleError::InvalidRoleEntry { .. })
+        ));
     }
 
     #[test]
