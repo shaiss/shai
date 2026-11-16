@@ -6,7 +6,6 @@
 //! Every case here ends before a session starts, so no model is contacted,
 //! and every case has a config file, so no starter config is downloaded.
 
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -36,6 +35,11 @@ fn shai(config_file: &str, config: &str, args: &[&str]) -> Outcome {
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", &config_home)
         .env("NO_COLOR", "1")
+        // A request that should never be made fails here, without leaving
+        // the machine.
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
         .current_dir(&work)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -53,11 +57,19 @@ fn shai(config_file: &str, config: &str, args: &[&str]) -> Outcome {
         std::thread::sleep(Duration::from_millis(20));
     }
     let output = child.wait_with_output().unwrap();
-    assert!(
-        !Path::new(&config_home)
-            .join("shai")
-            .join(".shai.config")
-            .exists(),
+    // Nothing was fetched over the config file or next to it: the config
+    // directory holds what it held before.
+    let left: Vec<(String, String)> = std::fs::read_dir(config_home.join("shai"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            (entry.file_name().to_string_lossy().into_owned(), text)
+        })
+        .collect();
+    assert_eq!(
+        left,
+        [(config_file.to_string(), config.to_string())],
         "no starter config may be fetched"
     );
     Outcome {

@@ -428,16 +428,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn default_config(default_config_url: Option<String>) {
-    if ShaiConfig::load().is_ok() {
-        return;
-    }
-    // A config file that is there and does not load, the legacy one included,
-    // is the user's to fix: it is neither replaced nor shadowed by a starter
-    // config. The warning says where it is broken and not what it holds: the
-    // parser's own message can quote a value, and the file holds credentials.
-    if let Some((path, reason)) = ShaiConfig::load_problem() {
-        eprintln!("Warning: failed to load config at {}: {}", path, reason);
-        return;
+    // One look at the config decides. Looking twice could see it broken and
+    // then fine, while another process writes it, and fetch a starter config
+    // over it.
+    match ShaiConfig::load_for_roles() {
+        Ok(_) => return,
+        // A config file that is there and does not load, the legacy one
+        // included, is the user's to fix: it is neither replaced nor shadowed
+        // by a starter config. The warning says where it is broken and not
+        // what it holds: the parser's own message can quote a value, and the
+        // file holds credentials.
+        Err(shai_core::config::roles::RoleError::ConfigInvalid { path, reason }) => {
+            eprintln!("Warning: failed to load config at {}: {}", path, reason);
+            return;
+        }
+        Err(_) => {}
     }
 
     let default_url = match default_config_url {
