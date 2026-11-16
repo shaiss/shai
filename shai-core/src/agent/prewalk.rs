@@ -197,11 +197,14 @@ impl AgentCore {
         if prewalk.is_spent() {
             return Err(PrewalkArmError::Spent);
         }
+        // The tool a call by that name is dispatched to is the first one
+        // listed under it: that one has to be the built-in.
         let has_builtin = |name: &str| {
             self.tool_ctx
                 .available_tools
                 .iter()
-                .any(|tool| tool.group() == Some(BUILTIN_TOOL_GROUP) && tool.name() == name)
+                .find(|tool| tool.name() == name)
+                .is_some_and(|tool| tool.group() == Some(BUILTIN_TOOL_GROUP))
         };
         if !has_builtin(TODO_WRITE_TOOL) {
             return Err(PrewalkArmError::NoTrigger {
@@ -886,6 +889,19 @@ mod tests {
                 "{server}"
             );
         }
+
+        // Built-in tools that a server's tools of the same names come
+        // before: the calls go to the server's tools.
+        let mut tools = server_tools("files", "write").await;
+        tools.extend(server_tools("files", "edit").await);
+        tools.extend(default_tools());
+        let mut agent = coder_agent(&script, tools);
+        assert_eq!(
+            agent.arm_prewalk(target(&script)),
+            Err(PrewalkArmError::NoTrigger {
+                missing: "write or edit"
+            })
+        );
 
         // A brain that cannot change model.
         let brain = FixedBrain {
