@@ -69,10 +69,10 @@ struct Cli {
     /// List all available tools
     #[arg(long)]
     list_tools: bool,
-    /// Only allow these built-in tools (comma-separated). With --agent, restricts the agent's tools
+    /// Only allow these tools (comma-separated). With --agent, restricts the agent's tools; its MCP tools are listed as <server>:<tool>
     #[arg(long)]
     tools: Option<String>,
-    /// Remove specific tools (comma-separated), also from the --agent's tools
+    /// Remove specific tools (comma-separated), also from the --agent's tools (MCP tools as <server>:<tool>)
     #[arg(long)]
     remove: Option<String>,
     /// Set the LLM sampling temperature (default: 0.0)
