@@ -71,12 +71,16 @@ struct Cli {
     /// List all available tools
     #[arg(long)]
     list_tools: bool,
-    /// Only allow these built-in tools (comma-separated). With --agent, restricts the agent's tools
+    /// Only allow these tools (comma-separated). With --agent, restricts the agent's tools; its MCP tools are listed as <server>:<tool>
     #[arg(long)]
     tools: Option<String>,
-    /// Remove specific tools (comma-separated), also from the --agent's tools
+    /// Remove specific tools (comma-separated), also from the --agent's tools (MCP tools as <server>:<tool>)
     #[arg(long)]
     remove: Option<String>,
+    /// Headless mode only: allow tools that write files, run bash or use the
+    /// network. Without it, headless runs only read-only tools and deny the rest
+    #[arg(long)]
+    yes: bool,
     /// Set the LLM sampling temperature (default: 0.0)
     #[arg(long)]
     temperature: Option<f32>,
@@ -174,6 +178,10 @@ enum Commands {
         /// Maximum number of concurrent sessions (None = unlimited)
         #[arg(long)]
         max_sessions: Option<usize>,
+        /// Allow tools that write files, run bash or use the network in every
+        /// session. Without it, sessions run only read-only tools and deny the rest
+        #[arg(long)]
+        yes: bool,
     },
     /// Import configuration from .claude or .cursor into AGENTS.md
     Import {
@@ -309,8 +317,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent,
             ephemeral,
             max_sessions,
+            yes,
         }) => {
-            handle_serve(host, port, agent, ephemeral, max_sessions).await?;
+            handle_serve(host, port, agent, ephemeral, max_sessions, yes).await?;
         }
         Some(Commands::Import { overwrite }) => {
             handle_import(overwrite)?;
@@ -350,15 +359,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref stdin_content) = stdin_input {
                     messages.push(stdin_content.clone());
                 }
-                let _ = handle_fix(
-                    messages,
-                    cli.tools,
-                    cli.remove,
-                    cli.trace,
-                    cli.agent,
-                    cli.temperature,
-                    session_options.clone(),
-                )
+                let _ = handle_fix(HeadlessRun {
+                    prompt: messages,
+                    tools: cli.tools,
+                    remove: cli.remove,
+                    trace: cli.trace,
+                    agent_name: cli.agent,
+                    temperature: cli.temperature,
+                    yes: cli.yes,
+                    session_options: session_options.clone(),
+                })
                 .await;
                 return Ok(());
             }
@@ -383,15 +393,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 } else {
                     // Headless mode from pipe
-                    let _ = handle_fix(
-                        vec![stdin_content],
-                        cli.tools,
-                        cli.remove,
-                        cli.trace,
-                        cli.agent,
-                        cli.temperature,
-                        session_options.clone(),
-                    )
+                    let _ = handle_fix(HeadlessRun {
+                        prompt: vec![stdin_content],
+                        tools: cli.tools,
+                        remove: cli.remove,
+                        trace: cli.trace,
+                        agent_name: cli.agent,
+                        temperature: cli.temperature,
+                        yes: cli.yes,
+                        session_options: session_options.clone(),
+                    })
                     .await;
                     return Ok(());
                 }
@@ -506,15 +517,30 @@ async fn handle_config() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_fix(
+/// Everything a headless run (`-p` or piped stdin) needs from the command line.
+struct HeadlessRun {
     prompt: Vec<String>,
     tools: Option<String>,
     remove: Option<String>,
     trace: bool,
     agent_name: Option<String>,
     temperature: Option<f32>,
+    /// `--yes`: allow tools that write, run bash or use the network.
+    yes: bool,
     session_options: SessionOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
+}
+
+async fn handle_fix(run: HeadlessRun) -> Result<(), Box<dyn std::error::Error>> {
+    let HeadlessRun {
+        prompt,
+        tools,
+        remove,
+        trace,
+        agent_name,
+        temperature,
+        yes,
+        session_options,
+    } = run;
     let initial_trace: Vec<ChatMessage> = prompt
         .into_iter()
         .map(|p| ChatMessage::User {
@@ -528,7 +554,7 @@ async fn handle_fix(
         app.set_temperature(temp);
     }
     app.set_session_options(session_options);
-    app.run(initial_trace, tools, remove, trace, agent_name)
+    app.run(initial_trace, tools, remove, trace, agent_name, yes)
         .await
 }
 
@@ -749,6 +775,7 @@ async fn handle_serve(
     _agent: Option<String>,
     ephemeral: bool,
     max_sessions: Option<usize>,
+    yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
@@ -762,7 +789,8 @@ async fn handle_serve(
     let addr = format!("{}:{}", host, port);
     let config = shai_http::ServerConfig::new(addr)
         .with_ephemeral(ephemeral)
-        .with_max_sessions(max_sessions);
+        .with_max_sessions(max_sessions)
+        .with_allow_all_tools(yes);
 
     shai_http::start_server(config).await?;
 
@@ -912,5 +940,32 @@ mod cli_tests {
 
         // The flag needs a value.
         assert!(Cli::try_parse_from(["shai", "--prewalk-into"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod yes_flag_tests {
+    use super::*;
+
+    #[test]
+    fn headless_yes_defaults_off() {
+        let cli = Cli::try_parse_from(["shai", "-p", "hi"]).unwrap();
+        assert!(!cli.yes);
+        let cli = Cli::try_parse_from(["shai", "-p", "hi", "--yes"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn serve_yes_defaults_off() {
+        let cli = Cli::try_parse_from(["shai", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve { yes: false, .. })
+        ));
+        let cli = Cli::try_parse_from(["shai", "serve", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Serve { yes: true, .. })
+        ));
     }
 }

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod llm_integration_tests {
     use crate::config::config::ShaiConfig;
-    use crate::runners::test_helpers::init_test_logging;
+    use crate::runners::test_helpers::{init_test_logging, skip_unless_live_llm};
     use crate::tools::{
         AnyTool, BashTool, EditTool, FetchTool, FindTool, FsOperationLog, LsTool, ReadTool,
         TodoReadTool, TodoStorage, TodoWriteTool, WriteTool,
@@ -10,8 +10,46 @@ mod llm_integration_tests {
         ChatCompletionParametersBuilder, ChatCompletionToolChoice,
     };
     use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
+    use shai_llm::client::LlmClient;
     use std::sync::Arc;
+    use std::time::Duration;
     use tracing::debug;
+
+    /// Env var that overrides the per-call timeout of these live LLM tests.
+    const LLM_TEST_TIMEOUT_ENV: &str = "SHAI_LLM_TEST_TIMEOUT_SECS";
+    /// Default bound for one chat call (retries included). A stalled provider
+    /// used to hang the test run for minutes.
+    const DEFAULT_LLM_TEST_TIMEOUT_SECS: u64 = 120;
+
+    /// Parse the timeout override; invalid or zero values use the default.
+    fn llm_test_timeout_from(value: Option<&str>) -> Duration {
+        let secs = value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_LLM_TEST_TIMEOUT_SECS);
+        Duration::from_secs(secs)
+    }
+
+    fn llm_test_timeout() -> Duration {
+        llm_test_timeout_from(std::env::var(LLM_TEST_TIMEOUT_ENV).ok().as_deref())
+    }
+
+    /// Run one chat call with a hard time limit, so a provider that accepts
+    /// the request but never answers fails the test instead of hanging it.
+    async fn chat_with_timeout(
+        llm_client: &LlmClient,
+        request: openai_dive::v1::resources::chat::ChatCompletionParameters,
+        timeout: Duration,
+    ) -> Result<openai_dive::v1::resources::chat::ChatCompletionResponse, String> {
+        match tokio::time::timeout(timeout, llm_client.chat(request)).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err(format!(
+                "LLM call timed out after {}s (set {} to change)",
+                timeout.as_secs_f32(),
+                LLM_TEST_TIMEOUT_ENV
+            )),
+        }
+    }
 
     /// Test a tool with the first available LLM provider
     async fn test_tool_with_llm(
@@ -20,7 +58,11 @@ mod llm_integration_tests {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         init_test_logging();
 
-        let (llm_client, model) = ShaiConfig::get_llm()
+        // Same guard as runners::test_helpers::get_llm: never use the built-in
+        // anonymous default, and build from this one load. The load error is not echoed.
+        let config = ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
+        let (llm_client, model) = config
+            .get_llm_from_config()
             .await
             .map_err(|e| format!("No LLM provider available: {}", e))?;
 
@@ -60,18 +102,20 @@ mod llm_integration_tests {
         debug!(target: "misc", "Chat request: {}", serde_json::to_string_pretty(&request).unwrap());
 
         // Make the request
-        let response = llm_client.chat(request).await.map_err(|e| {
-            let error_str = e.to_string().to_lowercase();
-            if error_str.contains("connection")
-                || error_str.contains("refused")
-                || error_str.contains("error sending request")
-                || error_str.contains("tcp connect error")
-            {
-                format!("LLM service not available: {}", e)
-            } else {
-                format!("LLM request failed: {}", e)
-            }
-        })?;
+        let response = chat_with_timeout(&llm_client, request, llm_test_timeout())
+            .await
+            .map_err(|e| {
+                let error_str = e.to_lowercase();
+                if error_str.contains("connection")
+                    || error_str.contains("refused")
+                    || error_str.contains("error sending request")
+                    || error_str.contains("tcp connect error")
+                {
+                    format!("LLM service not available: {}", e)
+                } else {
+                    format!("LLM request failed: {}", e)
+                }
+            })?;
 
         // Debug the response received
         debug!(target: "misc", "Chat response: {}", serde_json::to_string_pretty(&response).unwrap());
@@ -114,30 +158,23 @@ mod llm_integration_tests {
         Ok(false)
     }
 
-    /// Helper macro to run LLM test with graceful fallback for connection issues
+    /// Helper macro to run an LLM test. It only runs after `skip_unless_live_llm`
+    /// has allowed an opt-in run, so any error (including an unreachable
+    /// provider) fails the test instead of passing silently.
     macro_rules! llm_test_with_fallback {
         ($test_fn:expr, $error_msg:expr) => {
             match $test_fn.await {
                 Ok(success) => assert!(success, $error_msg),
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    if error_str.contains("not available")
-                        || error_str.contains("no llm provider")
-                        || error_str.contains("connection")
-                        || error_str.contains("refused")
-                    {
-                        println!("⚠️  Skipping LLM test - {}", e);
-                        return; // Skip test if LLM service not available
-                    } else {
-                        panic!("LLM test failed with unexpected error: {}", e);
-                    }
-                }
+                Err(e) => panic!("LLM test failed: {}", e),
             }
         };
     }
 
     #[tokio::test]
     async fn test_bash_tool_with_llm() {
+        if skip_unless_live_llm("test_bash_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(BashTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Run the command 'echo hello world' using bash"),
@@ -147,6 +184,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_ls_tool_with_llm() {
+        if skip_unless_live_llm("test_ls_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(LsTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "List the files in the current directory"),
@@ -156,6 +196,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_fetch_tool_with_llm() {
+        if skip_unless_live_llm("test_fetch_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(FetchTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -168,6 +211,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_find_tool_with_llm() {
+        if skip_unless_live_llm("test_find_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(FindTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -180,6 +226,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_todo_read_tool_with_llm() {
+        if skip_unless_live_llm("test_todo_read_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(TodoReadTool::new(Arc::new(TodoStorage::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Show me the current todo list"),
@@ -189,6 +238,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_todo_write_tool_with_llm() {
+        if skip_unless_live_llm("test_todo_write_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(TodoWriteTool::new(Arc::new(TodoStorage::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Create a new todo item with the content 'Test LLM integration' and status 'pending'"),
@@ -198,6 +250,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_write_tool_with_llm() {
+        if skip_unless_live_llm("test_write_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(WriteTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -210,6 +265,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_read_tool_with_llm() {
+        if skip_unless_live_llm("test_read_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(ReadTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Read the contents of the file 'Cargo.toml'"),
@@ -219,6 +277,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_edit_tool_with_llm() {
+        if skip_unless_live_llm("test_edit_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(EditTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -231,10 +292,82 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_multiedit_tool_with_llm() {
+        if skip_unless_live_llm("test_multiedit_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(EditTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "In the file 'Cargo.toml', replace 'name' with 'project_name' and 'v0.0.1' with 'v0.0.2'"),
             "EditTool should be called by LLM"
         );
+    }
+
+    #[test]
+    fn llm_test_timeout_parses_override() {
+        assert_eq!(llm_test_timeout_from(None), Duration::from_secs(120));
+        assert_eq!(llm_test_timeout_from(Some("5")), Duration::from_secs(5));
+        assert_eq!(llm_test_timeout_from(Some("0")), Duration::from_secs(120));
+        assert_eq!(llm_test_timeout_from(Some("abc")), Duration::from_secs(120));
+    }
+
+    fn timeout_test_request() -> openai_dive::v1::resources::chat::ChatCompletionParameters {
+        ChatCompletionParametersBuilder::default()
+            .model("test-model")
+            .messages(vec![ChatMessage::User {
+                content: ChatMessageContent::Text("hello".to_string()),
+                name: None,
+            }])
+            .build()
+            .unwrap()
+    }
+
+    const OK_BODY: &str = r#"{"id":"c1","object":"chat.completion","created":1700000000,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+
+    #[tokio::test]
+    async fn chat_with_timeout_fails_fast_on_stalled_provider() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_chunked_body(|w| {
+                // Stall well past the test timeout before answering.
+                std::thread::sleep(Duration::from_secs(3));
+                w.write_all(OK_BODY.as_bytes())
+            })
+            .create_async()
+            .await;
+
+        let client = LlmClient::compatible("test-key".to_string(), server.url());
+        let started = std::time::Instant::now();
+        let err = chat_with_timeout(&client, timeout_test_request(), Duration::from_millis(300))
+            .await
+            .expect_err("stalled provider should time out");
+
+        assert!(err.contains("timed out"), "{}", err);
+        assert!(err.contains(LLM_TEST_TIMEOUT_ENV), "{}", err);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout should fire before the mock answers, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_timeout_returns_prompt_response() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(OK_BODY)
+            .create_async()
+            .await;
+
+        let client = LlmClient::compatible("test-key".to_string(), server.url());
+        let response = chat_with_timeout(&client, timeout_test_request(), Duration::from_secs(10))
+            .await
+            .expect("fast provider should answer");
+        assert_eq!(response.choices.len(), 1);
     }
 }

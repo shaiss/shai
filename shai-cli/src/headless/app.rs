@@ -6,13 +6,28 @@ use crate::session_options::SessionOptions;
 use super::tools::{list_all_tools, restrict_toolbox, ToolName};
 use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
 use shai_core::agent::{
-    Agent, AgentBuilder, AgentError, AgentResult, Brain, LoggingConfig, StdoutEventManager,
+    Agent, AgentBuilder, AgentCore, AgentError, AgentResult, Brain, LoggingConfig,
+    StdoutEventManager,
 };
 use shai_core::config::agent::AgentConfig;
 use shai_core::config::config::ShaiConfig;
 use shai_core::runners::coder::coder::CoderBrain;
 use shai_core::runners::searcher::searcher::SearcherBrain;
 use shai_llm::LlmClient;
+
+/// Finish a headless agent. Nobody can answer a permission prompt here, so
+/// read-only tools run and every other tool is denied immediately, unless
+/// `yes` (`--yes`) grants full access.
+fn build_headless_agent(
+    builder: AgentBuilder,
+    initial_trace: Vec<ChatMessage>,
+    yes: bool,
+) -> AgentCore {
+    builder
+        .with_traces(initial_trace)
+        .headless_permissions(yes)
+        .build()
+}
 
 pub enum AgentKind {
     Coder,
@@ -50,6 +65,7 @@ impl AppHeadless {
         remove: Option<String>,
         trace: bool,
         agent_name: Option<String>,
+        yes: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Configure internal debug logging to file
         /*
@@ -90,7 +106,7 @@ impl AppHeadless {
                 builder.available_tools = toolbox;
             }
 
-            builder.with_traces(initial_trace).sudo().build()
+            build_headless_agent(builder, initial_trace, yes)
         } else {
             // Use default agent with provided tools
             let (llm_client, model) = ShaiConfig::get_llm().await?;
@@ -113,19 +129,20 @@ impl AppHeadless {
                     }
                 };
 
-                AgentBuilder::with_brain(brain)
-                    .tools(toolbox)
-                    .with_traces(initial_trace)
-                    .sudo()
-                    .build()
+                build_headless_agent(
+                    AgentBuilder::with_brain(brain).tools(toolbox),
+                    initial_trace,
+                    yes,
+                )
             } else {
                 // Use default agent
-                AgentBuilder::default()
-                    .await
-                    .map_err(|e| format!("Failed to create default agent: {}", e))?
-                    .with_traces(initial_trace)
-                    .sudo()
-                    .build()
+                build_headless_agent(
+                    AgentBuilder::default()
+                        .await
+                        .map_err(|e| format!("Failed to create default agent: {}", e))?,
+                    initial_trace,
+                    yes,
+                )
             }
         };
 
@@ -177,5 +194,185 @@ impl AppHeadless {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use openai_dive::v1::resources::chat::{Function, ToolCall};
+    use shai_core::agent::{AgentEvent, ThinkerContext, ThinkerDecision, ToolBudgetRef};
+    use shai_core::tools::{create_tool, AnyTool, BashToolConfig, FsOperationLog, TodoStorage};
+    use std::time::Duration;
+
+    /// Brain that makes one tool call, then stops.
+    struct OneCallBrain {
+        call: Option<(String, serde_json::Value)>,
+    }
+
+    #[async_trait]
+    impl Brain for OneCallBrain {
+        async fn next_step(
+            &mut self,
+            _: ThinkerContext,
+            _: ToolBudgetRef,
+        ) -> Result<ThinkerDecision, AgentError> {
+            let message = |content, tool_calls| ChatMessage::Assistant {
+                content,
+                reasoning: None,
+                reasoning_content: None,
+                tool_calls,
+                name: None,
+                audio: None,
+                refusal: None,
+            };
+            Ok(match self.call.take() {
+                Some((name, args)) => ThinkerDecision::agent_continue(message(
+                    None,
+                    Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: Function {
+                            name,
+                            arguments: args.to_string(),
+                        },
+                    }]),
+                )),
+                None => ThinkerDecision::agent_pause(message(
+                    Some(ChatMessageContent::Text("done".to_string())),
+                    None,
+                )),
+            })
+        }
+    }
+
+    fn tool(name: &str) -> Box<dyn AnyTool> {
+        create_tool(
+            name,
+            Arc::new(FsOperationLog::new()),
+            Arc::new(TodoStorage::new()),
+            &[],
+            &BashToolConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// Run one tool call through a headless agent, wired like `run()`:
+    /// an event printer is attached but nobody answers prompts.
+    /// Returns the tool message the model got back and whether a prompt was sent.
+    async fn run_headless(tool_name: &str, args: serde_json::Value, yes: bool) -> (String, bool) {
+        let builder = AgentBuilder::with_brain(Box::new(OneCallBrain {
+            call: Some((tool_name.to_string(), args)),
+        }))
+        .tools(vec![tool(tool_name)]);
+        let trace = vec![ChatMessage::User {
+            content: ChatMessageContent::Text("go".to_string()),
+            name: None,
+        }];
+        let prompted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = prompted.clone();
+        let mut agent = build_headless_agent(builder, trace, yes).on_event(move |event| {
+            if matches!(event, AgentEvent::PermissionRequired { .. }) {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), agent.run())
+            .await
+            .expect("headless run blocked instead of finishing")
+            .expect("headless run failed");
+        let tool_output = result
+            .trace
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::Tool {
+                    content: ChatMessageContent::Text(text),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("no tool result in trace");
+        (
+            tool_output,
+            prompted.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    fn assert_denied(output: &str, prompted: bool) {
+        assert!(
+            !prompted,
+            "headless sent a permission prompt nobody can answer"
+        );
+        assert!(
+            output.contains("permission denied") && output.contains("--yes"),
+            "unclear denial: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_denies_bash_without_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let (output, prompted) = run_headless(
+            "bash",
+            serde_json::json!({"command": format!("touch {}", marker.display())}),
+            false,
+        )
+        .await;
+        assert_denied(&output, prompted);
+        assert!(!marker.exists(), "bash ran without --yes");
+    }
+
+    #[tokio::test]
+    async fn headless_denies_write_without_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        let (output, prompted) = run_headless(
+            "write",
+            serde_json::json!({"files": [{"path": target.to_string_lossy(), "content": "x"}]}),
+            false,
+        )
+        .await;
+        assert_denied(&output, prompted);
+        assert!(!target.exists(), "write ran without --yes");
+    }
+
+    #[tokio::test]
+    async fn headless_allows_read_only_tools_without_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "headless-read-ok").unwrap();
+        let (output, prompted) = run_headless(
+            "read",
+            serde_json::json!({"files": [{"path": file.to_string_lossy()}]}),
+            false,
+        )
+        .await;
+        assert!(!prompted);
+        assert!(output.contains("headless-read-ok"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn headless_yes_allows_bash_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let (_, prompted) = run_headless(
+            "bash",
+            serde_json::json!({"command": format!("touch {}", marker.display())}),
+            true,
+        )
+        .await;
+        assert!(!prompted);
+        assert!(marker.exists(), "bash did not run with --yes");
+
+        let target = dir.path().join("out.txt");
+        let (_, prompted) = run_headless(
+            "write",
+            serde_json::json!({"files": [{"path": target.to_string_lossy(), "content": "x"}]}),
+            true,
+        )
+        .await;
+        assert!(!prompted);
+        assert!(target.exists(), "write did not run with --yes");
     }
 }

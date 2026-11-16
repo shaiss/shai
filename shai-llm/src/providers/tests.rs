@@ -307,8 +307,24 @@ pub async fn test_provider_chat_stream(provider: Box<dyn LlmProvider>) {
     }
 }
 
-/// Provider creation function that uses provider from_env() methods directly
+/// Env var that opts in to tests that call a real LLM provider.
+pub(crate) const LIVE_LLM_TESTS_ENV: &str = "SHAI_LIVE_LLM_TESTS";
+
+pub(crate) fn live_llm_tests_enabled() -> bool {
+    std::env::var(LIVE_LLM_TESTS_ENV).as_deref() == Ok("1")
+}
+
+/// Provider creation function that uses provider from_env() methods directly.
+/// Returns None unless SHAI_LIVE_LLM_TESTS=1, so a developer API key in the
+/// environment does not turn a plain `cargo test` into live provider calls.
 pub fn create_provider_from_env(provider_name: &str) -> Option<Box<dyn LlmProvider>> {
+    if !live_llm_tests_enabled() {
+        println!(
+            "skipping live {} provider test: set {}=1 to run",
+            provider_name, LIVE_LLM_TESTS_ENV
+        );
+        return None;
+    }
     match provider_name {
         "openai" => crate::providers::openai::OpenAIProvider::from_env()
             .map(|p| Box::new(p) as Box<dyn LlmProvider>),

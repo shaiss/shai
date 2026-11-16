@@ -44,7 +44,7 @@ impl LlmClient {
     }
 
     /// Create an Ollama provider from environment variables
-    /// Always returns Some since Ollama has a default base URL
+    /// Returns None unless OLLAMA_BASE_URL or OLLAMA_API_KEY is set
     pub fn from_env_ollama() -> Option<Self> {
         OllamaProvider::from_env().map(|provider| Self {
             provider: Box::new(provider),

@@ -2,10 +2,15 @@ use super::gerund::gerund;
 use super::prompt::gerund_prompt;
 use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
 
-use crate::runners::test_helpers::{get_test_llm_client, get_test_model_for_provider};
+use crate::runners::test_helpers::{
+    get_test_llm_client, get_test_model_for_provider, skip_unless_live_llm,
+};
 
 #[tokio::test]
 async fn test_gerund_with_simple_message() {
+    if skip_unless_live_llm("test_gerund_with_simple_message") {
+        return;
+    }
     let llm_client = get_test_llm_client();
     let model = get_test_model_for_provider(&llm_client).await;
 
@@ -38,6 +43,9 @@ async fn test_gerund_with_simple_message() {
 
 #[tokio::test]
 async fn test_gerund_with_coding_message() {
+    if skip_unless_live_llm("test_gerund_with_coding_message") {
+        return;
+    }
     let llm_client = get_test_llm_client();
     let model = get_test_model_for_provider(&llm_client).await;
     println!("{:?} {:?}", llm_client, model);
@@ -72,6 +80,9 @@ async fn test_gerund_with_coding_message() {
 
 #[tokio::test]
 async fn test_gerund_with_different_activities() {
+    if skip_unless_live_llm("test_gerund_with_different_activities") {
+        return;
+    }
     let test_messages = vec![
         "Writing unit tests",
         "Refactoring legacy code",
@@ -137,6 +148,9 @@ async fn test_gerund_prompt_generation() {
 
 #[tokio::test]
 async fn test_gerund_with_empty_message() {
+    if skip_unless_live_llm("test_gerund_with_empty_message") {
+        return;
+    }
     let llm_client = get_test_llm_client();
     let model = get_test_model_for_provider(&llm_client).await;
 
@@ -166,6 +180,9 @@ async fn test_gerund_with_empty_message() {
 
 #[tokio::test]
 async fn test_gerund_with_long_message() {
+    if skip_unless_live_llm("test_gerund_with_long_message") {
+        return;
+    }
     let llm_client = get_test_llm_client();
     let model = get_test_model_for_provider(&llm_client).await;
 
@@ -199,6 +216,7 @@ async fn test_gerund_with_long_message() {
 
 #[test]
 fn test_llm_client_selection() {
+    // Offline: only builds a client from env (Ollama fallback), no request.
     // Test that our client selection method works
     let client = get_test_llm_client();
     let provider_name = client.provider_name();
@@ -222,6 +240,9 @@ fn test_llm_client_selection() {
 
 #[tokio::test]
 async fn test_model_selection_for_providers() {
+    if skip_unless_live_llm("test_model_selection_for_providers") {
+        return;
+    }
     let client = get_test_llm_client();
     let model = get_test_model_for_provider(&client).await;
 

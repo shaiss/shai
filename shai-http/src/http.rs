@@ -33,6 +33,13 @@ impl ServerConfig {
         self
     }
 
+    /// Grant every tool (writes, bash, network) to every session.
+    /// Off by default: sessions then run read-only tools only.
+    pub fn with_allow_all_tools(mut self, allow_all_tools: bool) -> Self {
+        self.session_manager.allow_all_tools = allow_all_tools;
+        self
+    }
+
     /// Set the maximum number of concurrent sessions
     pub fn with_max_sessions(mut self, max_sessions: Option<usize>) -> Self {
         self.session_manager.max_sessions = max_sessions;
@@ -63,6 +70,14 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
             "ephemeral"
         } else {
             "persistent"
+        }
+    );
+    println!(
+        "  Tools: \x1b[1m{}\x1b[0m",
+        if config.session_manager.allow_all_tools {
+            "all (--yes)"
+        } else {
+            "read-only (pass --yes to allow writes, bash and network)"
         }
     );
     println!();

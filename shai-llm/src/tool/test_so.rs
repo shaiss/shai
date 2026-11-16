@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod structured_output_integration_tests {
+    use crate::providers::tests::{live_llm_tests_enabled, LIVE_LLM_TESTS_ENV};
     use crate::tool::{AssistantResponse, StructuredOutputBuilder};
     use crate::{client::LlmClient, ToolDescription};
     use openai_dive::v1::resources::chat::ChatCompletionParametersBuilder;
@@ -65,9 +66,15 @@ mod structured_output_integration_tests {
         vec![Arc::new(ReadTool), Arc::new(WriteTool)]
     }
 
-    fn create_llm_client(provider: &str, env_var: &str) -> Option<LlmClient> {
+    /// Live client for `provider`, or the reason to skip. Skips unless
+    /// SHAI_LIVE_LLM_TESTS=1, so a provider key in the environment does not
+    /// turn a plain `cargo test` into live provider calls.
+    fn create_llm_client(provider: &str, env_var: &str) -> Result<LlmClient, String> {
+        if !live_llm_tests_enabled() {
+            return Err(format!("set {}=1 to run", LIVE_LLM_TESTS_ENV));
+        }
         if std::env::var(env_var).is_err() {
-            return None;
+            return Err(format!("{} not set", env_var));
         }
 
         match provider {
@@ -77,13 +84,14 @@ mod structured_output_integration_tests {
             "ollama" => LlmClient::from_env_ollama(),
             _ => None,
         }
+        .ok_or_else(|| format!("no {} client from the environment", provider))
     }
 
     async fn test_no_tool_call(provider: &str, model: &str, env_var: &str) {
         let client = match create_llm_client(provider, env_var) {
-            Some(client) => client,
-            None => {
-                println!("⏭️  Skipping {}: {} not set", provider, env_var);
+            Ok(client) => client,
+            Err(reason) => {
+                println!("⏭️  Skipping live {} test: {}", provider, reason);
                 return;
             }
         };
@@ -127,9 +135,9 @@ mod structured_output_integration_tests {
 
     async fn test_must_use_read_tool(provider: &str, model: &str, env_var: &str) {
         let client = match create_llm_client(provider, env_var) {
-            Some(client) => client,
-            None => {
-                println!("⏭️  Skipping {}: {} not set", provider, env_var);
+            Ok(client) => client,
+            Err(reason) => {
+                println!("⏭️  Skipping live {} test: {}", provider, reason);
                 return;
             }
         };
