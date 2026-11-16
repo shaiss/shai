@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use openai_dive::v1::{
     error::APIError,
-    resources::chat::{
-        ChatCompletionChunkResponse, ChatCompletionParameters, ChatCompletionResponse,
+    resources::{
+        chat::{ChatCompletionChunkResponse, ChatCompletionParameters, ChatCompletionResponse},
+        shared::FinishReason,
     },
 };
 use reqwest::{Method, RequestBuilder};
@@ -60,6 +61,93 @@ impl std::error::Error for ChatError {
             ChatError::Api(e) => Some(e),
             ChatError::RateLimited(e) => Some(e),
         }
+    }
+}
+
+/// Normalize `finish_reason` values that openai_dive's [`FinishReason`] cannot
+/// deserialize, so one unexpected value does not fail the whole response with
+/// "unknown variant".
+///
+/// - A body (or SSE event) with a top-level `error` and no choices (OpenRouter
+///   can return this with HTTP 200) becomes an error carrying the provider's
+///   message and code.
+/// - `"error"` (sent by OpenRouter when the upstream provider fails mid-generation)
+///   becomes an error built from the choice's `error`, else the top-level `error`
+///   (a `null` value counts as absent).
+/// - In both cases the provider's numeric `code` picks the [`APIError`] variant:
+///   400/413/422 invalid request, 401 authentication, 402/403 permission and
+///   404 not found are not retried; anything else (429, 408, 5xx, string codes,
+///   no code) is an [`APIError::ServerError`] and stays retryable.
+/// - Any other unknown value is mapped to [`FinishReason::Other`] and logged.
+pub(crate) fn normalize_finish_reasons(json: &mut Value) -> Result<(), APIError> {
+    let top_level_error = json.get("error").filter(|e| !e.is_null()).cloned();
+    let has_choices = json
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|c| !c.is_empty());
+    if !has_choices {
+        // OpenRouter: a 200 body (or SSE event) with only `error` and no choices.
+        return match top_level_error {
+            Some(error) => Err(provider_error("provider returned an error", &error)),
+            None => Ok(()),
+        };
+    }
+    let Some(choices) = json.get_mut("choices").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for choice in choices {
+        let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) else {
+            continue;
+        };
+        if reason == "error" {
+            let prefix = "provider returned finish_reason \"error\"";
+            // `"error": null` on the choice must not hide a top-level error.
+            let error = choice
+                .get("error")
+                .filter(|e| !e.is_null())
+                .or(top_level_error.as_ref());
+            return Err(match error {
+                Some(error) => provider_error(prefix, error),
+                None => APIError::ServerError(format!("{}: no error details in response", prefix)),
+            });
+        }
+        if serde_json::from_value::<FinishReason>(Value::String(reason.to_string())).is_err() {
+            tracing::warn!(
+                target: "shai_llm::chat",
+                "unknown finish_reason {:?}, treating it as \"OTHER\"",
+                reason
+            );
+            choice["finish_reason"] = Value::String("OTHER".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Map a provider error object to an [`APIError`], using its numeric `code`
+/// (OpenRouter mirrors the HTTP status there) so deterministic client errors
+/// are not retried.
+fn provider_error(prefix: &str, error: &Value) -> APIError {
+    let message = format!("{}: {}", prefix, describe_provider_error(error));
+    match error.get("code").and_then(Value::as_u64) {
+        Some(400 | 413 | 422) => APIError::InvalidRequestError(message),
+        Some(401) => APIError::AuthenticationError(message),
+        Some(402 | 403) => APIError::PermissionError(message),
+        Some(404) => APIError::NotFoundError(message),
+        _ => APIError::ServerError(message),
+    }
+}
+
+/// Render a provider error object (`{"code": .., "message": ..}`) or plain value.
+fn describe_provider_error(error: &Value) -> String {
+    let message = error.get("message").and_then(Value::as_str);
+    let code = error.get("code").map(|c| match c {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    match (code, message) {
+        (Some(code), Some(message)) => format!("{} ({})", message, code),
+        (None, Some(message)) => message.to_string(),
+        _ => error.to_string(),
     }
 }
 
@@ -215,6 +303,7 @@ impl ChatClient {
             .map_err(|e| APIError::ParseError(e.to_string()))?;
 
         response_json = hooks.after_receive(response_json).await?;
+        normalize_finish_reasons(&mut response_json)?;
 
         // Deserialize the modified JSON
         let completion_response: ChatCompletionResponse = serde_json::from_value(response_json)
@@ -293,7 +382,11 @@ impl ChatClient {
                             Ok(json) => {
                                 // Apply after_receive_stream hook
                                 match hooks.after_receive_stream(json).await {
-                                    Ok(modified_json) => {
+                                    Ok(mut modified_json) => {
+                                        if let Err(e) = normalize_finish_reasons(&mut modified_json) {
+                                            yield Err(e);
+                                            break;
+                                        }
                                         // Deserialize the modified JSON
                                         match serde_json::from_value::<ChatCompletionChunkResponse>(modified_json) {
                                             Ok(chunk) => yield Ok(chunk),
@@ -466,6 +559,120 @@ mod tests {
         ));
     }
 
+    const OPENROUTER_ERROR_CHUNK: &str = r#"{"id":"gen-1","object":"chat.completion.chunk","created":1700000000,"model":"openai/gpt-oss-120b","error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
+
+    #[test]
+    fn finish_reason_error_is_a_provider_error() {
+        let mut json: Value = serde_json::from_str(OPENROUTER_ERROR_CHUNK).unwrap();
+        let err = normalize_finish_reasons(&mut json).expect_err("error finish reason");
+        match err {
+            APIError::ServerError(message) => {
+                assert!(message.contains("finish_reason \"error\""), "{}", message);
+                assert!(message.contains("Provider disconnected unexpectedly"));
+                assert!(message.contains("server_error"));
+            }
+            other => panic!("expected APIError::ServerError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn finish_reason_error_prefers_choice_error_and_handles_missing_details() {
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 502, "message": "upstream timeout"}}]
+        });
+        let message = normalize_finish_reasons(&mut json).unwrap_err().to_string();
+        assert!(message.contains("upstream timeout (502)"), "{}", message);
+
+        let mut bare = serde_json::json!({"choices": [{"index": 0, "finish_reason": "error"}]});
+        let message = normalize_finish_reasons(&mut bare).unwrap_err().to_string();
+        assert!(message.contains("no error details"), "{}", message);
+    }
+
+    #[test]
+    fn unknown_finish_reason_deserializes_as_other() {
+        let body = r#"{"id":"gen-2","object":"chat.completion","created":1700000000,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"some_new_reason"}]}"#;
+        // Without normalization openai_dive rejects the value.
+        assert!(serde_json::from_str::<ChatCompletionResponse>(body).is_err());
+
+        let mut json: Value = serde_json::from_str(body).unwrap();
+        normalize_finish_reasons(&mut json).expect("unknown reason is not an error");
+        let response: ChatCompletionResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Other));
+    }
+
+    #[test]
+    fn known_and_null_finish_reasons_are_unchanged() {
+        let mut json = serde_json::json!({
+            "choices": [
+                {"index": 0, "finish_reason": "stop"},
+                {"index": 1, "finish_reason": "tool_calls"},
+                {"index": 2, "finish_reason": null}
+            ]
+        });
+        let before = json.clone();
+        normalize_finish_reasons(&mut json).unwrap();
+        assert_eq!(json, before);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_surfaces_finish_reason_error() {
+        let body = r#"{"id":"gen-3","object":"chat.completion","created":1700000000,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"error","error":{"code":"server_error","message":"boom"}}]}"#;
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = ChatClient::new("test-key".into(), server.url());
+        let err = client
+            .chat_completion(&sample_params(), &NoHooks)
+            .await
+            .expect_err("finish_reason error should fail the call");
+        match err {
+            ChatError::Api(APIError::ServerError(message)) => {
+                assert!(message.contains("boom (server_error)"), "{}", message)
+            }
+            other => panic!("expected ServerError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_finish_reason_error_yields_provider_error() {
+        let ok_chunk = r#"{"id":"gen-1","object":"chat.completion.chunk","created":1700000000,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}"#;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            ok_chunk, OPENROUTER_ERROR_CHUNK
+        );
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = ChatClient::new("test-key".into(), server.url());
+        let mut stream = client
+            .chat_completion_stream(&sample_params(), NoHooks)
+            .await
+            .expect("stream should open");
+
+        let first = stream.next().await.expect("first item");
+        assert!(first.is_ok(), "partial chunk should parse: {:?}", first);
+        match stream.next().await.expect("second item") {
+            Err(APIError::ServerError(message)) => {
+                assert!(message.contains("Provider disconnected unexpectedly"))
+            }
+            other => panic!("expected ServerError, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none(), "stream ends after the error");
+    }
+
     #[tokio::test]
     async fn stream_success_yields_chunks() {
         let chunk_json = r#"{"id":"chatcmpl-test","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#;
@@ -494,5 +701,115 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].id.as_deref(), Some("chatcmpl-test"));
         assert_eq!(chunks[0].choices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_surfaces_error_only_200_body() {
+        // OpenRouter: a provider failure after headers is a 200 whose body
+        // holds only `error` and no `choices`.
+        let body = r#"{"id":"gen-9","error":{"code":502,"message":"Provider returned error"}}"#;
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = ChatClient::new("test-key".into(), server.url());
+        let err = client
+            .chat_completion(&sample_params(), &NoHooks)
+            .await
+            .expect_err("error-only body should fail the call");
+        match err {
+            ChatError::Api(APIError::ServerError(message)) => {
+                assert!(message.contains("Provider returned error"), "{}", message)
+            }
+            other => panic!("expected ServerError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_only_event_keeps_provider_message() {
+        let body = "data: {\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\"}}\n\ndata: [DONE]\n\n";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = ChatClient::new("test-key".into(), server.url());
+        let mut stream = client
+            .chat_completion_stream(&sample_params(), NoHooks)
+            .await
+            .expect("stream should open");
+        match stream.next().await.expect("first item") {
+            Err(APIError::ServerError(message)) => {
+                assert!(message.contains("Rate limit exceeded"), "{}", message)
+            }
+            other => panic!("expected ServerError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn finish_reason_error_with_client_error_code_is_not_retryable() {
+        let mut json = serde_json::json!({
+            "error": {"code": 400, "message": "context_length_exceeded"},
+            "choices": [{"index": 0, "finish_reason": "error"}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::InvalidRequestError(_)), "{:?}", err);
+
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 402, "message": "insufficient credits"}}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::PermissionError(_)), "{:?}", err);
+    }
+
+    #[test]
+    fn null_choice_error_falls_back_to_top_level_error() {
+        let mut json = serde_json::json!({
+            "error": {"code": 401, "message": "invalid key"},
+            "choices": [{"index": 0, "finish_reason": "error", "error": null}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        match err {
+            APIError::AuthenticationError(message) => {
+                assert!(message.contains("invalid key (401)"), "{}", message);
+            }
+            other => panic!("expected APIError::AuthenticationError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn provider_error_codes_401_and_404_map_to_non_retryable_variants() {
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 401, "message": "invalid key"}}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::AuthenticationError(_)), "{:?}", err);
+
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 404, "message": "model not found"}}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::NotFoundError(_)), "{:?}", err);
+
+        // Error-only body (no choices) uses the same mapping.
+        let mut json = serde_json::json!({"error": {"code": 404, "message": "no such model"}});
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::NotFoundError(_)), "{:?}", err);
+
+        let mut json = serde_json::json!({"error": {"code": 401, "message": "invalid key"}});
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::AuthenticationError(_)), "{:?}", err);
     }
 }
