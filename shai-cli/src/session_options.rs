@@ -724,6 +724,31 @@ mod tests {
     }
 
     #[test]
+    fn headless_without_yes_still_attaches_the_read_only_advisor() {
+        let cfg = config_with_advisor("");
+        let mut options = SessionOptions::resolve_from(Some("cheap"), true, Ok(&cfg)).unwrap();
+
+        // Without --yes the handoff is not armed, but the advisor writes
+        // nothing, so it is attached and announced all the same.
+        let mut denied = agent(&[]);
+        let notices = options.arm_headless(&mut denied, false);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("prewalk not armed:"), "{notices:?}");
+        assert!(notices[0].contains("--yes"), "{notices:?}");
+        assert!(notices[1].starts_with("advisor on:"), "{notices:?}");
+        assert!(!denied.is_prewalk_armed());
+        assert!(denied.has_advisor());
+        assert!(options.prewalk_pending());
+
+        // With only the advisor asked for, --yes makes no difference.
+        let mut options = SessionOptions::resolve_from(None, true, Ok(&cfg)).unwrap();
+        let mut plain = agent(&[]);
+        let notice = only(options.arm_headless(&mut plain, false));
+        assert!(notice.starts_with("advisor on:"), "{notice}");
+        assert!(plain.has_advisor());
+    }
+
+    #[test]
     fn the_primary_model_runs_on_the_default_only_without_a_config_file() {
         // The user's file, as loaded.
         let cfg = config(Some(URL_A), "");
