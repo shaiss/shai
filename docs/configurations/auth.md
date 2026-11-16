@@ -108,7 +108,7 @@ It is off by default. Turn it on for one run with a flag, or for every session i
 
 ```bash
 shai --prewalk-into cheap                      # a role from "roles"
-shai -p "fix the flaky test" --prewalk-into ollama/qwen3:8b
+shai -p "fix the flaky test" --prewalk-into ollama/qwen3:8b --yes   # headless needs --yes to edit
 ```
 
 ```jsonc

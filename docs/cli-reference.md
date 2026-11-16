@@ -137,7 +137,7 @@ shai -a myagent --yes -p "fix this bug"
 shai -p "review this function" --temperature 0.5
 
 # Plan on the primary model, then continue on a cheaper one after the first edit
-shai -p "add input validation to the signup form" --prewalk-into cheap
+shai -p "add input validation to the signup form" --prewalk-into cheap --yes
 
 # Chain commands
 echo "make me a hello world in main.py" | shai --yes --trace | shai --yes -p "now run it!"
