@@ -219,6 +219,47 @@ fn can_be_known(value: &str) -> bool {
     value.chars().any(char::is_alphanumeric)
 }
 
+/// `text` with its JSON escapes `\uXXXX` (either case, surrogate pairs
+/// joined) and `\/` decoded, and for each byte of the decoded text, the
+/// offset in `text` it comes from, with one more entry for its end.
+fn decode_json_escapes(text: &str) -> (String, Vec<usize>) {
+    let bytes = text.as_bytes();
+    let unit_at = |at: usize| -> Option<u16> {
+        (bytes.get(at) == Some(&b'\\') && bytes.get(at + 1) == Some(&b'u'))
+            .then(|| text.get(at + 2..at + 6))
+            .flatten()
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+    };
+    let mut decoded = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len() + 1);
+    let mut at = 0;
+    while at < text.len() {
+        let (c, len) = match unit_at(at) {
+            Some(high @ 0xD800..=0xDBFF) => match unit_at(at + 6) {
+                Some(low @ 0xDC00..=0xDFFF) => (
+                    char::decode_utf16([high, low]).next().and_then(Result::ok),
+                    12,
+                ),
+                _ => (None, 6),
+            },
+            Some(unit) => (char::from_u32(u32::from(unit)), 6),
+            None if bytes[at] == b'\\' && bytes.get(at + 1) == Some(&b'/') => (Some('/'), 2),
+            None => {
+                let c = text[at..].chars().next().unwrap_or('\u{fffd}');
+                (Some(c), c.len_utf8())
+            }
+        };
+        let c = c.unwrap_or('\u{fffd}');
+        for _ in 0..c.len_utf8() {
+            origin.push(at);
+        }
+        decoded.push(c);
+        at += len;
+    }
+    origin.push(text.len());
+    (decoded, origin)
+}
+
 /// `value` as programs write it into text: escaped for JSON (by serde, with
 /// `\/` as PHP writes it, with `\uXXXX` for what is not ASCII as Python
 /// writes it, with `&`, `<` and `>` escaped as Go writes them), escaped for
@@ -396,9 +437,10 @@ static KEY_END: LazyLock<Regex> = LazyLock::new(|| {
 /// The private lines of a PuTTY key file, after the line that counts them.
 static PUTTY_PRIVATE: LazyLock<Regex> = LazyLock::new(|| {
     // The count line and each private line may carry what a listing puts in
-    // front of a line: a number, a hash, a diff mark.
+    // front of a line: a number and a hash, a diff mark, `file:12:` as
+    // `grep -n` writes it.
     Regex::new(
-        r"(?m)^([^\n]{0,24}?Private-Lines: *\d+)[ \t]*\r?\n((?:(?:[ \t]*\d+(?::[ \t]*[0-9a-f]{8}[ \t]|\t))?[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
+        r"(?m)^([^\n]{0,80}?Private-Lines: *\d+)[ \t]*\r?\n((?:(?:[ \t]*\d+(?::[ \t]*[0-9a-f]{8}[ \t]|\t|[:|]))?(?:[^\n:]{0,64}:\d+[:-])?[-+> ]?[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
     )
     .unwrap()
 });
@@ -665,10 +707,10 @@ static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     // escaped quote: one alternative per kind of quote.
     const VALUE: &str = r#"(?:"(?P<dq>(?:\\.|[^"\\\n])*)"|'(?P<sq>(?:\\.|[^'\\\n])*)')"#;
     [
-        // A function given a name and a value: `define('DB_PASSWORD', 'x')`,
-        // `os.Setenv("API_TOKEN", "x")`, `config.set("password", "x")`.
+        // A call given a name and a value: `define('DB_PASSWORD', 'x')`,
+        // `os.Setenv("API_TOKEN", "x")`, `headers.put("X-Api-Key", "x")`.
         format!(
-            r#"(?i)\b(?:define|setenv|putenv|setproperty|setdefault|set)\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{{0,80}})["']\s*,\s*{VALUE}"#
+            r#"\b[A-Za-z_][\w.:]{{0,60}}\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{{0,80}})["']\s*,\s*{VALUE}"#
         ),
         // A setter named after what it sets: `ds.setPassword("x")`.
         format!(r#"\bset(?P<name>[A-Z][A-Za-z]{{0,40}})\s*\(\s*{VALUE}"#),
@@ -680,14 +722,14 @@ static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // A name and its value as attributes, in either order:
         // `<add key="Password" value="x"/>`, `<property value="x" name="password"/>`.
         format!(
-            r#"\b(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["']\s+value\s*=\s*{VALUE}"#
+            r#"\b(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["'][^>\n]{{0,200}}?\bvalue\s*=\s*{VALUE}"#
         ),
         format!(
             r#"\bvalue\s*=\s*{VALUE}\s+(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["']"#
         ),
         // SQL: `IDENTIFIED BY 'x'`, `IDENTIFIED WITH plugin BY 'x'`,
         // `WITH PASSWORD 'x'`, a quote written twice inside the value.
-        r#"(?i)\b(?:identified\s+(?:with\s+\w+\s+)?by|password)\s+(?:'(?P<sq>(?:''|[^'\n])*)'|"(?P<dq>(?:""|[^"\n])*)")"#.to_string(),
+        r#"(?i)\b(?:identified\s+(?:with\s+\w+\s+)?by|password)\s+'(?P<sq>(?:''|\\.|[^'\\\n])*)'"#.to_string(),
     ]
     .into_iter()
     .map(|pattern| Regex::new(&pattern).unwrap())
@@ -1438,7 +1480,12 @@ fn block_end<'a>(
     // Alone on its line, but for a comment, and for a YAML tag before it
     // (`!!binary |`).
     let mut shown = &text[value_start..line_end];
-    if let Some(comment) = shown.find(" #") {
+    if let Some(comment) = shown.find([' ', '\t']).and_then(|blank| {
+        shown[blank..]
+            .find('#')
+            .filter(|at| shown[blank..blank + at].trim().is_empty())
+            .map(|at| blank + at)
+    }) {
         shown = &shown[..comment];
     }
     let mut shown = shown.trim();
@@ -1447,7 +1494,9 @@ fn block_end<'a>(
             .split_once(char::is_whitespace)
             .map_or("", |(_, rest)| rest.trim());
     }
-    let token = if token.starts_with("!!") {
+    // What the line holds, rather than the value as it was read: a heredoc
+    // marker keeps its quotes, `<<'EOF'`.
+    let token = if token.starts_with("!!") || shown.starts_with("<<") {
         shown
     } else {
         token
@@ -1747,7 +1796,7 @@ impl Redactor {
 
     /// `text` with every known or recognizable secret replaced.
     pub(crate) fn redact(&self, text: &str) -> String {
-        let mut out = text.to_string();
+        let mut out = self.redact_escaped_known(text);
         for secret in &self.known {
             if out.contains(secret.as_str()) {
                 // A value of several lines leaves its line breaks behind, so
@@ -1778,6 +1827,47 @@ impl Redactor {
             }
         }
         redact_assignments(&redact_flags(&redact_handed_over(&out)))
+    }
+
+    /// `text` with the values this redactor knows replaced where they are
+    /// written with JSON escapes: `\uXXXX` in either case, as every encoder
+    /// writes the characters it escapes, and `\/`. The escapes are decoded
+    /// in a copy, the values looked for there, and what they were written as
+    /// replaced in `text`.
+    fn redact_escaped_known(&self, text: &str) -> String {
+        if !(text.contains("\\u") || text.contains("\\/")) {
+            return text.to_string();
+        }
+        let (decoded, origin) = decode_json_escapes(text);
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for secret in &self.known {
+            for (start, found) in decoded.match_indices(secret.as_str()) {
+                let end = start + found.len();
+                let from = origin[start];
+                let to = origin[end];
+                // Written without escapes, it is replaced as it stands.
+                if text[from..to] != *found {
+                    spans.push((from, to));
+                }
+            }
+        }
+        if spans.is_empty() {
+            return text.to_string();
+        }
+        spans.sort();
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (from, to) in spans {
+            if to <= copied {
+                continue;
+            }
+            let from = from.max(copied);
+            out.push_str(&text[copied..from]);
+            out.push_str(REDACTED);
+            copied = to;
+        }
+        out.push_str(&text[copied..]);
+        out
     }
 
     /// `text` with the values this redactor knows replaced, and nothing
@@ -1861,7 +1951,18 @@ impl Redactor {
                 // A number written without quotes is still a known value.
                 Value::Number(number) => {
                     let shown = number.to_string();
-                    if redactor.redact_known(&shown) == shown {
+                    // Its digits too: written out again, a large number can
+                    // come back as `1.234...e20`, a point inside the value.
+                    let digits: String = shown
+                        .split(['e', 'E'])
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .filter(char::is_ascii_digit)
+                        .collect();
+                    if redactor.redact_known(&shown) == shown
+                        && redactor.redact_known(&digits) == digits
+                    {
                         Value::Number(number)
                     } else {
                         Value::String(REDACTED.to_string())
@@ -2308,6 +2409,30 @@ mod tests {
             assert!(
                 large < small * 24 + std::time::Duration::from_millis(250),
                 "{unit:?}: {small:?} for 80 kB, {large:?} for 640 kB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_that_never_closes_costs_what_a_line_that_opens_none_costs() {
+        let redactor = Redactor::default();
+        let time = |text: &str| {
+            let started = std::time::Instant::now();
+            let _ = redactor.redact(text);
+            started.elapsed()
+        };
+        // Its end is looked up, not searched for: a search capped at 64 kB
+        // for every opener would make the first far slower than the second.
+        let _ = time("TOKEN = <<EOF\n");
+        for (unit, control) in [
+            ("TOKEN = <<EOF\n", "TOKEN = <<E-F\n"),
+            ("password: <<EOF\nx\n", "password: <<E-F\nx\n"),
+        ] {
+            let heredocs = time(&unit.repeat(160_000 / unit.len()));
+            let plain = time(&control.repeat(160_000 / control.len()));
+            assert!(
+                heredocs < plain * 4 + std::time::Duration::from_millis(250),
+                "{unit:?}: {heredocs:?} against {plain:?}"
             );
         }
     }
@@ -3160,6 +3285,9 @@ mod tests {
             r#"["x=Tr0ub4dor\u00263xyz\u003c\u003e"]"#,
             "value=Tr0ub4dor&amp;3xyz&lt;&gt;",
             "q=Tr0ub4dor%263xyz%3C%3E",
+            // .NET's default encoder: upper-case hex for `+`, `&`, `<`, `>`.
+            r#"{"Key":"abc\u002Bdef/ghi=jkl0123"}"#,
+            r#"{"k": "Tr0ub4dor\u00263xyz\u003C\u003E"}"#,
         ] {
             let out = redactor.redact(text);
             assert!(out.contains(REDACTED), "{text} -> {out}");
@@ -3178,6 +3306,8 @@ mod tests {
             "1234567890123456.0",
             "1.234567890123456e15",
             "12345678901234560",
+            "1234567890123456e5",
+            "-1.234567890123456e25",
         ] {
             let out = redactor.redact_json(&format!(r#"{{"pin": {number}}}"#));
             assert!(!out.contains("1234567890123456"), "{number} -> {out}");
@@ -3197,6 +3327,12 @@ mod tests {
         assert!(!redactor.redact(cut).contains("lQOYBF8"));
 
         // As a listing shows it, with numbered lines.
+        for lead in ["-", "+", "key.ppk:12:"] {
+            let text = format!(
+                "{lead}Private-Lines: 1\n{lead}AAABAQCs0123456789abcdef\n{lead}Private-MAC: 0a1b"
+            );
+            assert!(!redactor.redact(&text).contains("AAABAQCs"), "{lead}");
+        }
         let listed = "   7: 3f2a9c1d Private-Lines: 2\n   8: 9c1d77ab AAABAQCs0123456789abcdef\n   9: 77ab0e1f AAAAgQDabcdef0123456789\n  10: 0e1f2a3b Private-MAC: 0a1b";
         let out = redactor.redact(listed);
         assert!(
@@ -3331,6 +3467,18 @@ mod tests {
                 "define('DB_PASSWORD', \"[redacted]\");",
             ),
             (
+                "headers.put(\"X-Api-Key\", \"abcd1234efgh5678\");",
+                "headers.put(\"X-Api-Key\", \"[redacted]\");",
+            ),
+            (
+                "<add key=\"Password\" type=\"string\" value=\"Sup3rS3cretPw\" />",
+                "<add key=\"Password\" type=\"string\" value=\"[redacted]\" />",
+            ),
+            (
+                "ALTER USER bob IDENTIFIED BY 'it\\'s-Sup3rS3cret';",
+                "ALTER USER bob IDENTIFIED BY '[redacted]';",
+            ),
+            (
                 "<property name=\"hibernate.connection.password\">Sup3rS3cretPw</property>",
                 "<property name=\"hibernate.connection.password\">[redacted]</property>",
             ),
@@ -3357,6 +3505,7 @@ mod tests {
             "<name>project</name>",
             "<password>${env.DB_PASSWORD}</password>",
             "ds.setUrl(\"jdbc:postgresql://db/app\");",
+            "throw new Error(\"Invalid password \" + attempts + \" attempts left\");",
         ] {
             assert_eq!(redactor.redact(input), input);
         }
@@ -3385,6 +3534,14 @@ mod tests {
             (
                 "private_key = <<EOF\nabcd1234efgh5678ijkl9012mnop3456\nEOF\nnext = 1",
                 "private_key = [redacted]\n\nEOF\nnext = 1",
+            ),
+            (
+                "private_key = <<-'EOT'\nabcd1234efgh5678ijkl9012mnop3456\nEOT\nnext = 1",
+                "private_key = [redacted]\n\nEOT\nnext = 1",
+            ),
+            (
+                "password: |\t# rotate\n  Sup3rS3cretPw\nnext: 1",
+                "password: [redacted]\n\nnext: 1",
             ),
         ] {
             let once = redactor.redact(input);

@@ -320,6 +320,7 @@ fn is_sensitive_file_name(name: &str) -> bool {
         .is_some_and(|(stem, extension)| {
             names_a_secret(stem)
                 && (!PAGE_TEMPLATE_EXTENSIONS.contains(&extension)
+                    || stem.starts_with('.')
                     || names_a_secret_by_kind(stem)
                     || stem.strip_prefix('.').unwrap_or(stem).contains('.'))
         })
@@ -681,6 +682,7 @@ impl ConfinedFs {
         let mut reached = self.root.clone();
         let mut hops = 0usize;
         let mut lookups = 0usize;
+        let mut walked = 0usize;
         let mut exists = true;
         while let Some(step) = pending.pop_front() {
             let name = match Path::new(&step).components().next() {
@@ -702,7 +704,9 @@ impl ConfinedFs {
             reached.push(&name);
             if exists {
                 lookups += 1;
-                if lookups > MAX_LOOKUPS {
+                // Each lookup goes through the whole path reached so far.
+                walked += reached.as_os_str().len();
+                if lookups > MAX_LOOKUPS || walked > MAX_WALKED_BYTES {
                     return Route::LeavesRoot;
                 }
                 match reached.symlink_metadata() {
@@ -879,6 +883,10 @@ enum Route {
 /// links. A crafted tree of links that point at each other is refused past
 /// this, instead of keeping a tool call busy.
 const MAX_LOOKUPS: usize = 4096;
+
+/// Most bytes of path the lookups of one requested path go through, each
+/// lookup through the whole path reached so far.
+const MAX_WALKED_BYTES: usize = 1 << 20;
 
 /// Longest path the advisor may ask for, in bytes: what the system opens.
 const MAX_REQUEST_LEN: usize = 4096;
@@ -1670,6 +1678,7 @@ mod tests {
             ("app/views/passwords/show.erb", true),
             ("app/views/passwords/reset.hbs", false),
             ("theme/templates/password.liquid", false),
+            ("templates/.secrets.hbs", true),
             ("deploy/secrets/.pgpass.tmpl", true),
             ("deploy/secrets/htpasswd.j2", true),
             (".netrc.j2", true),
