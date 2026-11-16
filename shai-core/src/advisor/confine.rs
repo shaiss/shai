@@ -185,7 +185,8 @@ const ENV_TEMPLATE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".d
 
 /// True when `relative` (a path relative to the root) names something the
 /// advisor must not read or list into. `is_dir` says whether the entry itself
-/// is a directory: the rules about file names do not apply to one.
+/// is a directory: a directory named after secrets (`secrets/`) may be
+/// entered, only the data files below it are refused.
 pub(crate) fn is_sensitive(relative: &Path, is_dir: bool) -> bool {
     let names: Vec<String> = relative
         .components()
@@ -203,6 +204,14 @@ pub(crate) fn is_sensitive(relative: &Path, is_dir: bool) -> bool {
         .iter()
         .any(|name| SENSITIVE_DIRS.contains(&without_backup_suffixes(name)))
     {
+        return true;
+    }
+    // A name that holds credentials as a file holds them as a directory
+    // too: `.env/`, `.npmrc/` and `prod.env/` are not entered, and what is
+    // below them is not read, whether they are files or directories. Judged
+    // by the text alone, so the answer does not tell which, or whether they
+    // exist.
+    if names.iter().any(|name| names_a_secret_store(name)) {
         return true;
     }
     if is_dir {
@@ -324,6 +333,21 @@ fn is_sensitive_file_name(name: &str) -> bool {
                     || names_a_secret_by_kind(stem)
                     || stem.strip_prefix('.').unwrap_or(stem).contains('.'))
         })
+}
+
+/// A name that holds credentials by what it is (`.env`, `.npmrc`,
+/// `prod.env`, `server.pem`), also when a copy is set aside under it
+/// (`.env.bak`). Applied to directories as well as files. The rule about
+/// words (`secrets`, `passwords`) is not: a directory with such a name may
+/// be entered, only the data files below it are refused.
+fn names_a_secret_store(name: &str) -> bool {
+    let original = without_backup_suffixes(name);
+    names_a_secret_by_kind(name)
+        || names_a_secret_by_kind(original)
+        || original
+            .strip_prefix('.')
+            .is_some_and(names_a_secret_by_kind)
+            && original != name
 }
 
 /// The rules about one lowercased file name, taken as it is written.
@@ -1095,9 +1119,16 @@ mod tests {
         for path in paths {
             // The same refusal whether or not something is there: the
             // advisor cannot use it to find out what exists on the machine.
+            // A name that holds credentials is refused by its text, before
+            // any link in it is followed.
+            let by_name = path.starts_with(".env") || path == "server.pem";
             assert_eq!(
                 fs.resolve(path).unwrap_err(),
-                ConfineError::Outside(path.to_string()),
+                if by_name {
+                    ConfineError::Sensitive(path.to_string())
+                } else {
+                    ConfineError::Outside(path.to_string())
+                },
                 "{path}"
             );
             assert!(fs.read(path, 1024).is_err(), "{path}");
@@ -1688,6 +1719,30 @@ mod tests {
             ("docs/secrets/README.rst", false),
         ] {
             assert_eq!(is_sensitive(Path::new(path), false), refused, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_holds_credentials_is_refused_as_a_directory_too() {
+        for (path, is_dir, refused) in [
+            (".env", true, true),
+            (".env/prod", false, true),
+            (".env/nested/values.rs", false, true),
+            ("app/.npmrc", true, true),
+            ("app/.npmrc/x.rs", false, true),
+            ("home/.netrc/x", false, true),
+            ("deploy/prod.env/values.rs", false, true),
+            ("keys/server.pem/x.rs", false, true),
+            // Templates and names that only look close stay readable.
+            (".env.example", true, false),
+            (".env.example/values.rs", false, false),
+            ("environment/values.rs", false, false),
+            ("src/env/mod.rs", false, false),
+            // A directory named after secrets may still be entered.
+            ("secrets", true, false),
+            ("secret-store/src/lib.rs", false, false),
+        ] {
+            assert_eq!(is_sensitive(Path::new(path), is_dir), refused, "{path}");
         }
     }
 

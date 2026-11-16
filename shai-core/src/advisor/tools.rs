@@ -291,6 +291,9 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
     let mut listing =
         std::fs::read_dir(&dir).map_err(|e| Failure::about(fs.display(&dir), e.to_string()))?;
     let mut partial = false;
+    // Entries the advisor may not look at are left out, by the same rule as
+    // `read`, `find` and `grep` use, and only counted.
+    let mut hidden = 0;
     for (scanned, entry) in listing.by_ref().enumerate() {
         // A directory can hold any number of entries: stop reading at some.
         if scanned >= MAX_LS_SCAN {
@@ -303,6 +306,11 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        // A link is judged by its own name here: it is never followed.
+        if !fs.may_visit(&entry.path(), false, file_type.is_dir()) {
+            hidden += 1;
+            continue;
+        }
         // Each name by itself, before the list is put in order: where an
         // entry comes in the list then says nothing about what was removed
         // from its name.
@@ -328,6 +336,14 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
     } else if total > MAX_LS_ENTRIES {
         out.push_str(&format!("\n[{} more entries]", total - MAX_LS_ENTRIES));
     }
+    if hidden > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "[{hidden} not shown: they may hold credentials or internal state]"
+        ));
+    }
     if out.is_empty() {
         out.push_str("(empty directory)");
     }
@@ -352,6 +368,9 @@ struct Walked {
     /// Files and directories the walk came across and left out because the
     /// advisor may not look at them. Links and build output are not counted.
     refused: usize,
+    /// Directories, and files for `grep`, that could not be read: the walk
+    /// did not cover what is in them.
+    unreadable: usize,
 }
 
 /// Visit the regular files under `start`, in a stable order, staying inside
@@ -372,6 +391,7 @@ fn walk_within(
     let started = Instant::now();
     let mut read = 0;
     let mut refused = 0;
+    let mut unreadable = 0;
     // The directories the walk is in, outermost first: for each, the entries
     // it kept that are still to be handled, in the order of their names.
     let mut open: Vec<std::vec::IntoIter<(PathBuf, bool)>> = Vec::new();
@@ -379,8 +399,16 @@ fn walk_within(
     let end = 'walk: loop {
         if let Some(dir) = enter.take() {
             let mut kept = Vec::new();
-            // A directory that cannot be read is passed over.
-            for entry in std::fs::read_dir(&dir).into_iter().flatten() {
+            // A directory that cannot be read is passed over, and counted:
+            // "no match" must not read as "not there" for what is in it.
+            let listing = match std::fs::read_dir(&dir) {
+                Ok(listing) => Some(listing),
+                Err(_) => {
+                    unreadable += 1;
+                    None
+                }
+            };
+            for entry in listing.into_iter().flatten() {
                 // Every entry read counts towards the limits, whatever it is
                 // and whether it is kept or left out: a directory of a
                 // million files that are all left out is as long to go
@@ -437,7 +465,11 @@ fn walk_within(
             }
         }
     };
-    Walked { end, refused }
+    Walked {
+        end,
+        refused,
+        unreadable,
+    }
 }
 
 /// What to add to the results of a search that did not cover everything.
@@ -455,6 +487,13 @@ fn walk_note(walked: Walked) -> String {
             .push_str("\n[1 entry was skipped because it may hold credentials or internal state]"),
         refused => note.push_str(&format!(
             "\n[{refused} entries were skipped because they may hold credentials or internal state]"
+        )),
+    }
+    match walked.unreadable {
+        0 => {}
+        1 => note.push_str("\n[1 entry could not be read: the search did not cover it]"),
+        unreadable => note.push_str(&format!(
+            "\n[{unreadable} entries could not be read: the search did not cover them]"
         )),
     }
     note
@@ -503,8 +542,10 @@ fn grep(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
 
     let mut matches: Vec<String> = Vec::new();
     let mut partly_searched = 0;
+    let mut unreadable_files = 0;
     let mut search = |path: &Path| {
         let Ok((bytes, truncated)) = fs.read_resolved(path, MAX_FILE_BYTES) else {
+            unreadable_files += 1;
             return true;
         };
         let Some(text) = text_of(&bytes) else {
@@ -549,7 +590,15 @@ fn grep(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
         } else {
             Walk::Stopped
         };
-        Walked { end, refused: 0 }
+        Walked {
+            end,
+            refused: 0,
+            unreadable: 0,
+        }
+    };
+    let walked = Walked {
+        unreadable: walked.unreadable + unreadable_files,
+        ..walked
     };
 
     let mut out = if matches.is_empty() {
@@ -738,7 +787,12 @@ mod tests {
     fn ls_lists_names_and_does_not_enter_sensitive_directories() {
         let (_tmp, fs) = project();
         let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({}));
-        assert_eq!(out, ".env\n.git/\nREADME.md\nsrc/\ntarget/");
+        // `.env` and `.git` are left out by the same rule as `read` applies,
+        // and only counted.
+        assert_eq!(
+            out,
+            "README.md\nsrc/\ntarget/\n[2 not shown: they may hold credentials or internal state]"
+        );
         let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({"path": "src"}));
         assert_eq!(out, "main.rs\nnested/");
 
@@ -746,6 +800,144 @@ mod tests {
             let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({"path": path}));
             assert!(out.starts_with("error:"), "{path}: {out}");
         }
+    }
+
+    #[test]
+    fn ls_leaves_out_sensitive_names_of_any_kind_and_counts_them() {
+        let (tmp, fs) = project();
+        let root = tmp.path().join("work");
+        fs::create_dir_all(root.join("conf/.npmrc")).unwrap();
+        fs::write(root.join("conf/settings.toml"), "a = 1\n").unwrap();
+        fs::write(root.join("conf/id_rsa"), "key\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("settings.toml", root.join("conf/prod.env")).unwrap();
+        let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({"path": "conf"}));
+        let hidden = if cfg!(unix) { 3 } else { 2 };
+        assert_eq!(
+            out,
+            format!(
+                "settings.toml\n[{hidden} not shown: they may hold credentials or internal state]"
+            )
+        );
+
+        // A directory holding only such names says so, and is not "empty".
+        fs::create_dir_all(root.join("only")).unwrap();
+        fs::write(root.join("only/.env.local"), "X=1\n").unwrap();
+        let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({"path": "only"}));
+        assert_eq!(
+            out,
+            "[1 not shown: they may hold credentials or internal state]"
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_a_secret_file_is_never_entered() {
+        let (tmp, fs) = project();
+        let root = tmp.path().join("work");
+        // `.env`, `.npmrc` and `prod.env` as directories, with secrets in them.
+        fs::remove_file(root.join(".env")).unwrap();
+        for dir in [".env", "app/.npmrc", "deploy/prod.env"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("values.rs"), "answer-token-123456\n").unwrap();
+        }
+        let redactor = Redactor::default();
+        for path in [
+            ".env",
+            ".env/values.rs",
+            "app/.npmrc",
+            "app/.npmrc/values.rs",
+            "deploy/prod.env/values.rs",
+        ] {
+            for tool in [AdvisorTool::Read, AdvisorTool::Ls, AdvisorTool::Grep] {
+                let args = json!({"path": path, "pattern": "answer"});
+                let out = tool.run(&fs, &redactor, &args);
+                assert!(
+                    out.contains("access refused"),
+                    "{} {path}: {out}",
+                    tool.name()
+                );
+                assert!(
+                    !out.contains("answer-token"),
+                    "{} {path}: {out}",
+                    tool.name()
+                );
+            }
+        }
+
+        // Walks skip them, and say they skipped something.
+        let out = AdvisorTool::Grep.run(&fs, &redactor, &json!({"pattern": "answer-token"}));
+        assert!(out.starts_with("no match"), "{out}");
+        assert!(out.contains("skipped"), "{out}");
+        let out = AdvisorTool::Find.run(&fs, &redactor, &json!({"pattern": "values"}));
+        assert!(out.starts_with("no file matches"), "{out}");
+        assert!(out.contains("skipped"), "{out}");
+    }
+
+    #[test]
+    fn a_sensitive_directory_name_gives_one_answer_whether_or_not_it_exists() {
+        let (tmp, fs) = project();
+        let root = tmp.path().join("work");
+        fs::create_dir_all(root.join("app/.npmrc")).unwrap();
+        fs::write(root.join("app/.npmrc/x.rs"), "x\n").unwrap();
+        let redactor = Redactor::default();
+        for tool in [AdvisorTool::Read, AdvisorTool::Ls] {
+            let there = tool.run(&fs, &redactor, &json!({"path": "app/.npmrc/x.rs"}));
+            let missing = tool.run(&fs, &redactor, &json!({"path": "lib/.npmrc/x.rs"}));
+            assert_eq!(
+                there.replace("app/", "lib/"),
+                missing,
+                "{}: an existing and a missing path must read the same",
+                tool.name()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn searches_say_when_a_directory_could_not_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, fs) = project();
+        let locked = tmp.path().join("work/src/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("hidden.rs"), "fn answer() {}\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root (or in a user namespace mapped to root) reads it
+        // anyway: then there is nothing to report.
+        let readable = std::fs::read_dir(&locked).is_ok();
+
+        let grep = AdvisorTool::Grep.run(
+            &fs,
+            &Redactor::default(),
+            &json!({"pattern": "nothing-matches-this", "path": "src"}),
+        );
+        let find = AdvisorTool::Find.run(
+            &fs,
+            &Redactor::default(),
+            &json!({"pattern": "nothing-matches-this", "path": "src"}),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+        for out in [grep, find] {
+            assert!(
+                out.contains("[1 entry could not be read: the search did not cover it]"),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_note_reports_what_could_not_be_read() {
+        let note = walk_note(Walked {
+            end: Walk::Complete,
+            refused: 0,
+            unreadable: 2,
+        });
+        assert_eq!(
+            note,
+            "\n[2 entries could not be read: the search did not cover them]"
+        );
     }
 
     #[test]
@@ -1282,7 +1474,8 @@ mod tests {
             stopped,
             Walked {
                 end: Walk::Stopped,
-                refused: 0
+                refused: 0,
+                unreadable: 0
             }
         );
         assert_eq!(walk_note(stopped), "\n[more results not shown]");
@@ -1313,7 +1506,8 @@ mod tests {
             walked,
             Walked {
                 end: Walk::Complete,
-                refused: 40
+                refused: 40,
+                unreadable: 0
             }
         );
 
@@ -1346,7 +1540,8 @@ mod tests {
             walked,
             Walked {
                 end: Walk::CutShort,
-                refused: 0
+                refused: 0,
+                unreadable: 0
             }
         );
     }
