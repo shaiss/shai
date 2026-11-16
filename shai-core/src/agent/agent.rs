@@ -344,8 +344,14 @@ impl AgentCore {
         self.assert_socket_created();
         let mut rx = self.tool_ctx.public_event_tx.as_ref().unwrap().subscribe();
         _ = tokio::spawn(async move {
-            while let Ok(e) = rx.recv().await {
-                handler(e);
+            loop {
+                match rx.recv().await {
+                    Ok(event) => handler(event),
+                    // A handler that fell behind misses the events it was too
+                    // slow for, and goes on with the next ones.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
         self

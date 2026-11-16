@@ -49,11 +49,18 @@ const TODO_WRITE_TOOL: &str = "todo_write";
 /// each new agent with a clone, and the first agent to hand off uses the
 /// handoff up for all of them. That holds even if the front-end never gets to
 /// see the event that announces it.
+///
+/// Clones also share what the session's tool calls have done towards the
+/// trigger: the agents armed with them record their calls in one place. An
+/// agent that takes over the conversation of another one hands off as soon
+/// as the session is due, without having to plan and edit again.
 #[derive(Clone)]
 pub struct Prewalk {
     target: BoundModel,
     /// One of `PENDING`, `CLAIMED` and `SWITCHED`. It only moves forward.
     state: Arc<AtomicU8>,
+    /// What the tool calls of the agents armed with this handoff have done.
+    signals: Arc<PrewalkSignals>,
 }
 
 /// No agent has handed off yet.
@@ -69,6 +76,7 @@ impl Prewalk {
         Self {
             target,
             state: Arc::new(AtomicU8::new(PENDING)),
+            signals: Arc::new(PrewalkSignals::default()),
         }
     }
 
@@ -83,6 +91,7 @@ impl Prewalk {
         Self {
             target,
             state: self.state.clone(),
+            signals: self.signals.clone(),
         }
     }
 
@@ -214,6 +223,8 @@ impl AgentCore {
         if !can_switch {
             return Err(PrewalkArmError::CannotSwitch);
         }
+        // From now on this agent's calls count towards the session's trigger.
+        self.tool_ctx.prewalk_signals = prewalk.signals.clone();
         self.prewalk = Some(prewalk);
         Ok(())
     }
@@ -1004,6 +1015,48 @@ mod tests {
             third.arm_prewalk(prewalk.clone()),
             Err(PrewalkArmError::Spent)
         );
+        assert!(script.served().is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_the_session_did_counts_for_the_agent_that_takes_over() {
+        let script = Script::new(vec![]);
+        let prewalk = target(&script);
+        let mut first = coder_agent(&script, default_tools());
+        first.arm_prewalk(prewalk.clone()).unwrap();
+        // The first agent edits, and is replaced before its next request.
+        first
+            .tool_ctx
+            .prewalk_signals
+            .observe("write", &ToolResult::success("ok".to_string()));
+
+        // The agent that takes over the conversation does not edit again.
+        let mut second = coder_agent(&script, default_tools());
+        second.arm_prewalk(prewalk.clone()).unwrap();
+        let mut events = second.watch();
+        second.prewalk_if_due().await;
+        assert!(!prewalk.is_spent(), "no todo list yet");
+        second
+            .tool_ctx
+            .prewalk_signals
+            .observe("todo_write", &todo_result(1));
+        second.prewalk_if_due().await;
+        assert!(prewalk.has_switched());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::ModelSwitched { .. })
+        ));
+
+        // A session that planned and edited before its agent was replaced
+        // hands off at the first boundary of the next agent.
+        let prewalk = target(&script);
+        let mut first = coder_agent(&script, default_tools());
+        first.arm_prewalk(prewalk.clone()).unwrap();
+        make_due(&first);
+        let mut next = coder_agent(&script, default_tools());
+        next.arm_prewalk(prewalk.clone()).unwrap();
+        next.prewalk_if_due().await;
+        assert!(prewalk.has_switched());
         assert!(script.served().is_empty());
     }
 
