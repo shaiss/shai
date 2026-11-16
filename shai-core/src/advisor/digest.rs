@@ -190,7 +190,9 @@ pub(crate) fn build_digest(
 
     let mut digest = format!(
         "## The user's request\n{}\n\n## What the agent did since your last review\n",
-        request.join("\n\n")
+        // Each message was clipped on its own; so is the whole, however many
+        // messages make up the request. The text is redacted already.
+        clip(&request.join("\n\n"), MAX_REQUEST_CHARS)
     );
     if dropped {
         digest.push_str("[earlier steps omitted]\n\n");
@@ -319,6 +321,29 @@ mod tests {
             "{digest}"
         );
         assert!(!digest.contains("earlier"), "{digest}");
+    }
+
+    #[test]
+    fn a_request_of_many_messages_is_clipped_as_a_whole() {
+        let list = call("ls", json!({"directory": "."}));
+        let mut trace: Vec<ChatMessage> = (0..50)
+            .map(|i| user(&format!("{i:02} {}", "x".repeat(1_900))))
+            .collect();
+        trace.push(list.clone());
+        trace.push(result_of(&list, "a.txt"));
+        let digest = plain_digest(&trace, 0).unwrap();
+        let request = digest
+            .strip_prefix("## The user's request\n")
+            .and_then(|rest| rest.split("\n\n## What the agent did").next())
+            .unwrap();
+        assert!(
+            request.chars().count() <= MAX_REQUEST_CHARS + " [...]".len(),
+            "{}",
+            request.chars().count()
+        );
+        assert!(request.starts_with("00 "), "{request}");
+        assert!(request.ends_with(" [...]"), "{request}");
+        assert!(digest.contains("calls ls"), "{digest}");
     }
 
     #[test]
