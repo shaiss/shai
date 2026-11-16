@@ -79,15 +79,15 @@ impl App<'_> {
                         let session_id = session.session_id.clone();
                         let trace = session.trace.clone();
 
+                        let agent_name = self.agent_meta.name().map(|s| s.to_string());
+                        if !self.may_replace_agent(agent_name.as_deref()) {
+                            return Ok(());
+                        }
                         self.input.alert_msg(
                             &format!("Restoring session {}...", &session_id[..8]),
                             Duration::from_secs(2),
                         );
 
-                        let agent_name = self.agent_meta.name().map(|s| s.to_string());
-                        if !self.may_replace_agent(agent_name.as_deref()) {
-                            return Ok(());
-                        }
                         if let Some(agent) = self.agent.take() {
                             let _ = agent.controller.terminate().await;
                         }
