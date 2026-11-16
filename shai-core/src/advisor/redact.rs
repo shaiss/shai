@@ -143,11 +143,40 @@ fn is_secret_field(name: &str) -> bool {
         "encryptionkey",
         "encryption_key",
     ];
+    // The key of something that holds credentials: `AccountKey`,
+    // `client-key-data`, `Ocp-Apim-Subscription-Key`, `master_key`.
+    const KEY_OWNERS: &[&str] = &[
+        "account",
+        "master",
+        "subscription",
+        "client",
+        "signing",
+        "encryption",
+        "private",
+        "secret",
+        "access",
+        "app",
+        "consumer",
+        "shared",
+        "storage",
+        "service",
+        "hmac",
+        "license",
+        "deploy",
+        "ssh",
+        "webhook",
+        "sas",
+    ];
     let lower = name.to_ascii_lowercase();
+    let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+    let owner = ["keydata", "keys", "key"]
+        .iter()
+        .find_map(|suffix| compact.strip_suffix(suffix));
     ANYWHERE.iter().any(|word| lower.contains(word))
         || lower
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|part| part == "pass" || part == "pwd")
+        || owner.is_some_and(|owner| KEY_OWNERS.iter().any(|word| owner.ends_with(word)))
 }
 
 /// A value that is plainly not a credential: one unremarkable word, a number,
@@ -187,6 +216,67 @@ fn environment_value_is_secret(name: &str, value: &str, public: &[&str]) -> bool
 /// take the text apart, and hide nothing.
 fn can_be_known(value: &str) -> bool {
     value.chars().any(char::is_alphanumeric)
+}
+
+/// `value` as programs write it into text: escaped for JSON (by serde, with
+/// `\/` as PHP writes it, with `\uXXXX` for what is not ASCII as Python
+/// writes it, with `&`, `<` and `>` escaped as Go writes them), escaped for
+/// HTML, and percent-encoded for a URL or a form.
+fn encoded_forms(value: &str) -> Vec<String> {
+    let mut forms = Vec::new();
+    if let Ok(json) = serde_json::to_string(value) {
+        let json = json[1..json.len() - 1].to_string();
+        let ascii: String = json
+            .chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    c.to_string()
+                } else {
+                    c.encode_utf16(&mut [0; 2])
+                        .iter()
+                        .map(|unit| format!("\\u{unit:04x}"))
+                        .collect()
+                }
+            })
+            .collect();
+        forms.push(ascii.to_uppercase().replace("\\U", "\\u"));
+        forms.push(ascii.replace('/', "\\/"));
+        forms.push(
+            json.replace('&', "\\u0026")
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e"),
+        );
+        forms.push(json.replace('/', "\\/"));
+        forms.push(ascii);
+        forms.push(json);
+    }
+    forms.push(
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;"),
+    );
+    let percent = |upper: bool| -> String {
+        value
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                    (byte as char).to_string()
+                } else if upper {
+                    format!("%{byte:02X}")
+                } else {
+                    format!("%{byte:02x}")
+                }
+            })
+            .collect()
+    };
+    forms.push(percent(true).replace("%20", "+"));
+    forms.push(percent(true));
+    forms.push(percent(false));
+    forms.retain(|form| form != value);
+    forms
 }
 
 /// The parts of a URL setting that are credentials: the user, the password
@@ -278,13 +368,24 @@ fn char_floor(text: &str, max: usize) -> usize {
     index
 }
 
-/// The marker that opens a private key block.
-static KEY_BEGIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----").unwrap());
+/// The marker that opens a private key block: PEM, or armored PGP.
+static KEY_BEGIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|PGP (?:PRIVATE|SECRET) KEY BLOCK)-----")
+        .unwrap()
+});
 
 /// The marker that closes a private key block.
-static KEY_END: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY-----").unwrap());
+static KEY_END: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----END (?:[A-Z0-9 ]*PRIVATE KEY|PGP (?:PRIVATE|SECRET) KEY BLOCK)-----").unwrap()
+});
+
+/// The private lines of a PuTTY key file, after the line that counts them.
+static PUTTY_PRIVATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^(Private-Lines: *\d+)[ \t]*\r?\n((?:[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
+    )
+    .unwrap()
+});
 
 /// How far after its opening marker the end of a private key block is looked
 /// for. A key of 8192 bits takes less than half of this, written one line to
@@ -430,9 +531,15 @@ fn key_body_len(rest: &str) -> usize {
         // What joins two string literals, or closes one: no letter, no digit.
         let glue = !blank && line.len() <= 8 && !line.iter().any(u8::is_ascii_alphanumeric);
         let header = !in_body
-            && [&b"Proc-Type:"[..], &b"DEK-Info:"[..]]
-                .iter()
-                .any(|name| line.windows(name.len()).any(|part| part == *name));
+            && [
+                &b"Proc-Type:"[..],
+                &b"DEK-Info:"[..],
+                &b"Version:"[..],
+                &b"Comment:"[..],
+                &b"Charset:"[..],
+            ]
+            .iter()
+            .any(|name| line.windows(name.len()).any(|part| part == *name));
         if header {
             end = stop;
         } else if let Some(run_end) = key_run_end(line) {
@@ -534,6 +641,65 @@ fn redact_url_passwords(text: &str) -> String {
         .into_owned()
 }
 
+/// Credentials handed over by a call or written as markup, rather than
+/// assigned, each with the name that says what the value is, where there is
+/// one.
+static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        // A function given a name and a value: `define('DB_PASSWORD', 'x')`,
+        // `os.Setenv("API_TOKEN", "x")`, `config.set("password", "x")`.
+        r#"(?i)\b(?:define|setenv|putenv|setproperty|setdefault|set)\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{0,80})["']\s*,\s*["'](?P<value>[^"'\n]*)["']"#,
+        // A setter named after what it sets: `ds.setPassword("x")`.
+        r#"\bset(?P<name>[A-Z][A-Za-z]{0,40})\s*\(\s*["'](?P<value>[^"'\n]*)["']"#,
+        // An element of markup: `<password>x</password>`.
+        r#"<(?P<name>[A-Za-z_][\w.:-]{0,60})>(?P<value>[^<\n]{1,512})</"#,
+        // A key and its value as attributes: `<add key="Password" value="x"/>`.
+        r#"\bkey\s*=\s*"(?P<name>[^"\n]{1,80})"\s+value\s*=\s*"(?P<value>[^"\n]*)""#,
+        // SQL: `IDENTIFIED BY 'x'`, `WITH PASSWORD 'x'`.
+        r#"(?i)\b(?:identified\s+by|password)\s+'(?P<value>[^'\n]*)'"#,
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(pattern).unwrap())
+    .collect()
+});
+
+/// `text` with the credentials of [`HANDED_OVER`] replaced: the value goes
+/// when the name says it is a credential, or when the form says so alone.
+fn redact_handed_over(text: &str) -> String {
+    let mut out = text.to_string();
+    for rule in HANDED_OVER.iter() {
+        if !rule.is_match(&out) {
+            continue;
+        }
+        out = rule
+            .replace_all(&out, |found: &Captures<'_>| {
+                let whole = found.get(0).expect("the whole match");
+                let Some(value) = found.name("value") else {
+                    return whole.as_str().to_string();
+                };
+                let named = found
+                    .name("name")
+                    .is_none_or(|name| NameKind::of(name.as_str(), Operator::Colon).is_some());
+                let shown = value.as_str().trim();
+                // A placeholder that a tool fills in is not the value.
+                let placeholder = ["${", "#{", "$(", "%(", "{{"]
+                    .iter()
+                    .any(|mark| shown.starts_with(mark));
+                if !named || shown.is_empty() || shown == REDACTED || placeholder {
+                    return whole.as_str().to_string();
+                }
+                let (start, end) = (value.start() - whole.start(), value.end() - whole.start());
+                format!(
+                    "{}{REDACTED}{}",
+                    &whole.as_str()[..start],
+                    &whole.as_str()[end..]
+                )
+            })
+            .into_owned();
+    }
+    out
+}
+
 /// A command-line option given as two words, `--password value`, with the
 /// value bare or in quotes.
 static LONG_FLAG: LazyLock<Regex> = LazyLock::new(|| {
@@ -602,7 +768,7 @@ fn redact_flags(text: &str) -> String {
 /// (`char password[] = ...`).
 static ASSIGNED_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)["']?(?:\]|\[\])?(?P<before>[ \t]*)(?P<op>::|:=|\?=|\+=|===?|!==?|=~|=>|[:=])(?P<after>[ \t]*)"#,
+        r#"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?:\\{1,7}["']|["'])?(?:\]|\[\])?(?P<before>[ \t]*)(?P<op>::|:=|\?=|\+=|===?|!==?|=~|=>|[:=])(?P<after>[ \t]*)"#,
     )
     .unwrap()
 });
@@ -650,6 +816,8 @@ impl NameKind {
     /// when it says nothing.
     fn of(name: &str, operator: Operator) -> Option<Self> {
         const HEADERS: &[&str] = &[
+            "x-auth",
+            "x-api-key",
             "authorization",
             "proxy-authorization",
             "cookie",
@@ -970,8 +1138,17 @@ impl<'a> AssignedValue<'a> {
         for start in [prefix, 0] {
             match bytes.get(start) {
                 Some(b'"' | b'\'') => return (start + 1, &rest[start..start + 1]),
-                Some(b'\\') if start == 0 && matches!(bytes.get(1), Some(b'"' | b'\'')) => {
-                    return (2, &rest[..2]);
+                // A quote escaped once or more, as in JSON that is itself
+                // in a string: `\"`, `\\\"`.
+                Some(b'\\') if start == 0 => {
+                    let slashes = bytes
+                        .iter()
+                        .take(8)
+                        .take_while(|byte| **byte == b'\\')
+                        .count();
+                    if slashes < 8 && matches!(bytes.get(slashes), Some(b'"' | b'\'')) {
+                        return (slashes + 1, &rest[..=slashes]);
+                    }
                 }
                 _ => {}
             }
@@ -987,7 +1164,9 @@ impl<'a> AssignedValue<'a> {
         let mut escaped = false;
         for (index, c) in body.char_indices() {
             let ends = match quote {
-                "" => c.is_whitespace(),
+                // In a list of `Name=value;` pairs, as connection strings are
+                // written, a value ends where the next pair starts.
+                "" => c.is_whitespace() || (c == ';' && starts_a_pair(&body[index + 1..])),
                 "\"" | "'" => !escaped && (c == '\n' || quote.starts_with(c)),
                 _ => c == '\n' || body[index..].starts_with(quote),
             };
@@ -1161,6 +1340,80 @@ impl<'a> AssignedValue<'a> {
     }
 }
 
+/// Whether `rest` starts with `Name=`: the next pair of a list of pairs.
+fn starts_a_pair(rest: &str) -> bool {
+    let name = rest
+        .bytes()
+        .take(64)
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b' ' | b'.'))
+        .count();
+    name > 0 && rest.as_bytes().get(name) == Some(&b'=')
+}
+
+/// Longest block of lines taken as one value: a YAML block scalar or a
+/// heredoc.
+const MAX_BLOCK: usize = 64 * 1024;
+
+/// Where a value written as a block of lines ends, when `token`, alone on its
+/// line after the name that starts at `name_start`, opens one: a YAML block
+/// scalar (`|`, `>-`) takes the lines indented more than the name, a heredoc
+/// (`<<EOF`) the lines up to its end marker.
+fn block_end(text: &str, name_start: usize, value_start: usize, token: &str) -> Option<usize> {
+    let line_end = text[value_start..]
+        .find('\n')
+        .map_or(text.len(), |at| value_start + at);
+    if text[value_start..line_end].trim() != token || line_end == text.len() {
+        return None;
+    }
+    let scalar = token.starts_with(['|', '>'])
+        && token[1..]
+            .chars()
+            .all(|c| matches!(c, '-' | '+') || c.is_ascii_digit());
+    let marker = token
+        .strip_prefix("<<")
+        .map(|marker| {
+            marker
+                .trim_start_matches(['-', '~'])
+                .trim_matches(['"', '\''])
+        })
+        .filter(|marker| {
+            !marker.is_empty()
+                && marker
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    if !scalar && marker.is_none() {
+        return None;
+    }
+    let line_start = text[..name_start].rfind('\n').map_or(0, |at| at + 1);
+    let lead = &text[line_start..name_start];
+    let indent = lead.len() - lead.trim_start_matches([' ', '\t']).len();
+    let limit = (line_end + MAX_BLOCK).min(text.len());
+    let mut end = line_end;
+    let mut at = line_end;
+    while at < limit {
+        let start = at + 1;
+        let stop = text[start..]
+            .find('\n')
+            .map_or(text.len(), |found| start + found);
+        let line = &text[start..stop];
+        match marker {
+            Some(marker) if line.trim() == marker => return Some(at),
+            Some(_) => {}
+            None => {
+                let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+                if !line.trim().is_empty() && line_indent <= indent {
+                    break;
+                }
+                end = stop;
+            }
+        }
+        at = stop;
+    }
+    // A heredoc whose end is not in reach is not taken for one.
+    (marker.is_none() && end > line_end).then_some(end)
+}
+
 /// The quote that opens the quotation a header stands in, if it stands in
 /// one: the quote right before its name, or the nearest one before it on
 /// its line.
@@ -1183,6 +1436,16 @@ struct Rewrite<'a> {
 }
 
 impl Rewrite<'_> {
+    /// Replaces `text[from..to]`, keeping its line breaks so that the lines
+    /// after it keep their numbers.
+    fn replace_lines(&mut self, from: usize, to: usize) {
+        let lines = self.text[from..to].matches('\n').count();
+        self.out.push_str(&self.text[self.copied..from]);
+        self.out.push_str(REDACTED);
+        self.out.extend(std::iter::repeat_n('\n', lines));
+        self.copied = to;
+    }
+
     /// Replaces `text[from..to]`, which is in quotes when `quoted` is given:
     /// the opening and the closing of the quotation.
     fn replace(&mut self, from: usize, to: usize, quoted: Option<(&str, &str)>) {
@@ -1248,7 +1511,7 @@ fn redact_assignments(text: &str) -> String {
 
         // The value of a header is the rest of its line, or of the quotation
         // the header stands in.
-        if kind == NameKind::Header && !rest.starts_with(['"', '\'']) {
+        if kind == NameKind::Header && AssignedValue::opening(rest).1.is_empty() {
             // Judged by its first word, before the whole of it is measured.
             let window = &rest[..char_floor(rest, VALUE_SAMPLE)];
             let first = window
@@ -1285,6 +1548,17 @@ fn redact_assignments(text: &str) -> String {
             let about =
                 is_position(value.token()) || value.line_tail().is_none_or(|tail| !tail.is_empty());
             if about {
+                continue;
+            }
+        }
+        // A value written as a block of lines after its name: all of it.
+        if matches!(operator, Operator::Colon | Operator::Equals)
+            && starts_line
+            && !value.is_quoted()
+        {
+            if let Some(end) = block_end(text, name.start(), value_start, value.token()) {
+                rewrite.replace_lines(value_start, end);
+                search = end;
                 continue;
             }
         }
@@ -1364,14 +1638,12 @@ impl Redactor {
             }
         }
         known.retain(|value| can_be_known(value));
-        // A value also appears escaped, inside the JSON of a tool call.
-        let escaped: Vec<String> = known
+        // A value is the same secret in the forms programs write it in.
+        let forms: Vec<String> = known
             .iter()
-            .filter_map(|value| serde_json::to_string(value).ok())
-            .map(|json| json[1..json.len() - 1].to_string())
-            .filter(|escaped| !known.contains(escaped))
+            .flat_map(|value| encoded_forms(value))
             .collect();
-        known.extend(escaped);
+        known.extend(forms);
         known.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         known.dedup();
         Self { known }
@@ -1391,6 +1663,16 @@ impl Redactor {
         if KEY_BEGIN.is_match(&out) {
             out = redact_private_keys(&out);
         }
+        if PUTTY_PRIVATE.is_match(&out) {
+            out = PUTTY_PRIVATE
+                .replace_all(&out, |found: &Captures<'_>| {
+                    // The line breaks of the body stay, so that the lines
+                    // after it keep their numbers.
+                    let lines = "\n".repeat(found[2].matches('\n').count());
+                    format!("{}\n{REDACTED}{lines}", &found[1])
+                })
+                .into_owned();
+        }
         if URL_PASSWORD.is_match(&out) {
             out = redact_url_passwords(&out);
         }
@@ -1399,7 +1681,7 @@ impl Redactor {
                 out = shape.replace_all(&out, *replacement).into_owned();
             }
         }
-        redact_assignments(&redact_flags(&out))
+        redact_assignments(&redact_flags(&redact_handed_over(&out)))
     }
 
     /// `text` with the values this redactor knows replaced, and nothing
@@ -1480,6 +1762,15 @@ impl Redactor {
                         })
                         .collect(),
                 ),
+                // A number written without quotes is still a known value.
+                Value::Number(number)
+                    if redactor
+                        .known
+                        .iter()
+                        .any(|known| *known == number.to_string()) =>
+                {
+                    Value::String(REDACTED.to_string())
+                }
                 other => other,
             }
         }
@@ -2749,6 +3040,213 @@ mod tests {
     }
 
     #[test]
+    fn a_known_value_is_found_in_the_forms_programs_write_it_in() {
+        let redactor = Redactor::new(
+            [
+                ("SOME_API_KEY", "abc+def/ghi=jkl0123"),
+                ("NUM_API_KEY", "1234567890123456"),
+                ("MB_KEY", "clé-très-secrète-42"),
+                ("AMP_KEY", "Tr0ub4dor&3xyz<>"),
+            ],
+            Vec::<(String, String)>::new(),
+            &[],
+        );
+        for text in [
+            "GET /search?q=abc%2Bdef%2Fghi%3Djkl0123 HTTP/1.1",
+            "GET /search?q=abc%2bdef%2fghi%3djkl0123 HTTP/1.1",
+            r#"{"k":"abc+def\/ghi=jkl0123"}"#,
+            r#"{"k": "clé-très-secrète-42"}"#,
+            r#"{"k": "clé-très-secrète-42"}"#,
+            r#"["x=Tr0ub4dor&3xyz<>"]"#,
+            "value=Tr0ub4dor&amp;3xyz&lt;&gt;",
+            "q=Tr0ub4dor%263xyz%3C%3E",
+        ] {
+            let out = redactor.redact(text);
+            assert!(out.contains(REDACTED), "{text} -> {out}");
+            for piece in ["jkl0123", "secr", "3xyz"] {
+                assert!(
+                    !out.contains(piece) || !text.contains(piece),
+                    "{text} -> {out}"
+                );
+            }
+        }
+        // A number in the arguments of a tool call.
+        let out = redactor.redact_json(r#"{"pin": 1234567890123456, "count": 3}"#);
+        assert_eq!(out, r#"{"count":3,"pin":"[redacted]"}"#);
+    }
+
+    #[test]
+    fn pgp_and_putty_private_keys_go_whole() {
+        let redactor = Redactor::default();
+        let pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG v2\n\nlQOYBF8xQ0kBCADC2J3vZk9pQf8Yk1sQ0+M3s2YbR7rT5Z6H2l9d0wVxq4n1Kp8J\nq0n6e4cXv2Q1r9Wf7a3h5k2Lm8d4Pz1sT6uV0yX3bN9cR5gH7jK2lM4nP6qS8tU0\n=Xy1Z\n-----END PGP PRIVATE KEY BLOCK-----\nafter";
+        let out = redactor.redact(pgp);
+        assert!(!out.contains("lQOYBF8") && !out.contains("q0n6e4"), "{out}");
+        assert_eq!(out.lines().count(), pgp.lines().count());
+        assert!(out.ends_with("\nafter"));
+        // Without its end marker, as a listing cut short shows it.
+        let cut = "-----BEGIN PGP SECRET KEY BLOCK-----\nVersion: 1\n\nlQOYBF8xQ0kBCADC2J3vZk9pQf8Yk1sQ0+M3s2YbR7rT5Z6H2l9d0wVxq4n1Kp8J\n";
+        assert!(!redactor.redact(cut).contains("lQOYBF8"));
+
+        let putty = "PuTTY-User-Key-File-2: ssh-rsa\nPublic-Lines: 1\nAAAAB3NzaC1yc2E\nPrivate-Lines: 2\nAAABAQCs0123456789abcdef\nAAAAgQDabcdef0123456789\nPrivate-MAC: 0a1b2c\n";
+        let out = redactor.redact(putty);
+        assert!(
+            !out.contains("AAABAQCs") && !out.contains("AAAAgQD"),
+            "{out}"
+        );
+        assert!(out.contains("Public-Lines: 1\nAAAAB3NzaC1yc2E\n"), "{out}");
+        assert!(out.contains("\nPrivate-MAC: 0a1b2c"), "{out}");
+        assert_eq!(out.lines().count(), putty.lines().count());
+    }
+
+    #[test]
+    fn assignments_inside_escaped_json_lose_their_value() {
+        let redactor = Redactor::default();
+        for (input, expected) in [
+            (
+                r#"String body = "{\"username\":\"bob\",\"password\":\"hunter22\"}";"#,
+                r#"String body = "{\"username\":\"bob\",\"password\":\"[redacted]\"}";"#,
+            ),
+            (
+                r#"level=info body="{\"token\":\"abcd1234efgh\",\"user\":\"bob\"}""#,
+                r#"level=info body="{\"token\":\"[redacted]\",\"user\":\"bob\"}""#,
+            ),
+            (
+                r#"{\\\"password\\\":\\\"hunter 22 more\\\"}"#,
+                r#"{\\\"password\\\":\\\"[redacted]\\\"}"#,
+            ),
+            (
+                r#""{\"Cookie\":\"session=abc123def\"}""#,
+                r#""{\"Cookie\":\"[redacted]\"}""#,
+            ),
+        ] {
+            let once = redactor.redact(input);
+            assert_eq!(once, expected, "{input}");
+            assert_eq!(redactor.redact(&once), once, "{input}");
+        }
+        for input in [
+            r#"msg = "the \"token\" field is required""#,
+            r#""\"password\": \"\"""#,
+        ] {
+            assert_eq!(redactor.redact(input), input);
+        }
+        // Time in proportion to the length, whatever the backslashes.
+        let text = format!("password:{}\"{}", "\\".repeat(64_000), "\\".repeat(192_000));
+        let started = std::time::Instant::now();
+        let _ = redactor.redact(&text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn keys_of_accounts_and_services_are_credentials() {
+        let redactor = Redactor::default();
+        for (input, expected) in [
+            (
+                "DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;EndpointSuffix=core.windows.net",
+                "DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=[redacted];EndpointSuffix=core.windows.net",
+            ),
+            ("account_key: Eby8vdM02xNOcq", "account_key: [redacted]"),
+            (
+                "    client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ",
+                "    client-key-data: [redacted]",
+            ),
+            (
+                "Ocp-Apim-Subscription-Key: 0123456789abcdef0123456789abcdef",
+                "Ocp-Apim-Subscription-Key: [redacted]",
+            ),
+            ("X-Auth: Sup3rS3cretPw", "X-Auth: [redacted]"),
+        ] {
+            assert_eq!(redactor.redact(input), expected, "{input}");
+        }
+        for input in [
+            "primary_key: \"user_id\"",
+            "sort_key: \"created_at\"",
+            "let cache_key = format!(\"{id}\");",
+        ] {
+            assert_eq!(redactor.redact(input), input);
+        }
+    }
+
+    #[test]
+    fn credentials_handed_over_by_calls_and_markup_lose_their_value() {
+        let redactor = Redactor::default();
+        for (input, expected) in [
+            (
+                "define( 'DB_PASSWORD', 'Sup3rS3cretPw' );",
+                "define( 'DB_PASSWORD', '[redacted]' );",
+            ),
+            (
+                "os.Setenv(\"API_TOKEN\", \"abcd1234efgh5678\")",
+                "os.Setenv(\"API_TOKEN\", \"[redacted]\")",
+            ),
+            (
+                "System.setProperty(\"javax.net.ssl.keyStorePassword\", \"Sup3rS3cretPw\");",
+                "System.setProperty(\"javax.net.ssl.keyStorePassword\", \"[redacted]\");",
+            ),
+            (
+                "ds.setPassword(\"Sup3rS3cretPw\");",
+                "ds.setPassword(\"[redacted]\");",
+            ),
+            (
+                "<password>Sup3rS3cretPw</password>",
+                "<password>[redacted]</password>",
+            ),
+            (
+                "<add key=\"Password\" value=\"Sup3rS3cretPw\" />",
+                "<add key=\"Password\" value=\"[redacted]\" />",
+            ),
+            (
+                "ALTER USER bob IDENTIFIED BY 'Sup3rS3cretPw';",
+                "ALTER USER bob IDENTIFIED BY '[redacted]';",
+            ),
+            (
+                "CREATE USER bob WITH PASSWORD 'Sup3rS3cretPw';",
+                "CREATE USER bob WITH PASSWORD '[redacted]';",
+            ),
+        ] {
+            let once = redactor.redact(input);
+            assert_eq!(once, expected, "{input}");
+            assert_eq!(redactor.redact(&once), once, "{input}");
+        }
+        for input in [
+            "define('WP_DEBUG', 'true');",
+            "config.set(\"mode\", \"fast\")",
+            "<name>project</name>",
+            "<password>${env.DB_PASSWORD}</password>",
+            "ds.setUrl(\"jdbc:postgresql://db/app\");",
+        ] {
+            assert_eq!(redactor.redact(input), input);
+        }
+    }
+
+    #[test]
+    fn a_value_written_as_a_block_of_lines_goes_whole() {
+        let redactor = Redactor::default();
+        for (input, expected) in [
+            (
+                "client_secret: |\n  9f8e7d6c5b4a39281706f5e4d3c2b1a0\n  second line\nnext: 1",
+                "client_secret: [redacted]\n\n\nnext: 1",
+            ),
+            (
+                "  password: >-\n    Sup3rS3cretPw\n\n  other: 2",
+                "  password: [redacted]\n\n\n  other: 2",
+            ),
+            (
+                "private_key = <<EOF\nabcd1234efgh5678ijkl9012mnop3456\nEOF\nnext = 1",
+                "private_key = [redacted]\n\nEOF\nnext = 1",
+            ),
+        ] {
+            let once = redactor.redact(input);
+            assert_eq!(once, expected, "{input}");
+            assert_eq!(once.lines().count(), input.lines().count(), "{input}");
+            assert_eq!(redactor.redact(&once), once, "{input}");
+        }
+        // A heredoc whose end is not there, and a block that is empty.
+        for input in ["notes: |\nnext: 1", "token = <<EOF\nnever closed"] {
+            assert!(redactor.redact(input).contains("next: 1") || input.contains("never"));
+        }
+    }
+
+    #[test]
     fn no_text_makes_the_redactor_fail() {
         // Pieces that the rules look for, next to characters of more than one
         // byte and to the ends of the text, put together in every order a
@@ -2817,6 +3315,24 @@ mod tests {
             "-----END PRIVATE KEY-----",
             "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
             "Proc-Type: ",
+            "Version: ",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+            "Private-Lines: 2\n",
+            "<<EOF\n",
+            "EOF",
+            ": |\n",
+            "  ",
+            "define('DB_PASSWORD', '",
+            "<password>",
+            "</password>",
+            "setPassword(\"",
+            "IDENTIFIED BY '",
+            "AccountKey=",
+            ";Name=",
+            "\\\"",
+            "%2F",
+            "&amp;",
+            "\\u00e9",
             "DEK-Info: ",
             "export ",
             "- ",

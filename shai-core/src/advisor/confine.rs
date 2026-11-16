@@ -241,7 +241,8 @@ fn is_code_like(name: &str) -> bool {
         let stem = &bare[..bare.len() - last.len() - 1];
         return match stem.rsplit_once('.') {
             Some((_, rendered)) => CODE_EXTENSIONS.contains(&rendered),
-            None => true,
+            // What it renders is not said: data, as far as can be told.
+            None => false,
         };
     }
     CODE_EXTENSIONS.contains(&last)
@@ -300,8 +301,17 @@ fn is_sensitive_file_name(name: &str) -> bool {
     // `kubeconfig~`. An editor's swap file also hides the name behind a dot:
     // `.kubeconfig.swp`.
     let original = without_backup_suffixes(name);
-    original != name
+    if original != name
         && (names_a_secret(original) || original.strip_prefix('.').is_some_and(names_a_secret))
+    {
+        return true;
+    }
+    // A template is judged by the file it renders: `.pgpass.tmpl`,
+    // `htpasswd.j2`.
+    original
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && TEMPLATE_EXTENSIONS.contains(extension))
+        .is_some_and(|(stem, _)| names_a_secret(stem))
 }
 
 /// The rules about one lowercased file name, taken as it is written.
@@ -358,7 +368,7 @@ pub(crate) struct ConfinedFs {
 }
 
 /// The places a view refuses whatever they are called.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Refusals {
     /// Paths inside the root that are never read, nor anything below them.
     /// Each is written as [`destination`] gives it and as its text says, so
@@ -555,6 +565,11 @@ impl ConfinedFs {
     /// what exists where the advisor may not look.
     pub(crate) fn resolve(&self, requested: &str) -> Result<PathBuf, ConfineError> {
         let requested = if requested.is_empty() { "." } else { requested };
+        // No path this long can be opened. Refused by its length alone,
+        // before the filesystem is asked anything.
+        if requested.len() > MAX_REQUEST_LEN {
+            return Err(ConfineError::Outside(requested.to_string()));
+        }
         if requested.contains('\0') {
             return Err(ConfineError::NotFound(requested.replace('\0', "?")));
         }
@@ -588,10 +603,14 @@ impl ConfinedFs {
         } else {
             written.to_path_buf()
         };
-        match self.route(&written) {
-            Route::Inside => {}
-            Route::LeavesRoot => return Err(ConfineError::Outside(requested.to_string())),
-            Route::EntersRefused => return Err(ConfineError::Sensitive(requested.to_string())),
+        // Followed as written, and as it is opened: by its text, `..`
+        // resolved, which is the path the system follows link by link.
+        for path in [&written, &relative] {
+            match self.route(path) {
+                Route::Inside => {}
+                Route::LeavesRoot => return Err(ConfineError::Outside(requested.to_string())),
+                Route::EntersRefused => return Err(ConfineError::Sensitive(requested.to_string())),
+            }
         }
 
         // Outside by where its links lead, whether or not the last of them
@@ -638,7 +657,8 @@ impl ConfinedFs {
     fn route(&self, written: &Path) -> Route {
         use std::collections::VecDeque;
         use std::ffi::OsString;
-        let refusals = self.refusals();
+        // A copy: the lists are not held while the filesystem is asked.
+        let refusals = self.refusals().clone();
         let mut pending: VecDeque<OsString> = written
             .components()
             .map(|component| component.as_os_str().to_os_string())
@@ -662,19 +682,23 @@ impl ConfinedFs {
                 // are handled below.
                 Some(_) => return Route::LeavesRoot,
             };
-            let entry = reached.join(&name);
+            // The path grows in place: a copy of it at every name would make
+            // a long path cost the square of its length.
+            reached.push(&name);
             if exists {
                 lookups += 1;
                 if lookups > MAX_LOOKUPS {
                     return Route::LeavesRoot;
                 }
-                match entry.symlink_metadata() {
+                match reached.symlink_metadata() {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         let target = (hops < MAX_LINK_HOPS)
-                            .then(|| std::fs::read_link(&entry).ok())
+                            .then(|| std::fs::read_link(&reached).ok())
                             .flatten();
                         if let Some(target) = target {
                             hops += 1;
+                            // A relative target starts at the link's directory.
+                            reached.pop();
                             let target = if target.is_absolute() {
                                 let Some(rest) = [Some(&self.root), self.alias.as_ref()]
                                     .into_iter()
@@ -699,7 +723,6 @@ impl ConfinedFs {
                     Err(_) => exists = false,
                 }
             }
-            reached = entry;
             let lower = name.to_string_lossy().to_lowercase();
             if SENSITIVE_DIRS.contains(&without_backup_suffixes(&lower)) || refusals.names(&reached)
             {
@@ -841,6 +864,9 @@ enum Route {
 /// links. A crafted tree of links that point at each other is refused past
 /// this, instead of keeping a tool call busy.
 const MAX_LOOKUPS: usize = 4096;
+
+/// Longest path the advisor may ask for, in bytes: what the system opens.
+const MAX_REQUEST_LEN: usize = 4096;
 
 /// Most links [`destination`] follows by hand before it gives up, as many as
 /// the system follows itself.
@@ -1485,7 +1511,7 @@ mod tests {
         let long = format!("{}src/missing.rs", "self/".repeat(4_000));
         assert_eq!(
             confined.resolve(&long).unwrap_err(),
-            ConfineError::NotFound(long.clone())
+            ConfineError::Outside(long.clone())
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1506,6 +1532,11 @@ mod tests {
             sb.root.join("probe"),
         )
         .unwrap();
+        // One that goes through a refused place and comes back, and a link
+        // to a directory deeper down, which `..` after it leaves.
+        std::os::unix::fs::symlink("records/s1/../../README.md", sb.root.join("probe2")).unwrap();
+        fs::create_dir_all(sb.root.join("sub/deeper")).unwrap();
+        std::os::unix::fs::symlink("sub/deeper", sb.root.join("a")).unwrap();
         let confined = ConfinedFs::new(&sb.root)
             .unwrap()
             .refusing([sb.root.join("records")]);
@@ -1514,6 +1545,10 @@ mod tests {
                 "probe",
                 ".git/hooks/../../README.md",
                 "records/s1/../../README.md",
+                "nope/../probe",
+                "a/../probe",
+                "nope/../probe2",
+                "a/../probe2",
             ]
             .map(|path| {
                 confined
@@ -1539,6 +1574,45 @@ mod tests {
             confined.resolve("abs/main.rs"),
             Ok(sb.root.join("src/main.rs"))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_very_long_path_costs_little_and_is_refused() {
+        let sb = sandbox();
+        let confined = ConfinedFs::new(&sb.root).unwrap();
+        let started = std::time::Instant::now();
+        // Long enough to be refused by its length, and below it, a path of
+        // many missing names, which is followed in time to its length.
+        let long = format!("nope/{}", "a/".repeat(200_000));
+        assert_eq!(
+            confined.resolve(&long).unwrap_err(),
+            ConfineError::Outside(long.clone())
+        );
+        let route = confined.route(Path::new(&format!("nope/{}", "a/".repeat(200_000))));
+        assert!(matches!(route, Route::LeavesRoot | Route::Inside));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn clones_of_a_view_share_what_is_refused() {
+        let sb = sandbox();
+        let original = ConfinedFs::new(&sb.root)
+            .unwrap()
+            .refusing([sb.root.join("later/records")]);
+        let copy = original.clone();
+        fs::create_dir_all(sb.root.join("elsewhere")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("elsewhere", sb.root.join("later")).unwrap();
+        // What one clone learns about where the place leads, the other knows.
+        copy.refresh();
+        fs::create_dir_all(sb.root.join("elsewhere/records")).unwrap();
+        #[cfg(unix)]
+        assert!(original.resolve("elsewhere/records").is_err());
     }
 
     #[test]
@@ -1578,7 +1652,11 @@ mod tests {
             ("config/secrets/prod.yaml.example", true),
             ("secrets/prod.kubeconfig.dist", true),
             ("app/views/passwords/edit.html.erb", false),
-            ("app/views/passwords/show.erb", false),
+            ("app/views/passwords/show.erb", true),
+            ("deploy/secrets/.pgpass.tmpl", true),
+            ("deploy/secrets/htpasswd.j2", true),
+            (".netrc.j2", true),
+            ("templates/kubeconfig.tmpl", true),
             ("lib/src/password/password_field.dart", false),
             ("proto/secrets/v1/secrets.proto", false),
             ("docs/secrets/README.rst", false),
