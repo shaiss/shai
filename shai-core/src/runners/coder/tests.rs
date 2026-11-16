@@ -71,6 +71,7 @@ async fn test_coder_brain_think_simple() {
         is_plan_mode: false,
         active_prompts: vec![],
         tool_call_metadata: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        advisor_note: None,
     };
 
     let result = brain

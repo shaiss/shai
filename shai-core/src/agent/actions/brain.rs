@@ -42,6 +42,7 @@ impl AgentCore {
             is_plan_mode,
             active_prompts,
             tool_call_metadata: self.tool_ctx.tool_cache.tool_call_metadata.clone(),
+            advisor_note: self.take_advisor_note(),
         };
         let brain = self.brain.clone();
 

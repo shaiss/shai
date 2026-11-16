@@ -1,3 +1,4 @@
+use crate::agent::actions::advisor::AdvisorSession;
 use crate::agent::prewalk::{Prewalk, PrewalkSignals};
 use crate::agent::ClaimManager;
 use crate::tools::fs::operation_log::FsOperationLog;
@@ -187,6 +188,9 @@ pub struct AgentCore {
 
     /// handoff to another model, while one is armed (see `agent::prewalk`)
     pub(crate) prewalk: Option<Prewalk>,
+
+    /// second model reviewing this session's steps, if any
+    pub(crate) advisor: Option<AdvisorSession>,
 }
 
 pub struct AgentSocket {
@@ -241,6 +245,7 @@ impl AgentCore {
                 tool_budget,
             },
             prewalk: None,
+            advisor: None,
         }
     }
 
@@ -569,7 +574,7 @@ impl AgentCore {
                     .and({
                         // Remove trailing assistant messages and tool calls to re-think
                         // from the last user message
-                        {
+                        let rewound_to = {
                             let mut trace = self.tool_ctx.trace.write().await;
                             while let Some(msg) = trace.last() {
                                 match msg {
@@ -579,7 +584,9 @@ impl AgentCore {
                                     }
                                 }
                             }
-                        }
+                            trace.len()
+                        };
+                        self.advisor_rewound(rewound_to);
                         self.set_state(InternalAgentState::Running).await;
                         Ok(AgentResponse::Ack)
                     })

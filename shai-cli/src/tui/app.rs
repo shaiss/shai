@@ -112,10 +112,10 @@ impl App<'_> {
 
         // A handoff that has not happened yet stays armed on an agent that
         // replaces the previous one, if that agent can hand off at all. Once
-        // it has happened, no agent is armed again.
-        if let Some(notice) = self.session_options.arm(&mut agent) {
-            self.session_notices.push(notice);
-        }
+        // it has happened, no agent is armed again. The advisor follows the
+        // session from one agent to the next, and so does its review counter.
+        let notices = self.session_options.arm(&mut agent);
+        self.session_notices.extend(notices);
 
         let banner = if let Some(name) = agent_name {
             format!(
@@ -626,6 +626,36 @@ mod tests {
         // The same announcement arriving again is not shown twice.
         app.handle_agent_event(switched()).await.unwrap();
         assert_eq!(switch_lines(&app), 1);
+    }
+
+    #[tokio::test]
+    async fn advisor_notes_and_failures_are_shown_in_the_conversation() {
+        let mut app = App::new();
+        app.handle_agent_event(AgentEvent::AdvisorNote {
+            severity: shai_core::advisor::Severity::Concern,
+            note: "the tests were not run".to_string(),
+        })
+        .await
+        .unwrap();
+        app.handle_agent_event(AgentEvent::AdvisorFailed {
+            error: "model not found".to_string(),
+            disabled: true,
+        })
+        .await
+        .unwrap();
+
+        let scrollback = app.renderer.history().raw_text();
+        assert!(
+            scrollback.contains("advisor (concern): the tests were not run"),
+            "{scrollback}"
+        );
+        assert!(
+            scrollback.contains("advisor: review failed (model not found)"),
+            "{scrollback}"
+        );
+        assert!(scrollback.contains("off for the rest of this session"));
+        // Each is shown once.
+        assert_eq!(scrollback.matches("the tests were not run").count(), 1);
     }
 
     #[tokio::test]
