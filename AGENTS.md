@@ -75,6 +75,19 @@ When using `-p` with cargo commands, always use the package name (e.g., `cargo b
 - Run a single test: `cargo test -p shai-core <test_name>`
 - Use `tempfile::TempDir` for filesystem tests.
 - Use `mockito` for HTTP mocking.
+- Tests that call a real LLM provider (`runners::` agent tests, `tools::tests_llm`, and the
+  `shai-llm` per-provider tests) are skipped unless `SHAI_LIVE_LLM_TESTS=1`. A skipped test
+  prints a one-line reason and passes. To run them:
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners::` and
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- tools::tests_llm` and
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-llm` (they may cost tokens). The `shai-llm` tests
+  read provider env vars (e.g. `OPENAI_API_KEY`) and skip a provider whose key is unset.
+  The coder, searcher and tool tests need a `shai auth` config file and fail without one
+  (they never use the built-in anonymous endpoint); the gerund tests read provider env vars,
+  falling back to a local Ollama. New tests that need a model must call `skip_unless_live_llm`
+  first, or use `mockito`.
+- The gate only covers LLM calls: the MCP tests in `shai-core/src/tools/mcp` launch
+  `uvx mcp-server-fetch` and fetch a URL when `uvx` is installed.
 
 ## Release Process
 
