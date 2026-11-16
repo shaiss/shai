@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod env_scrub;
 pub mod fetch;
 pub mod frontmatter;
 pub mod fs;

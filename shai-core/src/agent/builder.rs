@@ -62,17 +62,23 @@ impl AgentBuilder {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;
 
+        Ok(Self::default_with_llm(Arc::new(llm_client), model))
+    }
+
+    /// Like [`AgentBuilder::default`], on an LLM client the caller already
+    /// built, so that the config is not loaded again.
+    pub fn default_with_llm(llm_client: Arc<LlmClient>, model: String) -> Self {
         // Create default brain
-        let brain = Box::new(CoderBrain::new(Arc::new(llm_client), model));
+        let brain = Box::new(CoderBrain::new(llm_client, model));
 
         // Create default toolbox (using ToolConfig from shai-cli)
         // For now, create basic tools - we can expand this later
         let fs_log = Arc::new(FsOperationLog::new());
         let (tools, todo_storage) = Self::create_default_tools(fs_log.clone());
 
-        Ok(Self::with_brain(brain)
+        Self::with_brain(brain)
             .tools(tools)
-            .set_todo_storage(todo_storage))
+            .set_todo_storage(todo_storage)
     }
 
     /// Create AgentBuilder with a specific brain
@@ -184,6 +190,19 @@ impl AgentBuilder {
     /// Enable sudo mode - bypasses all permission checks
     pub fn sudo(mut self) -> Self {
         self.permissions.sudo();
+        self
+    }
+
+    /// Permissions for an agent that runs without anyone to answer a prompt
+    /// (headless CLI, HTTP server). Tools that only read run; every other
+    /// tool is denied immediately. `allow_all` (`--yes`) grants everything.
+    pub fn headless_permissions(mut self, allow_all: bool) -> Self {
+        self.permissions.non_interactive();
+        if allow_all {
+            self.permissions.sudo();
+        } else {
+            self.permissions.no_sudo();
+        }
         self
     }
 

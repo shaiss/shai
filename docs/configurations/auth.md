@@ -112,7 +112,7 @@ It is off by default. Turn it on for one run with a flag, or for every session i
 
 ```bash
 shai --prewalk-into cheap                      # a role from "roles"
-shai -p "fix the flaky test" --prewalk-into ollama/qwen3:8b
+shai -p "fix the flaky test" --prewalk-into ollama/qwen3:8b --yes   # headless needs --yes to edit
 ```
 
 ```jsonc
@@ -129,7 +129,7 @@ What to expect:
 - **Once.** After the switch the conversation stays on the target; nothing switches it back. In the TUI, an agent you start afterwards (another agent, a restored conversation, `/auth`) is a new agent on its own model, and prewalk does not move it: Shai says so with a `prewalk is over` line.
 - **If the target cannot be resolved, the session does not start.** A role that is not configured, a provider with no entry, a `prewalk` section that is invalid or written twice: each is reported as an error and Shai exits with status 2 instead of running without the handoff. The error names a target taken from the config by its key (`prewalk.into`) and does not repeat its value, unless the value is the name of a role or provider that is configured. `--prewalk-into` on a command that starts no session (`shai serve`, `shai auth`, `shai --list-tools`, ...) is an error too. HTTP server mode does not use prewalk.
 - **A config file that cannot be read stops the session as well.** If `auth.config.json` (or the legacy `auth.config`) exists and does not load, Shai cannot tell whether it asks for a handoff, so the TUI and headless mode exit with status 2 and say where the file is broken, without repeating what it holds, instead of running on the built-in default model as they did before. An agent the TUI starts later in the session (agent picker, restored session, `/auth`) follows the same rule: it is not started on the built-in default. No starter config is downloaded over such a file. `shai auth` and the other commands that start no session still work, and so does a first run with no config file at all.
-- **An agent that could never trigger it is not armed.** The handoff needs the built-in `todo_write` tool and at least one of `write` and `edit`. If the agent's tools leave them out (`--tools`, `--remove`, a custom agent), Shai says `prewalk not armed` with the reason, in the same place as the armed notice, and the session runs on its own model. Tools of the same names served by an MCP server do not count.
+- **An agent that could never trigger it is not armed.** The handoff needs the built-in `todo_write` tool and at least one of `write` and `edit`. If the agent's tools leave them out (`--tools`, `--remove`, a custom agent), or a headless run has no `--yes` (headless mode denies `write` and `edit` without it), Shai says `prewalk not armed` with the reason, in the same place as the armed notice, and the session runs on its own model. Tools of the same names served by an MCP server do not count.
 - **The configuration is followed.** Each time the TUI starts an agent (after `/auth`, when you pick another agent, when you restore a conversation), a handoff that is still to come is resolved again against the configuration as it is then. If it no longer resolves, the handoff is given up with a `prewalk disarmed` line; it is never sent to credentials or an endpoint you have just removed.
 - If the target's provider rejects the request after the switch (for example because the model name is wrong, or it does not accept the conversation another provider produced), that error is shown and the session stays on the target.
 

@@ -124,6 +124,9 @@ pub struct ClaimManager {
     config_file: Option<PathBuf>,
     sudo_mode: bool,
     deny_all: bool,
+    /// No one can answer a permission prompt (headless CLI, HTTP server):
+    /// tools that would need approval are refused at once instead of asking.
+    non_interactive: bool,
     active_prompts: Vec<String>,
 }
 
@@ -135,6 +138,7 @@ impl ClaimManager {
             config_file: None,
             sudo_mode: false,
             deny_all: false,
+            non_interactive: false,
             active_prompts: Vec::new(),
         }
     }
@@ -146,6 +150,7 @@ impl ClaimManager {
             config_file: Some(path),
             sudo_mode: false,
             deny_all: false,
+            non_interactive: false,
             active_prompts: Vec::new(),
         }
     }
@@ -157,6 +162,7 @@ impl ClaimManager {
             config_file: None,
             sudo_mode: true,
             deny_all: false,
+            non_interactive: false,
             active_prompts: Vec::new(),
         }
     }
@@ -168,6 +174,7 @@ impl ClaimManager {
             config_file: Some(path),
             sudo_mode: true,
             deny_all: false,
+            non_interactive: false,
             active_prompts: Vec::new(),
         }
     }
@@ -180,6 +187,18 @@ impl ClaimManager {
     /// Disable sudo mode - re-enables permission checks
     pub fn no_sudo(&mut self) {
         self.sudo_mode = false;
+    }
+
+    /// Mark the session as non-interactive: nobody can answer a permission
+    /// prompt, so any tool that would need approval is denied immediately
+    /// instead of waiting for an answer that never comes.
+    pub fn non_interactive(&mut self) {
+        self.non_interactive = true;
+    }
+
+    /// Check if the session is non-interactive (headless CLI or HTTP server)
+    pub fn is_non_interactive(&self) -> bool {
+        self.non_interactive
     }
 
     /// Enable plan mode - denies all tool execution (read-only)

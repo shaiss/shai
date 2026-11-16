@@ -17,6 +17,39 @@ pub(crate) mod test_helpers {
 
     static INIT_LOGGING: Once = Once::new();
 
+    /// Env var that opts in to tests that call a real LLM provider.
+    pub const LIVE_LLM_TESTS_ENV: &str = "SHAI_LIVE_LLM_TESTS";
+
+    /// True only when the gate value is exactly "1".
+    pub fn live_llm_gate(value: Option<&str>) -> bool {
+        value == Some("1")
+    }
+
+    /// Returns true (after printing a one-line reason) when live LLM tests are
+    /// not enabled, so the caller can `return` early. Without this gate these
+    /// tests would fall back to the built-in provider config and try to reach
+    /// a real endpoint during a plain `cargo test`.
+    pub fn skip_unless_live_llm(test_name: &str) -> bool {
+        let value = std::env::var(LIVE_LLM_TESTS_ENV).ok();
+        if live_llm_gate(value.as_deref()) {
+            return false;
+        }
+        println!(
+            "skipping {}: live LLM test, set {}=1 to run",
+            test_name, LIVE_LLM_TESTS_ENV
+        );
+        true
+    }
+
+    #[test]
+    fn live_llm_gate_requires_exactly_one() {
+        assert!(live_llm_gate(Some("1")));
+        assert!(!live_llm_gate(None));
+        assert!(!live_llm_gate(Some("")));
+        assert!(!live_llm_gate(Some("0")));
+        assert!(!live_llm_gate(Some("true")));
+    }
+
     /// Initialize logging for tests. Safe to call multiple times.
     pub fn init_test_logging() {
         INIT_LOGGING.call_once(|| {
@@ -24,11 +57,17 @@ pub(crate) mod test_helpers {
         });
     }
 
-    /// Helper to get an LLM client + model from ShaiConfig.
-    /// Falls back to environment variables if no config file exists.
+    /// Helper to get an LLM client + model from the `shai auth` config file.
+    /// Errors if no config file exists, instead of using the anonymous default.
     pub async fn get_llm() -> Result<(std::sync::Arc<LlmClient>, String), Box<dyn std::error::Error>>
     {
-        let (client, model) = crate::config::config::ShaiConfig::get_llm().await?;
+        // Refuse the built-in anonymous default: live tests must hit a provider
+        // the developer configured. The load error is not echoed, so no config
+        // content can leak into test output.
+        let config = crate::config::config::ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
+        // Build from the config loaded above: a second load could fall back to
+        // the anonymous default if the file changed in between.
+        let (client, model) = config.get_llm_from_config().await?;
         Ok((std::sync::Arc::new(client), model))
     }
 
@@ -53,8 +92,11 @@ pub(crate) mod test_helpers {
             return client;
         }
 
-        // Fallback to Ollama (always returns Some)
-        LlmClient::from_env_ollama().expect("Ollama should always be available as fallback")
+        // Fallback to a local Ollama at its default URL. `from_env_ollama` returns
+        // None unless OLLAMA_BASE_URL or OLLAMA_API_KEY is set, so build the
+        // default client directly; this makes no request.
+        LlmClient::from_env_ollama()
+            .unwrap_or_else(|| LlmClient::ollama("http://127.0.0.1:11434/v1".to_string()))
     }
 
     /// Get the default model for a provider, with fallbacks

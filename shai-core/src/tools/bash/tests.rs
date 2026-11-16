@@ -326,3 +326,45 @@ sys.stdout.buffer.flush()
         assert!(euros.chars().all(|c| c == '€'), "unexpected char after pad");
     }
 }
+
+#[tokio::test]
+async fn test_secret_env_vars_not_inherited() {
+    // Unique names: the process env is shared with tests running in parallel.
+    const SECRET: &str = "SHAI_TEST_SCRUB_FOO_API_KEY";
+    const PLAIN: &str = "SHAI_TEST_SCRUB_PLAIN";
+    const DB_URL: &str = "SHAI_TEST_SCRUB_DB_URL";
+    const PLAIN_URL: &str = "SHAI_TEST_SCRUB_PLAIN_URL";
+    std::env::set_var(SECRET, "sk-should-not-leak");
+    std::env::set_var(PLAIN, "kept");
+    std::env::set_var(DB_URL, "postgres://app:pw-should-not-leak@db/app");
+    std::env::set_var(PLAIN_URL, "https://example.com/v1");
+
+    let (_wd_guard, wd) = isolated_dir();
+    let tool = BashTool::new();
+    let params = BashToolParams {
+        command: "env".to_string(),
+        timeout: Some(15),
+        working_dir: wd,
+        env: HashMap::new(),
+    };
+    let result = Tool::execute(&tool, params, None).await;
+    // env_remove applies to the child only; the shai process keeps its env.
+    let parent_still_has_it = std::env::var(SECRET).is_ok();
+    for name in [SECRET, PLAIN, DB_URL, PLAIN_URL] {
+        std::env::remove_var(name);
+    }
+    assert!(parent_still_has_it);
+
+    assert!(result.is_success(), "{:?}", result);
+    if let crate::tools::types::ToolResult::Success { output, .. } = result {
+        assert!(!output.contains(SECRET), "secret var leaked: {output}");
+        assert!(!output.contains("sk-should-not-leak"));
+        assert!(output.lines().any(|l| l.starts_with("PATH=")), "{output}");
+        assert!(output.contains("SHAI_TEST_SCRUB_PLAIN=kept"), "{output}");
+        assert!(!output.contains("pw-should-not-leak"), "url creds leaked");
+        assert!(
+            output.contains("SHAI_TEST_SCRUB_PLAIN_URL=https://example.com/v1"),
+            "{output}"
+        );
+    }
+}
