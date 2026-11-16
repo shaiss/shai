@@ -68,9 +68,16 @@ impl std::error::Error for ChatError {
 /// deserialize, so one unexpected value does not fail the whole response with
 /// "unknown variant".
 ///
+/// - A body (or SSE event) with a top-level `error` and no choices (OpenRouter
+///   can return this with HTTP 200) becomes an error carrying the provider's
+///   message and code.
 /// - `"error"` (sent by OpenRouter when the upstream provider fails mid-generation)
-///   is turned into an [`APIError::ServerError`] carrying the provider's error
-///   code and message when present. It stays retryable.
+///   becomes an error built from the choice's `error`, else the top-level `error`
+///   (a `null` value counts as absent).
+/// - In both cases the provider's numeric `code` picks the [`APIError`] variant:
+///   400/413/422 invalid request, 401 authentication, 402/403 permission and
+///   404 not found are not retried; anything else (429, 408, 5xx, string codes,
+///   no code) is an [`APIError::ServerError`] and stays retryable.
 /// - Any other unknown value is mapped to [`FinishReason::Other`] and logged.
 pub(crate) fn normalize_finish_reasons(json: &mut Value) -> Result<(), APIError> {
     let top_level_error = json.get("error").filter(|e| !e.is_null()).cloned();
@@ -94,7 +101,12 @@ pub(crate) fn normalize_finish_reasons(json: &mut Value) -> Result<(), APIError>
         };
         if reason == "error" {
             let prefix = "provider returned finish_reason \"error\"";
-            return Err(match choice.get("error").or(top_level_error.as_ref()) {
+            // `"error": null` on the choice must not hide a top-level error.
+            let error = choice
+                .get("error")
+                .filter(|e| !e.is_null())
+                .or(top_level_error.as_ref());
+            return Err(match error {
                 Some(error) => provider_error(prefix, error),
                 None => APIError::ServerError(format!("{}: no error details in response", prefix)),
             });
@@ -758,5 +770,46 @@ mod tests {
         });
         let err = normalize_finish_reasons(&mut json).unwrap_err();
         assert!(matches!(err, APIError::PermissionError(_)), "{:?}", err);
+    }
+
+    #[test]
+    fn null_choice_error_falls_back_to_top_level_error() {
+        let mut json = serde_json::json!({
+            "error": {"code": 401, "message": "invalid key"},
+            "choices": [{"index": 0, "finish_reason": "error", "error": null}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        match err {
+            APIError::AuthenticationError(message) => {
+                assert!(message.contains("invalid key (401)"), "{}", message);
+            }
+            other => panic!("expected APIError::AuthenticationError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn provider_error_codes_401_and_404_map_to_non_retryable_variants() {
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 401, "message": "invalid key"}}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::AuthenticationError(_)), "{:?}", err);
+
+        let mut json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "error",
+                         "error": {"code": 404, "message": "model not found"}}]
+        });
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::NotFoundError(_)), "{:?}", err);
+
+        // Error-only body (no choices) uses the same mapping.
+        let mut json = serde_json::json!({"error": {"code": 404, "message": "no such model"}});
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::NotFoundError(_)), "{:?}", err);
+
+        let mut json = serde_json::json!({"error": {"code": 401, "message": "invalid key"}});
+        let err = normalize_finish_reasons(&mut json).unwrap_err();
+        assert!(matches!(err, APIError::AuthenticationError(_)), "{:?}", err);
     }
 }
