@@ -216,9 +216,7 @@ async fn test_gerund_with_long_message() {
 
 #[test]
 fn test_llm_client_selection() {
-    if skip_unless_live_llm("test_llm_client_selection") {
-        return;
-    }
+    // Offline: only builds a client from env (Ollama fallback), no request.
     // Test that our client selection method works
     let client = get_test_llm_client();
     let provider_name = client.provider_name();

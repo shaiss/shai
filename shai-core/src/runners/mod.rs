@@ -86,8 +86,11 @@ pub(crate) mod test_helpers {
             return client;
         }
 
-        // Fallback to Ollama (always returns Some)
-        LlmClient::from_env_ollama().expect("Ollama should always be available as fallback")
+        // Fallback to a local Ollama at its default URL. `from_env_ollama` returns
+        // None unless OLLAMA_BASE_URL or OLLAMA_API_KEY is set, so build the
+        // default client directly; this makes no request.
+        LlmClient::from_env_ollama()
+            .unwrap_or_else(|| LlmClient::ollama("http://127.0.0.1:11434/v1".to_string()))
     }
 
     /// Get the default model for a provider, with fallbacks
