@@ -85,16 +85,21 @@ fn shai(config_file: &str, config: &str, args: &[&str]) -> Outcome {
 
     let outcome = run(dir.path(), &dir.path().join("config"), args);
 
-    // A starter config, fetched or made up, would have been saved over the
-    // file or, for a file under the legacy name, next to it.
+    // Nothing was fetched or made up over the config file or next to it:
+    // the config directory holds exactly what it held before, the one file
+    // as it was written.
+    let left: Vec<(String, String)> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            (entry.file_name().to_string_lossy().into_owned(), text)
+        })
+        .collect();
     assert_eq!(
-        std::fs::read_to_string(config_dir.join(config_file)).unwrap(),
-        config,
-        "shai {args:?} must leave the config file as it is"
-    );
-    assert!(
-        config_file == STARTER_CONFIG_FILE || !config_dir.join(STARTER_CONFIG_FILE).exists(),
-        "shai {args:?} must not put a starter config next to {config_file}"
+        left,
+        [(config_file.to_string(), config.to_string())],
+        "shai {args:?} must leave the config directory as it was"
     );
     outcome
 }
