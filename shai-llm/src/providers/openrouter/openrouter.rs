@@ -1,20 +1,20 @@
 use super::api::OpenRouterModelsResponse;
+use crate::chat::{ChatClient, NoHooks};
 use crate::provider::{EnvVar, LlmError, LlmProvider, LlmStream, ProviderInfo};
 use async_trait::async_trait;
 use futures::StreamExt;
-use openai_dive::v1::{
-    api::Client,
-    resources::{
-        chat::{ChatCompletionChunkResponse, ChatCompletionParameters, ChatCompletionResponse},
-        model::ListModelResponse,
-    },
+use openai_dive::v1::resources::{
+    chat::{ChatCompletionChunkResponse, ChatCompletionParameters, ChatCompletionResponse},
+    model::ListModelResponse,
 };
 use reqwest;
 
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 pub struct OpenRouterProvider {
-    client: Client,
+    /// Uses shai's ChatClient (not openai_dive's) so OpenRouter-specific
+    /// finish_reason values such as "error" are handled instead of failing to parse.
+    client: ChatClient,
     api_key: String,
     base_url: String,
     http_client: reqwest::Client,
@@ -22,8 +22,7 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn new(api_key: String) -> Self {
-        let mut client = Client::new(api_key.clone());
-        client.set_base_url(OPENROUTER_API_BASE);
+        let client = ChatClient::new(api_key.clone(), OPENROUTER_API_BASE.to_string());
         Self {
             client,
             api_key,
@@ -96,8 +95,7 @@ impl LlmProvider for OpenRouterProvider {
     ) -> Result<ChatCompletionResponse, LlmError> {
         let response = self
             .client
-            .chat()
-            .create(request)
+            .chat_completion(&request, &NoHooks)
             .await
             .map_err(|e| Box::new(e) as LlmError)?;
         Ok(response)
@@ -112,8 +110,7 @@ impl LlmProvider for OpenRouterProvider {
 
         let stream = self
             .client
-            .chat()
-            .create_stream(request)
+            .chat_completion_stream(&request, NoHooks)
             .await
             .map_err(|e| Box::new(e) as LlmError)?;
 
@@ -140,5 +137,49 @@ impl LlmProvider for OpenRouterProvider {
             display_name: "OpenRouter (Multiple AI Providers)",
             env_vars: vec![EnvVar::required("OPENROUTER_API_KEY", "OpenRouter API key")],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openai_dive::v1::resources::chat::{
+        ChatCompletionParametersBuilder, ChatMessage, ChatMessageContent,
+    };
+
+    #[tokio::test]
+    async fn chat_reports_finish_reason_error_instead_of_parse_failure() {
+        let body = r#"{"id":"gen-1","object":"chat.completion","created":1700000000,"model":"openai/gpt-oss-120b","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"error","error":{"code":"server_error","message":"Provider disconnected unexpectedly"}}]}"#;
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut provider = OpenRouterProvider::new("test-key".to_string());
+        provider.client = ChatClient::new("test-key".to_string(), server.url());
+
+        let request = ChatCompletionParametersBuilder::default()
+            .model("openai/gpt-oss-120b")
+            .messages(vec![ChatMessage::User {
+                content: ChatMessageContent::Text("hello".into()),
+                name: None,
+            }])
+            .build()
+            .unwrap();
+        let message = provider
+            .chat(request)
+            .await
+            .expect_err("finish_reason error should be an error")
+            .to_string();
+        assert!(
+            message.contains("Provider disconnected unexpectedly"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("unknown variant"), "{}", message);
     }
 }
