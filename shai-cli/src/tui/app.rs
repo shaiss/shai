@@ -71,7 +71,6 @@ impl App<'_> {
         use shai_core::agent::builder::AgentBuilder;
         use shai_core::agent::Agent;
         use shai_core::config::agent::AgentConfig;
-        use shai_core::config::config::ShaiConfig;
 
         // The agent this one replaces may have handed off without its
         // announcement having been read. Say so before moving on.
@@ -99,10 +98,10 @@ impl App<'_> {
             // As at start-up: a config file that is there and cannot be read
             // is not replaced by the built-in default, which would send the
             // conversation to a provider the user did not choose.
-            if let Some(problem) = SessionOptions::config_problem() {
-                return Err(problem.into());
-            }
-            let (llm, model) = ShaiConfig::get_llm().await?;
+            // The file is loaded once, and the primary model built from that
+            // load, so it cannot break between a check and the read.
+            let config = SessionOptions::primary_config()?;
+            let (llm, model) = config.get_llm_from_config().await?;
             self.agent_meta.set_model(model.clone());
             self.agent_meta
                 .set_provider(llm.provider().name().to_string());

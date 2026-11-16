@@ -109,7 +109,17 @@ impl AppHeadless {
             build_headless_agent(builder, initial_trace, yes)
         } else {
             // Use default agent with provided tools
-            let (llm_client, model) = ShaiConfig::get_llm().await?;
+            // One load of the config, which also builds the primary model:
+            // a file that breaks after the start-up check stops the run
+            // instead of falling back to the built-in default.
+            let config = match SessionOptions::primary_config() {
+                Ok(config) => config,
+                Err(problem) => {
+                    eprintln!("error: {}", problem);
+                    std::process::exit(2);
+                }
+            };
+            let (llm_client, model) = config.get_llm_from_config().await?;
             eprintln!(
                 "\x1b[2m░ {} on {}\x1b[0m",
                 model,
@@ -135,11 +145,9 @@ impl AppHeadless {
                     yes,
                 )
             } else {
-                // Use default agent
+                // Use default agent, on the model built above
                 build_headless_agent(
-                    AgentBuilder::default()
-                        .await
-                        .map_err(|e| format!("Failed to create default agent: {}", e))?,
+                    AgentBuilder::default_with_llm(Arc::new(llm_client), model),
                     initial_trace,
                     yes,
                 )
@@ -154,7 +162,7 @@ impl AppHeadless {
         // for and this agent cannot take it. The switch itself is announced,
         // also in one line, by the event handler below.
         let mut session_options = self.session_options.clone();
-        if let Some(notice) = session_options.arm(&mut agent) {
+        if let Some(notice) = session_options.arm_headless(&mut agent, yes) {
             eprintln!("{}", shai_core::agent::output::notice_line(&notice));
         }
 

@@ -21,6 +21,10 @@ use shai_core::config::config::ShaiConfig;
 use shai_core::config::prewalk::resolve_prewalk;
 use shai_core::config::roles::RoleError;
 
+/// Why a headless agent run without `--yes` is not armed.
+const HEADLESS_WITHOUT_YES: &str = "headless mode without --yes denies write and edit, \
+     so the edit that starts the handoff can never happen; pass --yes to arm it";
+
 /// What a session was asked to do beyond running on the primary model.
 #[derive(Clone, Default)]
 pub struct SessionOptions {
@@ -83,6 +87,24 @@ impl SessionOptions {
     /// later: such a file is not replaced by the built-in default.
     pub fn config_problem() -> Option<String> {
         Self::unreadable(ShaiConfig::load_for_roles().as_ref())
+    }
+
+    /// The config an agent without its own provider runs on, loaded once.
+    ///
+    /// The built-in default stands in only when there is no config file. A
+    /// file that is there and cannot be read is an error, as at start-up:
+    /// the primary model is built from this same load, so the file cannot
+    /// break between a check and the read that builds the client.
+    pub fn primary_config() -> Result<ShaiConfig, String> {
+        Self::primary_config_from(ShaiConfig::load_for_roles())
+    }
+
+    fn primary_config_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
+        match config {
+            Ok(config) => Ok(config),
+            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
+            Err(error) => Err(Self::unreadable(Err(&error)).unwrap_or_else(|| error.to_string())),
+        }
     }
 
     /// The handoff target the session is asked for, as things are now.
@@ -167,6 +189,21 @@ impl SessionOptions {
                 Some(prewalk_not_armed_notice(&error.to_string()))
             }
         }
+    }
+
+    /// Arm a headless agent. Headless denies `write` and `edit` unless
+    /// `yes` (`--yes`) is given, so without it the first edit that triggers a
+    /// handoff can never happen: the agent is not armed and the user is told.
+    pub fn arm_headless(&mut self, agent: &mut AgentCore, yes: bool) -> Option<String> {
+        let pending = self
+            .prewalk
+            .as_ref()
+            .is_some_and(|prewalk| !prewalk.is_spent());
+        if !yes && pending {
+            self.announced = None;
+            return Some(prewalk_not_armed_notice(HEADLESS_WITHOUT_YES));
+        }
+        self.arm(agent)
     }
 
     /// Account for a handoff that has happened: the session keeps where it
@@ -467,6 +504,59 @@ mod tests {
         let mut usable = agent(&[]);
         let notice = options.arm(&mut usable).expect("armed");
         assert!(notice.starts_with("prewalk armed:"), "{notice}");
+    }
+
+    #[test]
+    fn headless_without_yes_is_not_armed_and_the_user_is_told() {
+        let cfg = config(Some(URL_A), "");
+        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+
+        // Without --yes, write and edit are denied, so the handoff could
+        // never come due: no "armed" line, and the reason names --yes.
+        let mut denied = agent(&[]);
+        let notice = options
+            .arm_headless(&mut denied, false)
+            .expect("the user must be told");
+        assert!(notice.starts_with("prewalk not armed:"), "{notice}");
+        assert!(notice.contains("--yes"), "{notice}");
+        assert!(!denied.is_prewalk_armed());
+        assert!(options.prewalk_pending());
+
+        // With --yes the same agent is armed, and that is announced.
+        let mut allowed = agent(&[]);
+        let notice = options
+            .arm_headless(&mut allowed, true)
+            .expect("armed for the first time");
+        assert!(notice.starts_with("prewalk armed:"), "{notice}");
+        assert!(allowed.is_prewalk_armed());
+
+        // Nothing asked for: nothing to say, with or without --yes.
+        let mut options = SessionOptions::resolve_from(None, Ok(&cfg)).unwrap();
+        assert_eq!(options.arm_headless(&mut agent(&[]), false), None);
+        assert_eq!(options.arm_headless(&mut agent(&[]), true), None);
+    }
+
+    #[test]
+    fn the_primary_model_runs_on_the_default_only_without_a_config_file() {
+        // The user's file, as loaded.
+        let cfg = config(Some(URL_A), "");
+        let primary = SessionOptions::primary_config_from(Ok(cfg)).unwrap();
+        assert_eq!(primary.providers[0].provider, "openai");
+
+        // No file at all: the built-in default, as before.
+        let primary = SessionOptions::primary_config_from(Err(RoleError::ConfigMissing)).unwrap();
+        assert_eq!(
+            primary.providers[0].provider,
+            ShaiConfig::default().providers[0].provider
+        );
+
+        // A file that is there and does not load is never replaced by the
+        // default: the agent does not start, and the user is told why.
+        let error = SessionOptions::primary_config_from(Err(invalid()))
+            .map(|_| ())
+            .expect_err("no default for a broken file");
+        assert!(error.contains("auth.config.json"), "{error}");
+        assert!(error.contains("line 3 column 7"), "{error}");
     }
 
     #[test]
