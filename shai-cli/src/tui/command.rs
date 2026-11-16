@@ -265,15 +265,15 @@ impl CommandRegistry {
                                 });
 
                             if let Some(session) = selected {
+                                let agent_name = app.agent_meta.name().map(|s| s.to_string());
+                                if !app.may_replace_agent(agent_name.as_deref()) {
+                                    return Ok(());
+                                }
                                 app.notify(
                                     &format!("Restoring session {}...", &session.session_id[..8]),
                                     Duration::from_secs(2),
                                 );
 
-                                let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                                if !app.may_replace_agent(agent_name.as_deref()) {
-                                    return Ok(());
-                                }
                                 if let Some(agent) = app.agent.take() {
                                     let _ = agent.controller.terminate().await;
                                 }
@@ -347,15 +347,15 @@ impl CommandRegistry {
             "/latest" => match shai_core::session::SessionPersist::list_sessions() {
                 Ok(sessions) if !sessions.is_empty() => {
                     let session = &sessions[0];
+                    let agent_name = app.agent_meta.name().map(|s| s.to_string());
+                    if !app.may_replace_agent(agent_name.as_deref()) {
+                        return Ok(());
+                    }
                     app.notify(
                         &format!("Restoring session {}...", &session.session_id[..8]),
                         Duration::from_secs(2),
                     );
 
-                    let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                    if !app.may_replace_agent(agent_name.as_deref()) {
-                        return Ok(());
-                    }
                     if let Some(agent) = app.agent.take() {
                         let _ = agent.controller.terminate().await;
                     }
