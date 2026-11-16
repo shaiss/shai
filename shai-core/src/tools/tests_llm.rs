@@ -20,8 +20,8 @@ mod llm_integration_tests {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         init_test_logging();
 
-        // Same guard as runners::test_helpers::get_llm. The message must not
-        // match the skip substrings below, so a missing config fails loudly.
+        // Same guard as runners::test_helpers::get_llm: never use the built-in
+        // anonymous default. The load error is not echoed.
         ShaiConfig::load().map_err(|_| "live LLM tests need a `shai auth` config file; refusing to fall back to the built-in anonymous endpoint")?;
         let (llm_client, model) = ShaiConfig::get_llm()
             .await
@@ -117,24 +117,14 @@ mod llm_integration_tests {
         Ok(false)
     }
 
-    /// Helper macro to run LLM test with graceful fallback for connection issues
+    /// Helper macro to run an LLM test. It only runs after `skip_unless_live_llm`
+    /// has allowed an opt-in run, so any error (including an unreachable
+    /// provider) fails the test instead of passing silently.
     macro_rules! llm_test_with_fallback {
         ($test_fn:expr, $error_msg:expr) => {
             match $test_fn.await {
                 Ok(success) => assert!(success, $error_msg),
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    if error_str.contains("not available")
-                        || error_str.contains("no llm provider")
-                        || error_str.contains("connection")
-                        || error_str.contains("refused")
-                    {
-                        println!("⚠️  Skipping LLM test - {}", e);
-                        return; // Skip test if LLM service not available
-                    } else {
-                        panic!("LLM test failed with unexpected error: {}", e);
-                    }
-                }
+                Err(e) => panic!("LLM test failed: {}", e),
             }
         };
     }
