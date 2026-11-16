@@ -16,6 +16,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Why a path was refused. The message is shown to the advisor model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,9 +171,11 @@ const DATA_EXTENSIONS: &[&str] = &[
 /// Extensions of code, markup and documentation: all that is read below a
 /// directory named after secrets.
 const CODE_EXTENSIONS: &[&str] = &[
-    "rs", "go", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "java", "kt", "c", "h", "cc", "cpp",
-    "hpp", "cs", "rb", "php", "swift", "scala", "ex", "exs", "erl", "hs", "ml", "lua", "md", "sh",
-    "bash", "sql", "mod", "sum", "html", "htm", "css", "scss", "erb", "vue", "svelte",
+    "rs", "go", "py", "js", "jsx", "mjs", "cjs", "mts", "cts", "ts", "tsx", "java", "kt", "kts",
+    "scala", "groovy", "c", "h", "cc", "cpp", "hpp", "m", "mm", "cs", "fs", "fsx", "rb", "php",
+    "swift", "dart", "zig", "ex", "exs", "erl", "hs", "ml", "clj", "cljs", "jl", "pl", "pm", "r",
+    "lua", "ps1", "sh", "bash", "sql", "proto", "graphql", "gql", "mod", "sum", "html", "htm",
+    "css", "scss", "sass", "less", "vue", "svelte", "astro", "md", "mdx", "rst", "adoc",
 ];
 
 const BACKUP_SUFFIXES: &[&str] = &[".bak", ".old", ".orig", ".backup", ".save", ".swp", "~"];
@@ -219,19 +222,46 @@ pub(crate) fn is_sensitive(relative: &Path, is_dir: bool) -> bool {
     below_secrets && (is_data_like(last) || !is_code_like(last))
 }
 
-/// Code, markup or documentation by its last extension, or a template that
-/// only documents values. A copy set aside is what its original is.
+/// Code, markup or documentation by its extension. A copy set aside, or a
+/// template that documents values (`.example`), is what its original is,
+/// and a template a page or a file is rendered from is what it renders:
+/// `edit.html.erb` is markup, `database.yml.erb` is data.
 fn is_code_like(name: &str) -> bool {
     let original = without_backup_suffixes(name);
-    ENV_TEMPLATE_SUFFIXES
+    let bare = original.strip_prefix('.').unwrap_or(original);
+    let bare = ENV_TEMPLATE_SUFFIXES
         .iter()
-        .any(|suffix| original.ends_with(suffix))
-        || original
-            .strip_prefix('.')
-            .unwrap_or(original)
-            .rsplit_once('.')
-            .is_some_and(|(_, extension)| CODE_EXTENSIONS.contains(&extension))
+        .find_map(|suffix| bare.strip_suffix(suffix))
+        .unwrap_or(bare);
+    let mut extensions = bare.rsplit('.');
+    let (Some(last), Some(_)) = (extensions.next(), bare.rfind('.')) else {
+        return false;
+    };
+    if TEMPLATE_EXTENSIONS.contains(&last) {
+        let stem = &bare[..bare.len() - last.len() - 1];
+        return match stem.rsplit_once('.') {
+            Some((_, rendered)) => CODE_EXTENSIONS.contains(&rendered),
+            None => true,
+        };
+    }
+    CODE_EXTENSIONS.contains(&last)
 }
+
+/// Extensions of templates that something else is rendered from.
+const TEMPLATE_EXTENSIONS: &[&str] = &[
+    "erb",
+    "j2",
+    "jinja",
+    "jinja2",
+    "tpl",
+    "tmpl",
+    "mustache",
+    "hbs",
+    "handlebars",
+    "liquid",
+    "njk",
+    "twig",
+];
 
 /// `name` without what marks it as a copy set aside: `.netrc.bak~` is
 /// `.netrc`. A name made of nothing else is left as it is.
@@ -321,18 +351,61 @@ pub(crate) struct ConfinedFs {
     /// The root as it was given, when that is another way to write it (it
     /// goes through a link). The session's own paths may start with this.
     alias: Option<PathBuf>,
-    /// Paths inside the root that are never read, nor anything below them,
-    /// whatever they are called. Each is written as [`destination`] gives
-    /// it and as its text says, so that one that does not exist yet is
-    /// refused once it does.
+    /// The places refused whatever they are called. Shared by the clones of
+    /// a view: what one tool call finds out about where they lead stays
+    /// known to the next one.
+    refusals: Arc<Mutex<Refusals>>,
+}
+
+/// The places a view refuses whatever they are called.
+#[derive(Debug, Default)]
+struct Refusals {
+    /// Paths inside the root that are never read, nor anything below them.
+    /// Each is written as [`destination`] gives it and as its text says, so
+    /// that one that does not exist yet is refused once it does.
     refused: Vec<PathBuf>,
     /// Files inside the root that are never read, and neither are the files
     /// next to them whose name starts with theirs and a dot: a log that is
     /// rotated is written to `shai.log.2026-01-31`, not to `shai.log`.
     rotated: Vec<PathBuf>,
     /// The paths the two lists above were made from, as they were given.
-    /// What they lead to is looked up again by [`ConfinedFs::refreshed`].
+    /// What they lead to is looked up again by [`ConfinedFs::refresh`].
     configured: Vec<(PathBuf, bool)>,
+}
+
+impl Refusals {
+    /// Whether `path` is one of the refused places, or below one.
+    fn covers(&self, path: &Path) -> bool {
+        self.refused.iter().any(|refused| path.starts_with(refused))
+            || self.rotated.iter().any(|log| {
+                // The file itself, a rotated copy of it, or anything below
+                // either, should one of them be a directory.
+                path.ancestors()
+                    .any(|ancestor| is_rotated_copy(ancestor, log))
+            })
+    }
+
+    /// Whether `path` itself is one of the refused places. Enough for a path
+    /// built one name at a time, each of whose ancestors was looked at when
+    /// it was reached.
+    fn names(&self, path: &Path) -> bool {
+        self.refused.iter().any(|refused| path == refused)
+            || self.rotated.iter().any(|log| is_rotated_copy(path, log))
+    }
+}
+
+/// Whether `path` is the log file `log`, or a copy of it that the log's
+/// rotation left next to it.
+fn is_rotated_copy(path: &Path, log: &Path) -> bool {
+    path.parent() == log.parent()
+        && path
+            .file_name()
+            .zip(log.file_name())
+            .is_some_and(|(name, log)| {
+                let (name, log) = (name.to_string_lossy(), log.to_string_lossy());
+                name.strip_prefix(log.as_ref())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            })
 }
 
 impl ConfinedFs {
@@ -361,9 +434,7 @@ impl ConfinedFs {
         Ok(Self {
             root: canonical,
             alias,
-            refused: Vec::new(),
-            rotated: Vec::new(),
-            configured: Vec::new(),
+            refusals: Arc::default(),
         })
     }
 
@@ -385,30 +456,51 @@ impl ConfinedFs {
         self.configure(files, true)
     }
 
-    fn configure(mut self, paths: impl IntoIterator<Item = PathBuf>, rotated: bool) -> Self {
-        for path in paths {
-            let Ok(absolute) = std::path::absolute(&path) else {
-                continue;
-            };
-            if !self.configured.contains(&(absolute.clone(), rotated)) {
-                self.configured.push((absolute, rotated));
+    fn configure(self, paths: impl IntoIterator<Item = PathBuf>, rotated: bool) -> Self {
+        {
+            let mut refusals = self.refusals();
+            for path in paths {
+                let Ok(absolute) = std::path::absolute(&path) else {
+                    continue;
+                };
+                if !refusals.configured.contains(&(absolute.clone(), rotated)) {
+                    refusals.configured.push((absolute, rotated));
+                }
             }
         }
         self.refreshed()
     }
 
+    fn refusals(&self) -> std::sync::MutexGuard<'_, Refusals> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The same view, with what its refused paths lead to looked up again.
+    pub(crate) fn refreshed(self) -> Self {
+        self.refresh();
+        self
+    }
+
+    /// Look up again what the refused paths lead to.
     ///
     /// A path that did not exist when it was given may have been created
     /// since, and created as a link: it is refused where it leads now as
     /// well as where it led before. Nothing that was refused stops being
-    /// refused.
-    pub(crate) fn refreshed(mut self) -> Self {
-        for (path, rotated) in &self.configured {
-            let list = if *rotated {
-                &mut self.rotated
+    /// refused, in this view or in any clone of it.
+    pub(crate) fn refresh(&self) {
+        let mut refusals = self.refusals();
+        let Refusals {
+            refused,
+            rotated,
+            configured,
+        } = &mut *refusals;
+        for (path, is_rotated) in configured.iter() {
+            let list = if *is_rotated {
+                &mut *rotated
             } else {
-                &mut self.refused
+                &mut *refused
             };
             // Where the path leads, and what its text says.
             for form in [Some(destination(path)), normalized(path)] {
@@ -420,26 +512,10 @@ impl ConfinedFs {
                 }
             }
         }
-        self
     }
 
     fn is_refused(&self, path: &Path) -> bool {
-        self.refused.iter().any(|refused| path.starts_with(refused))
-            || self.rotated.iter().any(|log| {
-                // The file itself, a rotated copy of it, or anything below
-                // either, should one of them be a directory.
-                path.ancestors().any(|ancestor| {
-                    ancestor.parent() == log.parent()
-                        && ancestor
-                            .file_name()
-                            .zip(log.file_name())
-                            .is_some_and(|(name, log)| {
-                                let (name, log) = (name.to_string_lossy(), log.to_string_lossy());
-                                name.strip_prefix(log.as_ref())
-                                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-                            })
-                })
-            })
+        self.refusals().covers(path)
     }
 
     /// `path` relative to the root, for display.
@@ -496,6 +572,28 @@ impl ConfinedFs {
             return Err(ConfineError::Sensitive(requested.to_string()));
         }
 
+        // Where the path goes on its way, as it is written and through
+        // every link in it: one that leaves the root, or passes through a
+        // place the advisor never enters, is refused for that, whatever it
+        // comes back to and whatever is at its end. `a/../b` would otherwise
+        // be readable when `a` exists and missing when it does not, and `a`
+        // may be a link to anywhere.
+        let written = Path::new(requested);
+        let written = if written.is_absolute() {
+            [Some(&self.root), self.alias.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|base| written.strip_prefix(base).ok())
+                .map_or_else(|| relative.clone(), Path::to_path_buf)
+        } else {
+            written.to_path_buf()
+        };
+        match self.route(&written) {
+            Route::Inside => {}
+            Route::LeavesRoot => return Err(ConfineError::Outside(requested.to_string())),
+            Route::EntersRefused => return Err(ConfineError::Sensitive(requested.to_string())),
+        }
+
         // Outside by where its links lead, whether or not the last of them
         // leads to anything: a path through a link to `/etc` is refused the
         // same way for a file that is there and for one that is not.
@@ -525,6 +623,90 @@ impl ConfinedFs {
             return Err(ConfineError::Sensitive(requested.to_string()));
         }
         canonical.ok_or_else(|| ConfineError::NotFound(requested.to_string()))
+    }
+
+    /// Follow `written`, a path relative to the root as it was written, one
+    /// name at a time and through every link in it, and say whether it stays
+    /// inside the root and out of the places that are never entered.
+    ///
+    /// The first place on the way that is not allowed decides, and nothing
+    /// after it is looked at, so the answer says nothing about what lies
+    /// beyond. A link to an absolute path is followed only when that path is
+    /// inside the root. The work is bounded: past [`MAX_LOOKUPS`] names, or
+    /// once a link points to one that does not exist, the rest is taken by
+    /// its text, and a path that needs more lookups than that is refused.
+    fn route(&self, written: &Path) -> Route {
+        use std::collections::VecDeque;
+        use std::ffi::OsString;
+        let refusals = self.refusals();
+        let mut pending: VecDeque<OsString> = written
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect();
+        let mut reached = self.root.clone();
+        let mut hops = 0usize;
+        let mut lookups = 0usize;
+        let mut exists = true;
+        while let Some(step) = pending.pop_front() {
+            let name = match Path::new(&step).components().next() {
+                None | Some(Component::CurDir) => continue,
+                Some(Component::ParentDir) => {
+                    reached.pop();
+                    if !reached.starts_with(&self.root) {
+                        return Route::LeavesRoot;
+                    }
+                    continue;
+                }
+                Some(Component::Normal(name)) => name.to_os_string(),
+                // A root or a prefix can only come from a link, and those
+                // are handled below.
+                Some(_) => return Route::LeavesRoot,
+            };
+            let entry = reached.join(&name);
+            if exists {
+                lookups += 1;
+                if lookups > MAX_LOOKUPS {
+                    return Route::LeavesRoot;
+                }
+                match entry.symlink_metadata() {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let target = (hops < MAX_LINK_HOPS)
+                            .then(|| std::fs::read_link(&entry).ok())
+                            .flatten();
+                        if let Some(target) = target {
+                            hops += 1;
+                            let target = if target.is_absolute() {
+                                let Some(rest) = [Some(&self.root), self.alias.as_ref()]
+                                    .into_iter()
+                                    .flatten()
+                                    .find_map(|base| target.strip_prefix(base).ok())
+                                else {
+                                    return Route::LeavesRoot;
+                                };
+                                reached = self.root.clone();
+                                rest.to_path_buf()
+                            } else {
+                                target
+                            };
+                            for component in target.components().rev() {
+                                pending.push_front(component.as_os_str().to_os_string());
+                            }
+                            continue;
+                        }
+                        exists = false;
+                    }
+                    Ok(_) => {}
+                    Err(_) => exists = false,
+                }
+            }
+            reached = entry;
+            let lower = name.to_string_lossy().to_lowercase();
+            if SENSITIVE_DIRS.contains(&without_backup_suffixes(&lower)) || refusals.names(&reached)
+            {
+                return Route::EntersRefused;
+            }
+        }
+        Route::Inside
     }
 
     /// Resolve a path that must be a directory.
@@ -594,13 +776,30 @@ impl ConfinedFs {
     }
 }
 
-/// A file name as it is shown to the advisor. A name can hold a line break
-/// or another control character, and what follows it would read as a line
-/// of its own in a listing: each becomes a `?`.
+/// A file name as it is shown to the advisor. A name can hold a line break,
+/// a line or paragraph separator, or an invisible or direction-changing
+/// character, and what follows it would read as a line of its own in a
+/// listing, or in another order: each becomes a `?`.
 pub(crate) fn shown_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if super::review::is_invisible(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
+}
+
+/// `line`, a name or a path as a tool lists it, so that it cannot be taken
+/// for a note of the tool: those alone start with a square bracket.
+pub(crate) fn listed(line: String) -> String {
+    if line.starts_with('[') {
+        format!("./{line}")
+    } else {
+        line
+    }
 }
 
 /// `path` with `.` and `..` resolved by its text alone, without touching the
@@ -627,6 +826,21 @@ fn normalized(path: &Path) -> Option<PathBuf> {
     }
     Some(out)
 }
+
+/// Where a requested path goes on its way to its end.
+enum Route {
+    /// Through the root only, and nowhere the advisor never enters.
+    Inside,
+    /// Out of the root at some point, or too long to follow.
+    LeavesRoot,
+    /// Through a directory the advisor never enters, or a refused place.
+    EntersRefused,
+}
+
+/// Most names looked up while a requested path is followed through its
+/// links. A crafted tree of links that point at each other is refused past
+/// this, instead of keeping a tool call busy.
+const MAX_LOOKUPS: usize = 4096;
 
 /// Most links [`destination`] follows by hand before it gives up, as many as
 /// the system follows itself.
@@ -1264,7 +1478,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(
             confined.resolve("l0").unwrap_err(),
-            ConfineError::NotFound("l0".to_string())
+            ConfineError::Outside("l0".to_string())
         );
         // A long path through a link back to where it stands.
         std::os::unix::fs::symlink(".", sb.root.join("self")).unwrap();
@@ -1278,6 +1492,112 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_path_that_leaves_on_its_way_gets_one_answer_whatever_is_there() {
+        let sb = sandbox();
+        fs::write(sb.root.join("README.md"), "readme").unwrap();
+        fs::create_dir_all(sb.root.join("records")).unwrap();
+        // A link that goes out of the root and comes back.
+        std::os::unix::fs::symlink(
+            "../outside/there/../../work/README.md",
+            sb.root.join("probe"),
+        )
+        .unwrap();
+        let confined = ConfinedFs::new(&sb.root)
+            .unwrap()
+            .refusing([sb.root.join("records")]);
+        let answers = |confined: &ConfinedFs| {
+            [
+                "probe",
+                ".git/hooks/../../README.md",
+                "records/s1/../../README.md",
+            ]
+            .map(|path| {
+                confined
+                    .resolve(path)
+                    .map_err(|e| std::mem::discriminant(&e))
+            })
+        };
+        let before = answers(&confined);
+        assert!(before.iter().all(Result::is_err), "{before:?}");
+        // The places the paths go through now exist: nothing changes.
+        fs::create_dir_all(sb.outside.join("there")).unwrap();
+        fs::create_dir_all(sb.root.join(".git/hooks")).unwrap();
+        fs::create_dir_all(sb.root.join("records/s1")).unwrap();
+        assert_eq!(answers(&confined), before);
+        assert_eq!(
+            confined.resolve("probe").unwrap_err(),
+            ConfineError::Outside("probe".to_string())
+        );
+
+        // A link to an absolute path inside the root is followed.
+        std::os::unix::fs::symlink(sb.root.join("src"), sb.root.join("abs")).unwrap();
+        assert_eq!(
+            confined.resolve("abs/main.rs"),
+            Ok(sb.root.join("src/main.rs"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn links_deep_in_a_tree_are_refused_before_they_cost_much() {
+        let sb = sandbox();
+        let deep: PathBuf = std::iter::repeat_n("a", 600).collect();
+        fs::create_dir_all(sb.root.join(&deep)).unwrap();
+        // Each link points at the next by its absolute path.
+        for index in 0..40 {
+            let target = if index == 39 {
+                sb.root.join("nothere")
+            } else {
+                sb.root.join(&deep).join(format!("l{}", index + 1))
+            };
+            std::os::unix::fs::symlink(target, sb.root.join(&deep).join(format!("l{index}")))
+                .unwrap();
+        }
+        let confined = ConfinedFs::new(&sb.root).unwrap();
+        let started = std::time::Instant::now();
+        let path = deep.join("l0").display().to_string();
+        assert_eq!(
+            confined.resolve(&path).unwrap_err(),
+            ConfineError::Outside(path.clone())
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn templates_and_set_aside_copies_are_judged_by_what_they_hold() {
+        for (path, refused) in [
+            ("config/secrets/database.yml.erb", true),
+            ("config/secrets/prod.yaml.example", true),
+            ("secrets/prod.kubeconfig.dist", true),
+            ("app/views/passwords/edit.html.erb", false),
+            ("app/views/passwords/show.erb", false),
+            ("lib/src/password/password_field.dart", false),
+            ("proto/secrets/v1/secrets.proto", false),
+            ("docs/secrets/README.rst", false),
+        ] {
+            assert_eq!(is_sensitive(Path::new(path), false), refused, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_listed_name_cannot_pass_for_a_line_of_its_own_or_a_note() {
+        assert_eq!(
+            shown_name("a.md\u{2028}[all files listed]\u{2029}b\u{202e}gpj.exe\u{200b}"),
+            "a.md?[all files listed]?b?gpj.exe?"
+        );
+        assert_eq!(
+            listed("[the search stopped]".to_string()),
+            "./[the search stopped]"
+        );
+        assert_eq!(listed("src/[x].rs".to_string()), "src/[x].rs");
     }
 
     #[test]

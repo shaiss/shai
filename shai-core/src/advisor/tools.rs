@@ -17,7 +17,7 @@
 //! reasons, and so that it is never read together with the text that follows
 //! it on a line.
 
-use super::confine::{shown_name, ConfineError, ConfinedFs};
+use super::confine::{listed, shown_name, ConfineError, ConfinedFs};
 use super::redact::Redactor;
 use regex::RegexBuilder;
 use serde_json::{json, Value};
@@ -306,7 +306,7 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
         // Each name by itself, before the list is put in order: where an
         // entry comes in the list then says nothing about what was removed
         // from its name.
-        let name = redactor.redact(&shown_name(&entry.file_name().to_string_lossy()));
+        let name = listed(redactor.redact(&shown_name(&entry.file_name().to_string_lossy())));
         // Names only: nothing here is opened or followed.
         if file_type.is_dir() {
             entries.push(format!("{name}/"));
@@ -477,7 +477,7 @@ fn find(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
         // The pattern is matched against the path as the advisor may see
         // it: whether a path comes back never tells it anything about a
         // part of the path that is not shown.
-        let shown = redactor.redact(&fs.display(path));
+        let shown = listed(redactor.redact(&fs.display(path)));
         if regex.is_match(&shown) {
             matches.push(shown);
         }
@@ -529,7 +529,7 @@ fn grep(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
             if regex.is_match(line) {
                 matches.push(format!(
                     "{}:{}: {}",
-                    shown_path.get_or_insert_with(|| redactor.redact(&fs.display(path))),
+                    shown_path.get_or_insert_with(|| listed(redactor.redact(&fs.display(path)))),
                     index + 1,
                     clip_line(line.trim_end())
                 ));
@@ -1078,8 +1078,13 @@ mod tests {
         // The functions behind the tools, with nothing redacting after them.
         let listed = ls(&fs, &redactor, &json!({"path": "deploy"})).unwrap();
         // In the order of what is shown: where a name comes in the list
-        // does not depend on what was removed from it.
-        assert_eq!(listed, "[redacted].txt\n[redacted]/\naaa.txt\nnotes.txt");
+        // does not depend on what was removed from it. A name that starts
+        // with a bracket once redacted is written as a path, so that no line
+        // of a listing can pass for a note of the tool.
+        assert_eq!(
+            listed,
+            "./[redacted].txt\n./[redacted]/\naaa.txt\nnotes.txt"
+        );
 
         let found = find(&fs, &redactor, &json!({"pattern": ".", "path": "deploy"})).unwrap();
         assert_eq!(found.lines().count(), 4, "{found}");

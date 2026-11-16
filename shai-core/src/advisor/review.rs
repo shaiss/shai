@@ -243,8 +243,9 @@ impl Reviewer {
             None => return "error: the arguments must be a JSON object".to_string(),
         };
         // What this process was told to keep out of reach may have been
-        // created since the last look.
-        let fs = self.fs.clone().refreshed();
+        // created since the last look. What is found stays refused.
+        self.fs.refresh();
+        let fs = self.fs.clone();
         let redactor = self.redactor.clone();
         // File I/O is blocking; keep it off the async workers.
         tokio::task::spawn_blocking(move || tool.run(&fs, &redactor, &args))
@@ -446,7 +447,7 @@ fn is_accent(c: char) -> bool {
 /// and direction-changing characters, variation selectors, the tag block
 /// that some models read and no terminal draws, and letters and symbols that
 /// are drawn as blanks.
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -858,6 +859,46 @@ mod tests {
             )
             .await;
         assert_eq!(sent(read), "    2  fn next(&mut self) {}\n[2 more lines]\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_records_place_found_by_one_tool_call_stays_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for data in ["data1", "data2"] {
+            std::fs::create_dir_all(root.join(data).join("sessions")).unwrap();
+            std::fs::write(root.join(data).join("sessions/one.json"), "{}").unwrap();
+        }
+        let script = crate::agent::scripted_llm::Script::new(vec![]);
+        let reviewer = Reviewer {
+            llm: script.client("advisor"),
+            model: "advisor-model".to_string(),
+            // `var` does not exist yet when the advisor is set up.
+            fs: ConfinedFs::new(&root)
+                .unwrap()
+                .refusing([root.join("var/sessions")]),
+            redactor: Redactor::default(),
+        };
+        let read = |path: &'static str| {
+            let reviewer = &reviewer;
+            async move {
+                reviewer
+                    .run_tool("read", &format!(r#"{{"path": "{path}"}}"#))
+                    .await
+            }
+        };
+        // Created as a link during the session.
+        std::os::unix::fs::symlink("data1", root.join("var")).unwrap();
+        assert!(read("data1/sessions/one.json")
+            .await
+            .contains("access refused"));
+        // Pointed elsewhere later: where it led before stays refused.
+        std::fs::remove_file(root.join("var")).unwrap();
+        std::os::unix::fs::symlink("data2", root.join("var")).unwrap();
+        for path in ["data1/sessions/one.json", "data2/sessions/one.json"] {
+            assert!(read(path).await.contains("access refused"), "{path}");
+        }
     }
 
     #[test]

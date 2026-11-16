@@ -1246,6 +1246,12 @@ fn the_log_of_this_process_is_out_of_reach_wherever_it_is_written() {
     // The files next to it are the project's.
     assert!(reviewer.fs.resolve("logs/build.log").is_ok());
     assert!(reviewer.fs.may_visit(&logs.join("build.log"), false, false));
+    // The logger writes one file a day, named after the configured one.
+    std::fs::write(dir.path().join("logs/shai.log.2026-11-16"), "what it did").unwrap();
+    assert!(reviewer.fs.resolve("logs/shai.log.2026-11-16").is_err());
+    assert!(!reviewer
+        .fs
+        .may_visit(&logs.join("shai.log.2026-11-16"), false, false));
 
     // Not set, the same file is a file like any other.
     let advisor = advisor_in(dir.path(), &ShaiConfig::default(), &[]);
