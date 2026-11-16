@@ -55,6 +55,10 @@ impl AnyTool for WrappedMcpTool {
         &[ToolCapability::Network]
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn execute_json(
         &self,
         params: serde_json::Value,
