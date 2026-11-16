@@ -9,6 +9,17 @@ pay attention to a few things:
 4. your work must be signed (see below)
 5. you may contribute through GitHub Pull Requests
  
+# Running Tests
+
+`cargo test --workspace` runs offline. Tests that call a real LLM provider are
+skipped unless you opt in with `SHAI_LIVE_LLM_TESTS=1`, for example:
+
+    SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners:: tools::tests_llm
+
+These use your configured provider (see `shai auth`) and may cost tokens. New
+tests should mock HTTP with `mockito`; a test that needs a live model must
+return early via `skip_unless_live_llm`.
+
 # Release Process
 
 When creating a new release, make sure to update the version in the following locations:

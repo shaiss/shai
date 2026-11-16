@@ -75,6 +75,11 @@ When using `-p` with cargo commands, always use the package name (e.g., `cargo b
 - Run a single test: `cargo test -p shai-core <test_name>`
 - Use `tempfile::TempDir` for filesystem tests.
 - Use `mockito` for HTTP mocking.
+- Tests that call a real LLM provider (`runners::` agent tests, `tools::tests_llm`, and the
+  `shai-llm` per-provider tests) are skipped unless `SHAI_LIVE_LLM_TESTS=1`. A skipped test
+  prints a one-line reason and passes. To run them against your configured provider:
+  `SHAI_LIVE_LLM_TESTS=1 cargo test -p shai-core -- runners:: tools::tests_llm` (they may cost
+  tokens). New tests that need a model must call `skip_unless_live_llm` first, or use `mockito`.
 
 ## Release Process
 

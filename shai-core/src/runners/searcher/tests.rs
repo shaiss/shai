@@ -4,7 +4,9 @@ use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use crate::runners::test_helpers::{get_llm, init_test_logging, DIR_TEST_MUTEX};
+use crate::runners::test_helpers::{
+    get_llm, init_test_logging, skip_unless_live_llm, DIR_TEST_MUTEX,
+};
 
 // Helper function to create a searcher agent with goal
 async fn create_searcher_agent_with_goal(goal: &str) -> impl Agent {
@@ -32,6 +34,9 @@ async fn create_searcher_agent_with_goal(goal: &str) -> impl Agent {
 
 #[tokio::test]
 async fn test_searcher_find_struct_definition() {
+    if skip_unless_live_llm("test_searcher_find_struct_definition") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
 
@@ -158,6 +163,9 @@ fn main() {
 
 #[tokio::test]
 async fn test_searcher_analyze_auth_feature() {
+    if skip_unless_live_llm("test_searcher_analyze_auth_feature") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
 
@@ -351,6 +359,9 @@ impl AuthController {
 
 #[tokio::test]
 async fn test_searcher_generate_knowledge_documentation() {
+    if skip_unless_live_llm("test_searcher_generate_knowledge_documentation") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
 

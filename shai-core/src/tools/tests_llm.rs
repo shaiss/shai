@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod llm_integration_tests {
     use crate::config::config::ShaiConfig;
-    use crate::runners::test_helpers::init_test_logging;
+    use crate::runners::test_helpers::{init_test_logging, skip_unless_live_llm};
     use crate::tools::{
         AnyTool, BashTool, EditTool, FetchTool, FindTool, FsOperationLog, LsTool, ReadTool,
         TodoReadTool, TodoStorage, TodoWriteTool, WriteTool,
@@ -138,6 +138,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_bash_tool_with_llm() {
+        if skip_unless_live_llm("test_bash_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(BashTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Run the command 'echo hello world' using bash"),
@@ -147,6 +150,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_ls_tool_with_llm() {
+        if skip_unless_live_llm("test_ls_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(LsTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "List the files in the current directory"),
@@ -156,6 +162,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_fetch_tool_with_llm() {
+        if skip_unless_live_llm("test_fetch_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(FetchTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -168,6 +177,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_find_tool_with_llm() {
+        if skip_unless_live_llm("test_find_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(FindTool::new());
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -180,6 +192,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_todo_read_tool_with_llm() {
+        if skip_unless_live_llm("test_todo_read_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(TodoReadTool::new(Arc::new(TodoStorage::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Show me the current todo list"),
@@ -189,6 +204,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_todo_write_tool_with_llm() {
+        if skip_unless_live_llm("test_todo_write_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(TodoWriteTool::new(Arc::new(TodoStorage::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Create a new todo item with the content 'Test LLM integration' and status 'pending'"),
@@ -198,6 +216,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_write_tool_with_llm() {
+        if skip_unless_live_llm("test_write_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(WriteTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -210,6 +231,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_read_tool_with_llm() {
+        if skip_unless_live_llm("test_read_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(ReadTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "Read the contents of the file 'Cargo.toml'"),
@@ -219,6 +243,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_edit_tool_with_llm() {
+        if skip_unless_live_llm("test_edit_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(EditTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(
@@ -231,6 +258,9 @@ mod llm_integration_tests {
 
     #[tokio::test]
     async fn test_multiedit_tool_with_llm() {
+        if skip_unless_live_llm("test_multiedit_tool_with_llm") {
+            return;
+        }
         let tool: Arc<dyn AnyTool> = Arc::new(EditTool::new(Arc::new(FsOperationLog::new())));
         llm_test_with_fallback!(
             test_tool_with_llm(tool, "In the file 'Cargo.toml', replace 'name' with 'project_name' and 'v0.0.1' with 'v0.0.2'"),

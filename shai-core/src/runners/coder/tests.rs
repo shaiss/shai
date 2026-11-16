@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 
-use crate::runners::test_helpers::{get_llm, init_test_logging, DIR_TEST_MUTEX};
+use crate::runners::test_helpers::{
+    get_llm, init_test_logging, skip_unless_live_llm, DIR_TEST_MUTEX,
+};
 
 // Helper function to create a coder agent with full toolbox
 async fn create_coder_agent_with_goal(goal: &str) -> impl Agent {
@@ -44,6 +46,9 @@ async fn create_coder_agent_with_goal(goal: &str) -> impl Agent {
 
 #[tokio::test]
 async fn test_coder_brain_creation() {
+    if skip_unless_live_llm("test_coder_brain_creation") {
+        return;
+    }
     let (_llm_client, _model) = get_llm().await.expect("No LLM provider available");
     let llm_client = Arc::new(LlmClient::first_from_env().expect("No LLM provider available"));
     let model = llm_client.default_model().await.expect("default model");
@@ -55,6 +60,9 @@ async fn test_coder_brain_creation() {
 
 #[tokio::test]
 async fn test_coder_brain_think_simple() {
+    if skip_unless_live_llm("test_coder_brain_think_simple") {
+        return;
+    }
     let (llm_client, model) = get_llm().await.expect("No LLM provider available");
     let mut brain = CoderBrain::new(llm_client, model);
 
@@ -101,6 +109,9 @@ async fn test_coder_brain_think_simple() {
 
 #[tokio::test]
 async fn test_coder_integration_simple_file_creation() {
+    if skip_unless_live_llm("test_coder_integration_simple_file_creation") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
     // Create a temporary directory for this test
@@ -163,6 +174,9 @@ async fn test_coder_integration_simple_file_creation() {
 
 #[tokio::test]
 async fn test_multi_turn_conversation() {
+    if skip_unless_live_llm("test_multi_turn_conversation") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
     // Create a temporary directory for this test
@@ -218,6 +232,9 @@ async fn test_multi_turn_conversation() {
 
 #[tokio::test]
 async fn test_coder_integration_bug_fix_task() {
+    if skip_unless_live_llm("test_coder_integration_bug_fix_task") {
+        return;
+    }
     init_test_logging();
     let _guard = DIR_TEST_MUTEX.lock().await;
     // Create a temporary directory for this test
