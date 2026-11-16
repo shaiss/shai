@@ -147,6 +147,7 @@ fn is_secret_field(name: &str) -> bool {
     // `client-key-data`, `Ocp-Apim-Subscription-Key`, `master_key`.
     const KEY_OWNERS: &[&str] = &[
         "account",
+        "auth",
         "master",
         "subscription",
         "client",
@@ -239,7 +240,20 @@ fn encoded_forms(value: &str) -> Vec<String> {
                 }
             })
             .collect();
-        forms.push(ascii.to_uppercase().replace("\\U", "\\u"));
+        let upper: String = json
+            .chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    c.to_string()
+                } else {
+                    c.encode_utf16(&mut [0; 2])
+                        .iter()
+                        .map(|unit| format!("\\u{unit:04X}"))
+                        .collect()
+                }
+            })
+            .collect();
+        forms.push(upper);
         forms.push(ascii.replace('/', "\\/"));
         forms.push(
             json.replace('&', "\\u0026")
@@ -381,8 +395,10 @@ static KEY_END: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The private lines of a PuTTY key file, after the line that counts them.
 static PUTTY_PRIVATE: LazyLock<Regex> = LazyLock::new(|| {
+    // The count line and each private line may carry what a listing puts in
+    // front of a line: a number, a hash, a diff mark.
     Regex::new(
-        r"(?m)^(Private-Lines: *\d+)[ \t]*\r?\n((?:[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
+        r"(?m)^([^\n]{0,24}?Private-Lines: *\d+)[ \t]*\r?\n((?:(?:[ \t]*\d+(?::[ \t]*[0-9a-f]{8}[ \t]|\t))?[ \t]*[A-Za-z0-9+/=]+[ \t]*(?:\r?\n|$))+)",
     )
     .unwrap()
 });
@@ -645,21 +661,36 @@ fn redact_url_passwords(text: &str) -> String {
 /// assigned, each with the name that says what the value is, where there is
 /// one.
 static HANDED_OVER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    // A quoted value, which ends at the quote it opened with only, past any
+    // escaped quote: one alternative per kind of quote.
+    const VALUE: &str = r#"(?:"(?P<dq>(?:\\.|[^"\\\n])*)"|'(?P<sq>(?:\\.|[^'\\\n])*)')"#;
     [
         // A function given a name and a value: `define('DB_PASSWORD', 'x')`,
         // `os.Setenv("API_TOKEN", "x")`, `config.set("password", "x")`.
-        r#"(?i)\b(?:define|setenv|putenv|setproperty|setdefault|set)\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{0,80})["']\s*,\s*["'](?P<value>[^"'\n]*)["']"#,
+        format!(
+            r#"(?i)\b(?:define|setenv|putenv|setproperty|setdefault|set)\s*\(\s*["'](?P<name>[A-Za-z_][\w.-]{{0,80}})["']\s*,\s*{VALUE}"#
+        ),
         // A setter named after what it sets: `ds.setPassword("x")`.
-        r#"\bset(?P<name>[A-Z][A-Za-z]{0,40})\s*\(\s*["'](?P<value>[^"'\n]*)["']"#,
+        format!(r#"\bset(?P<name>[A-Z][A-Za-z]{{0,40}})\s*\(\s*{VALUE}"#),
         // An element of markup: `<password>x</password>`.
-        r#"<(?P<name>[A-Za-z_][\w.:-]{0,60})>(?P<value>[^<\n]{1,512})</"#,
-        // A key and its value as attributes: `<add key="Password" value="x"/>`.
-        r#"\bkey\s*=\s*"(?P<name>[^"\n]{1,80})"\s+value\s*=\s*"(?P<value>[^"\n]*)""#,
-        // SQL: `IDENTIFIED BY 'x'`, `WITH PASSWORD 'x'`.
-        r#"(?i)\b(?:identified\s+by|password)\s+'(?P<value>[^'\n]*)'"#,
+        r#"<(?P<name>[A-Za-z_][\w.:-]{0,60})>(?P<value>[^<\n]{1,512})</"#.to_string(),
+        // An element named by an attribute:
+        // `<property name="hibernate.connection.password">x</property>`.
+        r#"<(?:property|entry|add|param|setting|parameter)\b[^>\n]{0,200}?\b(?:name|key)\s*=\s*["'](?P<name>[^"'\n]{1,80})["'][^>\n]{0,200}?>(?P<value>[^<\n]{1,512})</"#.to_string(),
+        // A name and its value as attributes, in either order:
+        // `<add key="Password" value="x"/>`, `<property value="x" name="password"/>`.
+        format!(
+            r#"\b(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["']\s+value\s*=\s*{VALUE}"#
+        ),
+        format!(
+            r#"\bvalue\s*=\s*{VALUE}\s+(?:key|name)\s*=\s*["'](?P<name>[^"'\n]{{1,80}})["']"#
+        ),
+        // SQL: `IDENTIFIED BY 'x'`, `IDENTIFIED WITH plugin BY 'x'`,
+        // `WITH PASSWORD 'x'`, a quote written twice inside the value.
+        r#"(?i)\b(?:identified\s+(?:with\s+\w+\s+)?by|password)\s+(?:'(?P<sq>(?:''|[^'\n])*)'|"(?P<dq>(?:""|[^"\n])*)")"#.to_string(),
     ]
     .into_iter()
-    .map(|pattern| Regex::new(pattern).unwrap())
+    .map(|pattern| Regex::new(&pattern).unwrap())
     .collect()
 });
 
@@ -674,7 +705,11 @@ fn redact_handed_over(text: &str) -> String {
         out = rule
             .replace_all(&out, |found: &Captures<'_>| {
                 let whole = found.get(0).expect("the whole match");
-                let Some(value) = found.name("value") else {
+                let Some(value) = found
+                    .name("value")
+                    .or_else(|| found.name("dq"))
+                    .or_else(|| found.name("sq"))
+                else {
                     return whole.as_str().to_string();
                 };
                 let named = found
@@ -1354,15 +1389,70 @@ fn starts_a_pair(rest: &str) -> bool {
 /// heredoc.
 const MAX_BLOCK: usize = 64 * 1024;
 
+/// Where each line that could end a heredoc stands in a text: a line made of
+/// a word alone, by that word, at the line break before it. Built once for a
+/// text, so that the end of a heredoc is looked up rather than searched for
+/// again for every heredoc that opens.
+struct HeredocEnds<'a>(std::collections::HashMap<&'a str, Vec<usize>>);
+
+impl<'a> HeredocEnds<'a> {
+    fn of(text: &'a str) -> Self {
+        let mut ends: std::collections::HashMap<&'a str, Vec<usize>> = Default::default();
+        let mut at = 0;
+        for line in text.split('\n') {
+            let word = line.trim();
+            let marker = !word.is_empty()
+                && word.len() <= 64
+                && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if marker && at > 0 {
+                ends.entry(word).or_default().push(at - 1);
+            }
+            at += line.len() + 1;
+        }
+        Self(ends)
+    }
+
+    /// The line break before the first line from `from` on, and before
+    /// `to`, that is `marker` alone.
+    fn after(&self, marker: &str, from: usize, to: usize) -> Option<usize> {
+        let positions = self.0.get(marker)?;
+        let first = positions.partition_point(|at| *at < from);
+        positions.get(first).copied().filter(|at| *at < to)
+    }
+}
+
 /// Where a value written as a block of lines ends, when `token`, alone on its
 /// line after the name that starts at `name_start`, opens one: a YAML block
 /// scalar (`|`, `>-`) takes the lines indented more than the name, a heredoc
 /// (`<<EOF`) the lines up to its end marker.
-fn block_end(text: &str, name_start: usize, value_start: usize, token: &str) -> Option<usize> {
+fn block_end<'a>(
+    text: &'a str,
+    name_start: usize,
+    value_start: usize,
+    token: &str,
+    heredoc_ends: &std::cell::OnceCell<HeredocEnds<'a>>,
+) -> Option<usize> {
     let line_end = text[value_start..]
         .find('\n')
         .map_or(text.len(), |at| value_start + at);
-    if text[value_start..line_end].trim() != token || line_end == text.len() {
+    // Alone on its line, but for a comment, and for a YAML tag before it
+    // (`!!binary |`).
+    let mut shown = &text[value_start..line_end];
+    if let Some(comment) = shown.find(" #") {
+        shown = &shown[..comment];
+    }
+    let mut shown = shown.trim();
+    if shown.starts_with("!!") {
+        shown = shown
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim());
+    }
+    let token = if token.starts_with("!!") {
+        shown
+    } else {
+        token
+    };
+    if shown != token || line_end == text.len() {
         return None;
     }
     let scalar = token.starts_with(['|', '>'])
@@ -1385,10 +1475,16 @@ fn block_end(text: &str, name_start: usize, value_start: usize, token: &str) -> 
     if !scalar && marker.is_none() {
         return None;
     }
+    let limit = (line_end + MAX_BLOCK).min(text.len());
+    if let Some(marker) = marker {
+        // A heredoc whose end is not in reach is not taken for one.
+        return heredoc_ends
+            .get_or_init(|| HeredocEnds::of(text))
+            .after(marker, line_end, limit);
+    }
     let line_start = text[..name_start].rfind('\n').map_or(0, |at| at + 1);
     let lead = &text[line_start..name_start];
     let indent = lead.len() - lead.trim_start_matches([' ', '\t']).len();
-    let limit = (line_end + MAX_BLOCK).min(text.len());
     let mut end = line_end;
     let mut at = line_end;
     while at < limit {
@@ -1397,21 +1493,14 @@ fn block_end(text: &str, name_start: usize, value_start: usize, token: &str) -> 
             .find('\n')
             .map_or(text.len(), |found| start + found);
         let line = &text[start..stop];
-        match marker {
-            Some(marker) if line.trim() == marker => return Some(at),
-            Some(_) => {}
-            None => {
-                let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
-                if !line.trim().is_empty() && line_indent <= indent {
-                    break;
-                }
-                end = stop;
-            }
+        let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if !line.trim().is_empty() && line_indent <= indent {
+            break;
         }
+        end = stop;
         at = stop;
     }
-    // A heredoc whose end is not in reach is not taken for one.
-    (marker.is_none() && end > line_end).then_some(end)
+    (end > line_end).then_some(end)
 }
 
 /// The quote that opens the quotation a header stands in, if it stands in
@@ -1493,6 +1582,7 @@ fn redact_assignments(text: &str) -> String {
         copied: 0,
     };
     let mut search = 0;
+    let heredoc_ends = std::cell::OnceCell::new();
     while let Some(found) = ASSIGNED_NAME.captures_at(text, search) {
         let (Some(whole), Some(name)) = (found.get(0), found.name("name")) else {
             break;
@@ -1556,7 +1646,13 @@ fn redact_assignments(text: &str) -> String {
             && starts_line
             && !value.is_quoted()
         {
-            if let Some(end) = block_end(text, name.start(), value_start, value.token()) {
+            if let Some(end) = block_end(
+                text,
+                name.start(),
+                value_start,
+                value.token(),
+                &heredoc_ends,
+            ) {
                 rewrite.replace_lines(value_start, end);
                 search = end;
                 continue;
@@ -1763,19 +1859,21 @@ impl Redactor {
                         .collect(),
                 ),
                 // A number written without quotes is still a known value.
-                Value::Number(number)
-                    if redactor
-                        .known
-                        .iter()
-                        .any(|known| *known == number.to_string()) =>
-                {
-                    Value::String(REDACTED.to_string())
+                Value::Number(number) => {
+                    let shown = number.to_string();
+                    if redactor.redact_known(&shown) == shown {
+                        Value::Number(number)
+                    } else {
+                        Value::String(REDACTED.to_string())
+                    }
                 }
                 other => other,
             }
         }
         match serde_json::from_str::<Value>(json) {
-            Ok(value) => walk(self, value, false).to_string(),
+            // What is written out again is looked at once more: a number
+            // can come back in another form than it was given in.
+            Ok(value) => self.redact_known(&walk(self, value, false).to_string()),
             Err(_) => self.redact(json),
         }
     }
@@ -2195,6 +2293,8 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----",
             "Cookie: ",
             "Cookie: f( ",
+            "TOKEN = <<EOF\n",
+            "password: <<EOF\nx\n",
             "x Cookie: 'a ",
             "-----BEGIN PRIVATE KEY-----\n",
             "-----BEGIN PRIVATE KEY-----aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3055,9 +3155,9 @@ mod tests {
             "GET /search?q=abc%2Bdef%2Fghi%3Djkl0123 HTTP/1.1",
             "GET /search?q=abc%2bdef%2fghi%3djkl0123 HTTP/1.1",
             r#"{"k":"abc+def\/ghi=jkl0123"}"#,
-            r#"{"k": "clé-très-secrète-42"}"#,
-            r#"{"k": "clé-très-secrète-42"}"#,
-            r#"["x=Tr0ub4dor&3xyz<>"]"#,
+            r#"{"k": "cl\u00e9-tr\u00e8s-secr\u00e8te-42"}"#,
+            r#"{"k": "cl\u00E9-tr\u00E8s-secr\u00E8te-42"}"#,
+            r#"["x=Tr0ub4dor\u00263xyz\u003c\u003e"]"#,
             "value=Tr0ub4dor&amp;3xyz&lt;&gt;",
             "q=Tr0ub4dor%263xyz%3C%3E",
         ] {
@@ -3070,9 +3170,18 @@ mod tests {
                 );
             }
         }
-        // A number in the arguments of a tool call.
+        // A number in the arguments of a tool call, however it is written.
         let out = redactor.redact_json(r#"{"pin": 1234567890123456, "count": 3}"#);
         assert_eq!(out, r#"{"count":3,"pin":"[redacted]"}"#);
+        for number in [
+            "-1234567890123456",
+            "1234567890123456.0",
+            "1.234567890123456e15",
+            "12345678901234560",
+        ] {
+            let out = redactor.redact_json(&format!(r#"{{"pin": {number}}}"#));
+            assert!(!out.contains("1234567890123456"), "{number} -> {out}");
+        }
     }
 
     #[test]
@@ -3087,6 +3196,13 @@ mod tests {
         let cut = "-----BEGIN PGP SECRET KEY BLOCK-----\nVersion: 1\n\nlQOYBF8xQ0kBCADC2J3vZk9pQf8Yk1sQ0+M3s2YbR7rT5Z6H2l9d0wVxq4n1Kp8J\n";
         assert!(!redactor.redact(cut).contains("lQOYBF8"));
 
+        // As a listing shows it, with numbered lines.
+        let listed = "   7: 3f2a9c1d Private-Lines: 2\n   8: 9c1d77ab AAABAQCs0123456789abcdef\n   9: 77ab0e1f AAAAgQDabcdef0123456789\n  10: 0e1f2a3b Private-MAC: 0a1b";
+        let out = redactor.redact(listed);
+        assert!(
+            !out.contains("AAABAQCs") && !out.contains("AAAAgQD"),
+            "{out}"
+        );
         let putty = "PuTTY-User-Key-File-2: ssh-rsa\nPublic-Lines: 1\nAAAAB3NzaC1yc2E\nPrivate-Lines: 2\nAAABAQCs0123456789abcdef\nAAAAgQDabcdef0123456789\nPrivate-MAC: 0a1b2c\n";
         let out = redactor.redact(putty);
         assert!(
@@ -3154,6 +3270,10 @@ mod tests {
                 "Ocp-Apim-Subscription-Key: [redacted]",
             ),
             ("X-Auth: Sup3rS3cretPw", "X-Auth: [redacted]"),
+            (
+                "X-Auth-Key: c2547eb745079dac9320b638f5e225cf483cc5cfdda41",
+                "X-Auth-Key: [redacted]",
+            ),
         ] {
             assert_eq!(redactor.redact(input), expected, "{input}");
         }
@@ -3202,6 +3322,30 @@ mod tests {
                 "CREATE USER bob WITH PASSWORD 'Sup3rS3cretPw';",
                 "CREATE USER bob WITH PASSWORD '[redacted]';",
             ),
+            (
+                "CREATE USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'Sup3r''s3cret';",
+                "CREATE USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY '[redacted]';",
+            ),
+            (
+                "define('DB_PASSWORD', \"it's-a-s3cret\");",
+                "define('DB_PASSWORD', \"[redacted]\");",
+            ),
+            (
+                "<property name=\"hibernate.connection.password\">Sup3rS3cretPw</property>",
+                "<property name=\"hibernate.connection.password\">[redacted]</property>",
+            ),
+            (
+                "<property name=\"password\" value=\"Sup3rS3cretPw\"/>",
+                "<property name=\"password\" value=\"[redacted]\"/>",
+            ),
+            (
+                "<property value='Sup3rS3cretPw' name='password'/>",
+                "<property value='[redacted]' name='password'/>",
+            ),
+            (
+                "<entry key=\"db.password\">Sup3rS3cretPw</entry>",
+                "<entry key=\"db.password\">[redacted]</entry>",
+            ),
         ] {
             let once = redactor.redact(input);
             assert_eq!(once, expected, "{input}");
@@ -3231,6 +3375,14 @@ mod tests {
                 "  password: [redacted]\n\n\n  other: 2",
             ),
             (
+                "client_secret: | # rotate yearly\n  9f8e7d6c5b4a39281706\nnext: 1",
+                "client_secret: [redacted]\n\nnext: 1",
+            ),
+            (
+                "private_key: !!binary |\n  LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t\nnext: 1",
+                "private_key: [redacted]\n\nnext: 1",
+            ),
+            (
                 "private_key = <<EOF\nabcd1234efgh5678ijkl9012mnop3456\nEOF\nnext = 1",
                 "private_key = [redacted]\n\nEOF\nnext = 1",
             ),
@@ -3240,9 +3392,14 @@ mod tests {
             assert_eq!(once.lines().count(), input.lines().count(), "{input}");
             assert_eq!(redactor.redact(&once), once, "{input}");
         }
-        // A heredoc whose end is not there, and a block that is empty.
-        for input in ["notes: |\nnext: 1", "token = <<EOF\nnever closed"] {
-            assert!(redactor.redact(input).contains("next: 1") || input.contains("never"));
+        // A heredoc whose end is not there is not a heredoc, and an empty
+        // block under a secret name takes no line with it.
+        for input in ["token = <<EOF\nnever closed", "password: |\nnext: 1"] {
+            let out = redactor.redact(input);
+            assert!(
+                out.ends_with("\nnever closed") || out.ends_with("\nnext: 1"),
+                "{out}"
+            );
         }
     }
 

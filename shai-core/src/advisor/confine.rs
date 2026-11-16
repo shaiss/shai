@@ -241,8 +241,9 @@ fn is_code_like(name: &str) -> bool {
         let stem = &bare[..bare.len() - last.len() - 1];
         return match stem.rsplit_once('.') {
             Some((_, rendered)) => CODE_EXTENSIONS.contains(&rendered),
-            // What it renders is not said: data, as far as can be told.
-            None => false,
+            // What it renders is not said: a page for a page template, data,
+            // as far as can be told, for any other.
+            None => PAGE_TEMPLATE_EXTENSIONS.contains(&last),
         };
     }
     CODE_EXTENSIONS.contains(&last)
@@ -263,6 +264,11 @@ const TEMPLATE_EXTENSIONS: &[&str] = &[
     "njk",
     "twig",
 ];
+
+/// Templates a page is rendered from. A bare stem names the page, not a
+/// file: `password.liquid` is markup.
+const PAGE_TEMPLATE_EXTENSIONS: &[&str] =
+    &["mustache", "hbs", "handlebars", "liquid", "njk", "twig"];
 
 /// `name` without what marks it as a copy set aside: `.netrc.bak~` is
 /// `.netrc`. A name made of nothing else is left as it is.
@@ -311,11 +317,24 @@ fn is_sensitive_file_name(name: &str) -> bool {
     original
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && TEMPLATE_EXTENSIONS.contains(extension))
-        .is_some_and(|(stem, _)| names_a_secret(stem))
+        .is_some_and(|(stem, extension)| {
+            names_a_secret(stem)
+                && (!PAGE_TEMPLATE_EXTENSIONS.contains(&extension)
+                    || names_a_secret_by_kind(stem)
+                    || stem.strip_prefix('.').unwrap_or(stem).contains('.'))
+        })
 }
 
 /// The rules about one lowercased file name, taken as it is written.
 fn names_a_secret(name: &str) -> bool {
+    // A bare name, or a data file, that says what it holds.
+    names_a_secret_by_kind(name)
+        || (is_data_like(name) && SENSITIVE_WORDS.iter().any(|word| name.contains(word)))
+}
+
+/// The rules that know a file holding secrets by what it is, not by a word
+/// in its name.
+fn names_a_secret_by_kind(name: &str) -> bool {
     if SENSITIVE_FILES.contains(&name) {
         return true;
     }
@@ -346,11 +365,7 @@ fn names_a_secret(name: &str) -> bool {
     if is_env && !is_template {
         return true;
     }
-    if extensions().any(|extension| SENSITIVE_EXTENSIONS.contains(&extension)) {
-        return true;
-    }
-    // A bare name, or a data file, that says what it holds.
-    is_data_like(name) && SENSITIVE_WORDS.iter().any(|word| name.contains(word))
+    extensions().any(|extension| SENSITIVE_EXTENSIONS.contains(&extension))
 }
 
 /// A directory tree the advisor may read from.
@@ -1653,6 +1668,8 @@ mod tests {
             ("secrets/prod.kubeconfig.dist", true),
             ("app/views/passwords/edit.html.erb", false),
             ("app/views/passwords/show.erb", true),
+            ("app/views/passwords/reset.hbs", false),
+            ("theme/templates/password.liquid", false),
             ("deploy/secrets/.pgpass.tmpl", true),
             ("deploy/secrets/htpasswd.j2", true),
             (".netrc.j2", true),
