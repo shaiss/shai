@@ -635,6 +635,22 @@ pub async fn handle_postcmd(
             return Ok(());
         }
         _ => {
+            // A failed command must not start a fix on the built-in default
+            // model when the auth config is there and cannot be read. Load
+            // once as soon as this hook might suggest a fix, so the user is
+            // told even if the session history is empty.
+            let primary = if env::var("SHAI_SESSION_ID").is_ok() {
+                match SessionOptions::primary_config() {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        eprintln!("error: {}", error);
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
+            };
+
             let last_terminal_output = env::var("SHAI_SESSION_ID").ok().and_then(|session_id| {
                 let client = ShaiSessionClient::new(&session_id);
                 client.session_exists().then(|| {
@@ -650,7 +666,8 @@ pub async fn handle_postcmd(
                     name: None,
                 }];
 
-                let (llm, model) = ShaiConfig::get_llm().await?;
+                let config = primary.expect("SHAI_SESSION_ID was set above");
+                let (llm, model) = config.get_llm_from_config().await?;
 
                 enable_raw_mode().unwrap();
                 let mut events = EventStream::new();
@@ -777,6 +794,14 @@ async fn handle_serve(
     max_sessions: Option<usize>,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The default agent is built later with AgentBuilder::default. Refuse to
+    // start if the auth config is there and cannot be read, so a typo never
+    // silently runs the built-in default model.
+    if let Err(error) = SessionOptions::primary_config() {
+        eprintln!("error: {}", error);
+        std::process::exit(2);
+    }
+
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
         .with_target(false)

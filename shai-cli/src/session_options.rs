@@ -96,15 +96,12 @@ impl SessionOptions {
     /// the primary model is built from this same load, so the file cannot
     /// break between a check and the read that builds the client.
     pub fn primary_config() -> Result<ShaiConfig, String> {
-        Self::primary_config_from(ShaiConfig::load_for_roles())
+        ShaiConfig::primary()
     }
 
+    #[cfg(test)]
     fn primary_config_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
-        match config {
-            Ok(config) => Ok(config),
-            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
-            Err(error) => Err(Self::unreadable(Err(&error)).unwrap_or_else(|| error.to_string())),
-        }
+        ShaiConfig::primary_from(config)
     }
 
     /// The handoff target the session is asked for, as things are now.
