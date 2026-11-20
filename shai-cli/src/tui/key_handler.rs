@@ -138,13 +138,16 @@ impl App<'_> {
                     &format!("Switching to agent '{}'...", name),
                     Duration::from_secs(2),
                 );
-                self.swap_agent(Some(&name))
+                let replaced = self
+                    .swap_agent(Some(&name))
                     .await
                     .map_err(|e| io::Error::other(format!("Failed to switch agent: {}", e)))?;
-                self.input.alert_msg(
-                    &format!("Switched to agent '{}'", name),
-                    Duration::from_secs(2),
-                );
+                if replaced {
+                    self.input.alert_msg(
+                        &format!("Switched to agent '{}'", name),
+                        Duration::from_secs(2),
+                    );
+                }
             }
             Some(AgentPickerAction::Cancelled) => {
                 self.ui_state.agent_picker = None;

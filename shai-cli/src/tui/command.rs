@@ -442,28 +442,33 @@ impl CommandRegistry {
                 }
             }
             "/auth" => {
-                // Save agent name and trace before reconfiguring
                 let agent_name = app.agent_meta.name().map(|s| s.to_string());
+
+                // Run auth TUI without tearing the agent down first. Suspend
+                // the main event reader: crossterm only supports one event
+                // reader at a time, and the idle main reader would keep its
+                // lock held, deadlocking the auth view's own EventStream
+                // (black screen until a key press). The live agent stays
+                // until the new config is known to be usable.
+                app.suspend_event_reader();
+                let mut auth = crate::tui::auth::auth::AppAuth::new();
+                auth.run().await;
+                app.resume_event_reader();
+
+                if !app.may_replace_agent(agent_name.as_deref()) {
+                    return Ok(());
+                }
+
                 let trace = if let Some(ref agent) = app.agent {
                     agent.controller.get_trace().await.ok()
                 } else {
                     None
                 };
 
-                // Terminate current agent
                 if let Some(agent) = app.agent.take() {
                     let _ = agent.controller.terminate().await;
                     let _ = agent.handle.await;
                 }
-
-                // Run auth TUI. Suspend the main event reader first: crossterm
-                // only supports one event reader at a time, and the idle main
-                // reader would keep its lock held, deadlocking the auth view's
-                // own EventStream (black screen until a key press).
-                app.suspend_event_reader();
-                let mut auth = crate::tui::auth::auth::AppAuth::new();
-                auth.run().await;
-                app.resume_event_reader();
 
                 // Recreate agent. `start_agent` resolves what the session was
                 // asked for against the config as it is now.

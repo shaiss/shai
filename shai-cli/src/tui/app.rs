@@ -284,14 +284,18 @@ impl App<'_> {
 
     /// Whether the running agent may be replaced by one on the agent
     /// `agent_name` (`None`: the primary model of the auth config). Not when
-    /// that would start from an auth config that is there and cannot be
-    /// read: the new agent would not start, and the session would be left
-    /// without one. The user is told why.
+    /// the replacement could not start: the current agent would be torn
+    /// down and the session left without one. A named agent is loaded first
+    /// so a broken auth config, or a file that is not a valid agent object,
+    /// is reported and the live agent is kept. The user is told why.
     pub(crate) fn may_replace_agent(&mut self, agent_name: Option<&str>) -> bool {
-        if agent_name.is_some() {
-            return true;
-        }
-        self.may_replace_agent_given(SessionOptions::config_problem())
+        let problem = match agent_name {
+            None => SessionOptions::config_problem(),
+            Some(name) => shai_core::config::agent::AgentConfig::load(name)
+                .err()
+                .map(|error| error.to_string()),
+        };
+        self.may_replace_agent_given(problem)
     }
 
     /// [`App::may_replace_agent`] for an agent on the auth config, given what
@@ -310,9 +314,9 @@ impl App<'_> {
     pub async fn swap_agent(
         &mut self,
         agent_name: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         if !self.may_replace_agent(agent_name) {
-            return Ok(());
+            return Ok(false);
         }
         let trace = if let Some(ref agent) = self.agent {
             agent.controller.get_trace().await.ok()
@@ -333,7 +337,7 @@ impl App<'_> {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> io::Result<()> {
@@ -708,8 +712,6 @@ mod tests {
             app.session_notices,
             ["the agent was not replaced: the config file /x/auth.config.json could not be loaded (line 3)"]
         );
-        // An agent of its own config does not depend on that file.
-        assert!(app.may_replace_agent(Some("reviewer")));
     }
 
     #[test]
@@ -724,6 +726,142 @@ mod tests {
         app.show_session_notices();
         let scrollback = app.renderer.history().raw_text();
         assert_eq!(scrollback.matches("prewalk not armed").count(), 1);
+        assert!(app.session_notices.is_empty());
+    }
+
+    /// Serializes tests that point `XDG_CONFIG_HOME` at a fixture tree.
+    static CONFIG_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn set_config_home(home: &std::path::Path) -> Option<String> {
+        let previous = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", home);
+        previous
+    }
+
+    fn restore_config_home(previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    fn with_config_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_config_home(home);
+        let result = f();
+        restore_config_home(previous);
+        result
+    }
+
+    fn broken_auth_home(agent_json: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai = dir.path().join("shai");
+        std::fs::create_dir_all(shai.join("agents")).unwrap();
+        std::fs::write(shai.join("auth.config.json"), "{ this is not json").unwrap();
+        std::fs::write(shai.join("agents").join("reviewer.config.json"), agent_json).unwrap();
+        dir
+    }
+
+    fn attach_live_agent(app: &mut App<'_>) {
+        use openai_dive::v1::resources::chat::ChatMessage;
+        use shai_core::agent::{
+            Agent, AgentBuilder, AgentError, Brain, ThinkerContext, ThinkerDecision, ToolBudgetRef,
+        };
+
+        struct PauseBrain;
+
+        #[async_trait::async_trait]
+        impl Brain for PauseBrain {
+            async fn next_step(
+                &mut self,
+                _: ThinkerContext,
+                _: ToolBudgetRef,
+            ) -> Result<ThinkerDecision, AgentError> {
+                Ok(ThinkerDecision::agent_pause(ChatMessage::Assistant {
+                    content: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    name: None,
+                    audio: None,
+                    refusal: None,
+                }))
+            }
+        }
+
+        let mut agent = AgentBuilder::with_brain(Box::new(PauseBrain)).build();
+        let controller = agent.controller();
+        let events = agent.watch();
+        let handle = tokio::spawn(async move {
+            let _ = agent.run().await;
+        });
+        app.agent = Some(AppRunningAgent {
+            handle,
+            controller,
+            events,
+            tools: Vec::new(),
+        });
+        app.agent_state
+            .session_manager_mut()
+            .set_session_id("live-session-1");
+        app.agent_meta.set_name(Some("reviewer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_keeps_the_live_agent_and_session() {
+        let home =
+            broken_auth_home(r#"{"name": "reviewer", "description": "needs the auth config"}"#);
+        let mut app = App::new();
+        attach_live_agent(&mut app);
+        let _guard = CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_config_home(home.path());
+        let replaced = app.swap_agent(Some("reviewer")).await.unwrap();
+        restore_config_home(previous);
+        drop(_guard);
+
+        assert!(!replaced);
+        assert!(
+            app.agent.is_some(),
+            "the live agent must survive a failed reload"
+        );
+        assert_eq!(
+            app.agent_state.session_manager().session_id(),
+            "live-session-1"
+        );
+        assert!(
+            app.session_notices
+                .iter()
+                .any(|n| n.contains("the agent was not replaced")
+                    && n.contains("auth.config.json")),
+            "notices={:?}",
+            app.session_notices
+        );
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+    }
+
+    #[test]
+    fn a_named_agent_with_its_own_provider_can_replace_when_auth_is_broken() {
+        let home = broken_auth_home(
+            r#"{
+                "name": "reviewer",
+                "description": "has its own provider",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        );
+        let mut app = App::new();
+        assert!(with_config_home(home.path(), || app.may_replace_agent(Some("reviewer"))));
         assert!(app.session_notices.is_empty());
     }
 }
