@@ -580,7 +580,13 @@ mod broken_config_fallback_tests {
     #[test]
     fn a_non_object_agent_config_is_an_error_not_a_panic() {
         let path = Path::new("/home/me/.config/shai/agents/reviewer.config.json");
-        for (json, kind) in [("[]", "array"), ("\"str\"", "string"), ("123", "number")] {
+        for (json, kind) in [
+            ("[]", "array"),
+            ("\"str\"", "string"),
+            ("123", "number"),
+            ("null", "null"),
+            ("true", "boolean"),
+        ] {
             let value: serde_json::Value = serde_json::from_str(json).unwrap();
             let error = agent_config_from_value(value, Ok(ShaiConfig::default()), Some(path))
                 .map(|_| ())

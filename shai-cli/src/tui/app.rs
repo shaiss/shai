@@ -730,7 +730,9 @@ mod tests {
     }
 
     /// Serializes tests that point `XDG_CONFIG_HOME` at a fixture tree.
-    static CONFIG_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Async so the failed-reload test can keep exclusive access across
+    /// `swap_agent(...).await` without holding a `std` mutex over an await.
+    static CONFIG_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn set_config_home(home: &std::path::Path) -> Option<String> {
         let previous = std::env::var("XDG_CONFIG_HOME").ok();
@@ -746,9 +748,7 @@ mod tests {
     }
 
     fn with_config_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = CONFIG_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = CONFIG_HOME_LOCK.blocking_lock();
         let previous = set_config_home(home);
         let result = f();
         restore_config_home(previous);
@@ -815,9 +815,7 @@ mod tests {
             broken_auth_home(r#"{"name": "reviewer", "description": "needs the auth config"}"#);
         let mut app = App::new();
         attach_live_agent(&mut app);
-        let _guard = CONFIG_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = CONFIG_HOME_LOCK.lock().await;
         let previous = set_config_home(home.path());
         let replaced = app.swap_agent(Some("reviewer")).await.unwrap();
         restore_config_home(previous);
