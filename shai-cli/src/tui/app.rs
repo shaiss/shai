@@ -63,14 +63,112 @@ pub struct App<'a> {
     pub(crate) event_reader: Option<crossterm::event::EventStream>,
 }
 
+/// A replacement loaded once, so construction does not read the agent
+/// or auth file again after the live agent has been torn down.
+pub(crate) enum PreparedAgent {
+    Named {
+        name: String,
+        config: shai_core::config::agent::AgentConfig,
+    },
+    Primary(shai_core::config::config::ShaiConfig),
+}
+
+struct BuiltAgent {
+    agent: shai_core::agent::AgentCore,
+    name: Option<String>,
+    model: String,
+    provider: String,
+    mcp_status: Option<Vec<shai_core::tools::McpServerStatus>>,
+}
+
 impl App<'_> {
     pub async fn start_agent(
         &mut self,
         agent_name: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // As at start-up: a config file that is there and cannot be read
+        // is not replaced by the built-in default, which would send the
+        // conversation to a provider the user did not choose.
+        // The file is loaded once, and the agent built from that load, so
+        // it cannot break between a check and a later read.
+        let prepared = Self::load_prepared(agent_name)?;
+        self.start_prepared(prepared).await
+    }
+
+    pub(crate) fn load_prepared(
+        agent_name: Option<&str>,
+    ) -> Result<PreparedAgent, Box<dyn std::error::Error>> {
+        match agent_name {
+            Some(name) => {
+                let config = shai_core::config::agent::AgentConfig::load(name)?;
+                Ok(PreparedAgent::Named {
+                    name: name.to_string(),
+                    config,
+                })
+            }
+            None => Ok(PreparedAgent::Primary(SessionOptions::primary_config()?)),
+        }
+    }
+
+    /// Load the replacement, or tell the user why the live agent is kept.
+    pub(crate) fn prepared_replacement(
+        &mut self,
+        agent_name: Option<&str>,
+    ) -> Option<PreparedAgent> {
+        match Self::load_prepared(agent_name) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                self.session_notices
+                    .push(format!("the agent was not replaced: {error}"));
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn start_prepared(
+        &mut self,
+        prepared: PreparedAgent,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let built = self.build_agent(prepared).await?;
+        Ok(self.install_built(built).await)
+    }
+
+    async fn build_agent(
+        &mut self,
+        prepared: PreparedAgent,
+    ) -> Result<BuiltAgent, Box<dyn std::error::Error>> {
         use shai_core::agent::builder::AgentBuilder;
+
+        match prepared {
+            PreparedAgent::Named { name, config } => {
+                let model = config.llm_provider.model.clone();
+                let provider = config.llm_provider.provider.clone();
+                let agent_builder = AgentBuilder::from_config(config).await?;
+                let mcp_status = agent_builder.mcp_status.clone();
+                Ok(BuiltAgent {
+                    agent: agent_builder.build(),
+                    name: Some(name),
+                    model,
+                    provider,
+                    mcp_status: Some(mcp_status),
+                })
+            }
+            PreparedAgent::Primary(config) => {
+                let (llm, model) = config.get_llm_from_config().await?;
+                let provider = llm.provider().name().to_string();
+                Ok(BuiltAgent {
+                    agent: coder(Arc::new(llm), model.clone()),
+                    name: None,
+                    model,
+                    provider,
+                    mcp_status: None,
+                })
+            }
+        }
+    }
+
+    async fn install_built(&mut self, mut built: BuiltAgent) -> String {
         use shai_core::agent::Agent;
-        use shai_core::config::agent::AgentConfig;
 
         // The agent this one replaces may have handed off without its
         // announcement having been read. Say so before moving on.
@@ -83,58 +181,33 @@ impl App<'_> {
             self.session_notices.extend(notices);
         }
 
-        let mut agent = if let Some(name) = agent_name {
-            let config = AgentConfig::load(name)?;
-            self.agent_meta.set_model(config.llm_provider.model.clone());
-            self.agent_meta
-                .set_provider(config.llm_provider.provider.clone());
-            self.agent_meta.set_name(Some(name.to_string()));
-            let agent_builder = AgentBuilder::from_config(config).await?;
-            self.agent_state
-                .mcp_manager_mut()
-                .set_servers(agent_builder.mcp_status.clone());
-            agent_builder.build()
-        } else {
-            // As at start-up: a config file that is there and cannot be read
-            // is not replaced by the built-in default, which would send the
-            // conversation to a provider the user did not choose.
-            // The file is loaded once, and the primary model built from that
-            // load, so it cannot break between a check and the read.
-            let config = SessionOptions::primary_config()?;
-            let (llm, model) = config.get_llm_from_config().await?;
-            self.agent_meta.set_model(model.clone());
-            self.agent_meta
-                .set_provider(llm.provider().name().to_string());
-            self.agent_meta.set_name(None);
-            coder(Arc::new(llm), model)
-        };
+        self.agent_meta.set_model(built.model.clone());
+        self.agent_meta.set_provider(built.provider.clone());
+        self.agent_meta.set_name(built.name.clone());
+        if let Some(mcp_status) = built.mcp_status {
+            self.agent_state.mcp_manager_mut().set_servers(mcp_status);
+        }
 
         // A handoff that has not happened yet stays armed on an agent that
         // replaces the previous one, if that agent can hand off at all. Once
         // it has happened, no agent is armed again.
-        if let Some(notice) = self.session_options.arm(&mut agent) {
+        if let Some(notice) = self.session_options.arm(&mut built.agent) {
             self.session_notices.push(notice);
         }
 
-        let banner = if let Some(name) = agent_name {
+        let banner = if let Some(ref name) = built.name {
             format!(
                 "\x1b[2m░ agent {} - {} on {}\x1b[0m",
-                name,
-                self.agent_meta.model(),
-                self.agent_meta.provider()
+                name, built.model, built.provider
             )
         } else {
-            format!(
-                "\x1b[2m░ {} on {}\x1b[0m",
-                self.agent_meta.model(),
-                self.agent_meta.provider()
-            )
+            format!("\x1b[2m░ {} on {}\x1b[0m", built.model, built.provider)
         };
 
-        let controller = agent.controller();
-        let events = agent.watch();
+        let controller = built.agent.controller();
+        let events = built.agent.watch();
         let handle = tokio::spawn(async move {
-            match agent.run().await {
+            match built.agent.run().await {
                 Ok(result) => debug!(target: "agent::loop", "Agent completed: {:?}", result),
                 Err(error) => warn!(target: "agent::loop", "Agent failed: {}", error),
             }
@@ -157,7 +230,7 @@ impl App<'_> {
         self.refresh_status_bar();
         self.agents_started += 1;
 
-        Ok(banner)
+        banner
     }
 
     /// Show the lines about the session's options that are waiting.
@@ -284,22 +357,18 @@ impl App<'_> {
 
     /// Whether the running agent may be replaced by one on the agent
     /// `agent_name` (`None`: the primary model of the auth config). Not when
-    /// the replacement could not start: the current agent would be torn
+    /// the replacement could not be loaded: the current agent would be torn
     /// down and the session left without one. A named agent is loaded first
     /// so a broken auth config, or a file that is not a valid agent object,
     /// is reported and the live agent is kept. The user is told why.
+    #[cfg(test)]
     pub(crate) fn may_replace_agent(&mut self, agent_name: Option<&str>) -> bool {
-        let problem = match agent_name {
-            None => SessionOptions::config_problem(),
-            Some(name) => shai_core::config::agent::AgentConfig::load(name)
-                .err()
-                .map(|error| error.to_string()),
-        };
-        self.may_replace_agent_given(problem)
+        self.prepared_replacement(agent_name).is_some()
     }
 
     /// [`App::may_replace_agent`] for an agent on the auth config, given what
     /// is wrong with that config file, if anything.
+    #[cfg(test)]
     fn may_replace_agent_given(&mut self, config_problem: Option<String>) -> bool {
         match config_problem {
             Some(problem) => {
@@ -315,11 +384,52 @@ impl App<'_> {
         &mut self,
         agent_name: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        if !self.may_replace_agent(agent_name) {
+        self.replace_running_agent(agent_name, true).await
+    }
+
+    /// Load the replacement once, then install it. The agent or auth file
+    /// is not read again after this returns the snapshot.
+    pub async fn replace_running_agent(
+        &mut self,
+        agent_name: Option<&str>,
+        keep_current_trace: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(prepared) = self.prepared_replacement(agent_name) else {
             return Ok(false);
-        }
-        let trace = if let Some(ref agent) = self.agent {
-            agent.controller.get_trace().await.ok()
+        };
+        self.install_replacement(prepared, keep_current_trace).await
+    }
+
+    /// Build the replacement from a snapshot already loaded, then tear the
+    /// live agent down only after that build succeeds. Construction does
+    /// not read the agent or auth file again, so a change on disk between
+    /// preflight and install cannot leave the session without an agent.
+    /// If the build fails, the live agent and its trace are kept.
+    ///
+    /// Install after a successful build does not fail: it only updates the
+    /// UI, arms prewalk, and spawns the already-built agent. There is
+    /// therefore no post-teardown path that would need to reinstate the
+    /// previous agent.
+    pub(crate) async fn install_replacement(
+        &mut self,
+        prepared: PreparedAgent,
+        keep_current_trace: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let built = match self.build_agent(prepared).await {
+            Ok(built) => built,
+            Err(error) => {
+                self.session_notices
+                    .push(format!("the agent was not replaced: {error}"));
+                return Ok(false);
+            }
+        };
+
+        let trace = if keep_current_trace {
+            if let Some(ref agent) = self.agent {
+                agent.controller.get_trace().await.ok()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -329,7 +439,7 @@ impl App<'_> {
             let _ = agent.handle.await;
         }
 
-        self.start_agent(agent_name).await?;
+        self.install_built(built).await;
 
         if let Some(trace) = trace {
             if let Some(ref agent) = self.agent {
@@ -641,6 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_switch_is_shown_and_ends_the_handoff() {
+        let _guard = CONFIG_HOME_LOCK.lock().await;
         let mut app = app_with(prewalk());
         assert!(app.session_options.prewalk_pending());
 
@@ -661,6 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_events_leave_the_handoff_armed() {
+        let _guard = CONFIG_HOME_LOCK.lock().await;
         let mut app = app_with(prewalk());
 
         app.handle_agent_event(AgentEvent::TokenUsage {
@@ -679,6 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_switch_whose_event_was_lost_is_still_shown_once() {
+        let _guard = CONFIG_HOME_LOCK.lock().await;
         // An agent hands off, and its announcement never reaches the loop:
         // the loop fell behind, or the agent was replaced first.
         let handoff = prewalk();
@@ -702,6 +815,7 @@ mod tests {
 
     #[test]
     fn an_agent_is_not_replaced_by_one_that_could_not_start() {
+        let _guard = CONFIG_HOME_LOCK.blocking_lock();
         let mut app = App::new();
         assert!(app.may_replace_agent_given(None));
         assert!(app.session_notices.is_empty());
@@ -716,6 +830,7 @@ mod tests {
 
     #[test]
     fn waiting_session_notices_are_shown_and_cleared() {
+        let _guard = CONFIG_HOME_LOCK.blocking_lock();
         let mut app = App::new();
         app.show_session_notices();
         assert!(app.renderer.history().raw_text().is_empty());
@@ -813,10 +928,10 @@ mod tests {
     async fn a_failed_reload_keeps_the_live_agent_and_session() {
         let home =
             broken_auth_home(r#"{"name": "reviewer", "description": "needs the auth config"}"#);
-        let mut app = App::new();
-        attach_live_agent(&mut app);
         let _guard = CONFIG_HOME_LOCK.lock().await;
         let previous = set_config_home(home.path());
+        let mut app = App::new();
+        attach_live_agent(&mut app);
         let replaced = app.swap_agent(Some("reviewer")).await.unwrap();
         restore_config_home(previous);
         drop(_guard);
@@ -858,8 +973,69 @@ mod tests {
                 }
             }"#,
         );
+        with_config_home(home.path(), || {
+            let mut app = App::new();
+            assert!(app.may_replace_agent(Some("reviewer")));
+            assert!(app.session_notices.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn a_prepared_replacement_does_not_reread_the_agent_file() {
+        let home = broken_auth_home(
+            r#"{
+                "name": "reviewer",
+                "description": "has its own provider",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        );
+        let agent_file = home
+            .path()
+            .join("shai")
+            .join("agents")
+            .join("reviewer.config.json");
+
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let previous = set_config_home(home.path());
         let mut app = App::new();
-        assert!(with_config_home(home.path(), || app.may_replace_agent(Some("reviewer"))));
-        assert!(app.session_notices.is_empty());
+        attach_live_agent(&mut app);
+
+        let prepared = app
+            .prepared_replacement(Some("reviewer"))
+            .expect("the reviewer snapshot should load");
+
+        // A later start_agent / AgentConfig::load would fail: the file is gone.
+        std::fs::remove_file(&agent_file).unwrap();
+        assert!(!agent_file.exists());
+
+        let replaced = app
+            .install_replacement(prepared, true)
+            .await
+            .expect("install from the snapshot should not error");
+        restore_config_home(previous);
+        drop(_guard);
+
+        assert!(
+            replaced,
+            "the snapshot must be enough to start the replacement; notices={:?}",
+            app.session_notices
+        );
+        assert!(app.agent.is_some(), "the session must still have an agent");
+        assert_eq!(app.agent_meta.name(), Some("reviewer"));
+        assert_eq!(app.agent_meta.model(), "gpt-4o");
+        assert_eq!(
+            app.agent_state.session_manager().session_id(),
+            "live-session-1"
+        );
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
     }
 }

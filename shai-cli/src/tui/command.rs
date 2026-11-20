@@ -266,21 +266,25 @@ impl CommandRegistry {
 
                             if let Some(session) = selected {
                                 let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                                if !app.may_replace_agent(agent_name.as_deref()) {
+                                let Some(prepared) =
+                                    app.prepared_replacement(agent_name.as_deref())
+                                else {
                                     return Ok(());
-                                }
+                                };
                                 app.notify(
                                     &format!("Restoring session {}...", &session.session_id[..8]),
                                     Duration::from_secs(2),
                                 );
 
-                                if let Some(agent) = app.agent.take() {
-                                    let _ = agent.controller.terminate().await;
+                                if !app
+                                    .install_replacement(prepared, false)
+                                    .await
+                                    .map_err(|e| {
+                                        io::Error::other(format!("Failed to start agent: {}", e))
+                                    })?
+                                {
+                                    return Ok(());
                                 }
-
-                                app.start_agent(agent_name.as_deref()).await.map_err(|e| {
-                                    io::Error::other(format!("Failed to start agent: {}", e))
-                                })?;
 
                                 if let Some(ref agent) = app.agent {
                                     let _ =
@@ -348,21 +352,21 @@ impl CommandRegistry {
                 Ok(sessions) if !sessions.is_empty() => {
                     let session = &sessions[0];
                     let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                    if !app.may_replace_agent(agent_name.as_deref()) {
+                    let Some(prepared) = app.prepared_replacement(agent_name.as_deref()) else {
                         return Ok(());
-                    }
+                    };
                     app.notify(
                         &format!("Restoring session {}...", &session.session_id[..8]),
                         Duration::from_secs(2),
                     );
 
-                    if let Some(agent) = app.agent.take() {
-                        let _ = agent.controller.terminate().await;
-                    }
-
-                    app.start_agent(agent_name.as_deref())
+                    if !app
+                        .install_replacement(prepared, false)
                         .await
-                        .map_err(|e| io::Error::other(format!("Failed to start agent: {}", e)))?;
+                        .map_err(|e| io::Error::other(format!("Failed to start agent: {}", e)))?
+                    {
+                        return Ok(());
+                    }
 
                     if let Some(ref agent) = app.agent {
                         let _ = agent.controller.load_trace(session.trace.clone()).await;
@@ -455,32 +459,14 @@ impl CommandRegistry {
                 auth.run().await;
                 app.resume_event_reader();
 
-                if !app.may_replace_agent(agent_name.as_deref()) {
-                    return Ok(());
-                }
-
-                let trace = if let Some(ref agent) = app.agent {
-                    agent.controller.get_trace().await.ok()
-                } else {
-                    None
-                };
-
-                if let Some(agent) = app.agent.take() {
-                    let _ = agent.controller.terminate().await;
-                    let _ = agent.handle.await;
-                }
-
-                // Recreate agent. `start_agent` resolves what the session was
-                // asked for against the config as it is now.
-                match app.start_agent(agent_name.as_deref()).await {
-                    Ok(_) => {
-                        if let Some(trace) = trace {
-                            if let Some(ref agent) = app.agent {
-                                let _ = agent.controller.load_trace(trace).await;
-                            }
-                        }
+                // Recreate the agent from a snapshot taken after the auth
+                // TUI, built before the live agent is torn down, so a later
+                // change on disk cannot leave the session without one.
+                match app.swap_agent(agent_name.as_deref()).await {
+                    Ok(true) => {
                         app.notify("Provider configuration updated", Duration::from_secs(2));
                     }
+                    Ok(false) => {}
                     // Say why there is no agent, instead of reporting an
                     // update that started nothing.
                     Err(error) => app

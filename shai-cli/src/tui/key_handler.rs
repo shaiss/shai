@@ -80,21 +80,24 @@ impl App<'_> {
                         let trace = session.trace.clone();
 
                         let agent_name = self.agent_meta.name().map(|s| s.to_string());
-                        if !self.may_replace_agent(agent_name.as_deref()) {
+                        let Some(prepared) = self.prepared_replacement(agent_name.as_deref())
+                        else {
                             return Ok(());
-                        }
+                        };
                         self.input.alert_msg(
                             &format!("Restoring session {}...", &session_id[..8]),
                             Duration::from_secs(2),
                         );
 
-                        if let Some(agent) = self.agent.take() {
-                            let _ = agent.controller.terminate().await;
+                        if !self
+                            .install_replacement(prepared, false)
+                            .await
+                            .map_err(|e| {
+                                io::Error::other(format!("Failed to start agent: {}", e))
+                            })?
+                        {
+                            return Ok(());
                         }
-
-                        self.start_agent(agent_name.as_deref()).await.map_err(|e| {
-                            io::Error::other(format!("Failed to start agent: {}", e))
-                        })?;
 
                         if let Some(ref agent) = self.agent {
                             let _ = agent.controller.load_trace(trace.clone()).await;

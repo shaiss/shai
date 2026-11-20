@@ -82,13 +82,6 @@ impl SessionOptions {
         }
     }
 
-    /// What is wrong with the user's config file, when it is there and cannot
-    /// be read. The rule of start-up holds for every agent a session starts
-    /// later: such a file is not replaced by the built-in default.
-    pub fn config_problem() -> Option<String> {
-        Self::unreadable(ShaiConfig::load_for_roles().as_ref())
-    }
-
     /// The config an agent without its own provider runs on, loaded once.
     ///
     /// The built-in default stands in only when there is no config file. A
