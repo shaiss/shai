@@ -604,8 +604,9 @@ mod broken_config_fallback_tests {
 
     #[test]
     fn load_with_primary_uses_the_startup_snapshot_when_auth_is_broken() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let shai = dir.path().join("shai");
         std::fs::create_dir_all(shai.join("agents")).unwrap();

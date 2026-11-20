@@ -526,6 +526,9 @@ mod tests {
 
     #[test]
     fn test_env_derived_config_is_persisted() {
+        let _guard = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::TempDir::new().unwrap();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         std::env::set_var("XDG_CONFIG_HOME", temp.path());
