@@ -10,7 +10,7 @@ use crate::apis;
 use crate::session::{SessionManager, SessionManagerConfig};
 
 /// Configuration for the HTTP server
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Server bind address (e.g., "127.0.0.1:8080")
     pub address: String,
@@ -50,6 +50,15 @@ impl ServerConfig {
     pub fn with_primary_config(mut self, primary: shai_core::config::config::ShaiConfig) -> Self {
         self.session_manager.primary = Some(std::sync::Arc::new(primary));
         self
+    }
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("address", &self.address)
+            .field("session_manager", &self.session_manager)
+            .finish()
     }
 }
 
@@ -149,4 +158,24 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+    use shai_core::config::config::ShaiConfig;
+
+    #[test]
+    fn debug_does_not_contain_the_auth_config_key() {
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"sk-test-do-not-leak"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let config = ServerConfig::new("127.0.0.1:0".into()).with_primary_config(snapshot);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("sk-test-do-not-leak"),
+            "Debug leaked the key: {debug}"
+        );
+    }
 }
