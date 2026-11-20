@@ -45,6 +45,12 @@ impl ServerConfig {
         self.session_manager.max_sessions = max_sessions;
         self
     }
+
+    /// Use this already-loaded auth config for every default HTTP session.
+    pub fn with_primary_config(mut self, primary: shai_core::config::config::ShaiConfig) -> Self {
+        self.session_manager.primary = Some(std::sync::Arc::new(primary));
+        self
+    }
 }
 
 /// Server state holding the session manager

@@ -575,6 +575,16 @@ impl ShaiConfig {
         Self::primary_from(Self::load_for_roles())
     }
 
+    /// The caller's already-loaded config, or a fresh [`ShaiConfig::primary`]
+    /// load if they have not passed one. Serve uses this so HTTP sessions
+    /// keep the startup snapshot instead of reading the file again.
+    pub fn from_snapshot_or_primary(primary: Option<&ShaiConfig>) -> Result<ShaiConfig, String> {
+        match primary {
+            Some(config) => Ok(config.clone()),
+            None => Self::primary(),
+        }
+    }
+
     /// [`ShaiConfig::primary`] from an already-attempted load.
     pub fn primary_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
         match config {
@@ -1096,6 +1106,15 @@ mod tests {
         assert!(error.contains("auth.config.json"), "{error}");
         assert!(error.contains("could not be loaded"), "{error}");
         assert!(!error.to_lowercase().contains("ovh"), "{error}");
+
+        // A caller that already holds a good snapshot must not reread the
+        // now-broken file.
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"snapshot-model","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let loaded = ShaiConfig::from_snapshot_or_primary(Some(&snapshot)).unwrap();
+        assert_eq!(loaded.providers[0].model, "snapshot-model");
     }
 
     #[test]

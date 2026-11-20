@@ -41,9 +41,18 @@ impl AgentBuilder {
     /// If None, creates a default agent with LLM from ShaiConfig
     /// If Some(name), loads agent from config file
     pub async fn create(config_name: Option<String>) -> Result<Self, AgentError> {
+        Self::create_with_primary(config_name, None).await
+    }
+
+    /// [`AgentBuilder::create`], using an already-loaded auth config so the
+    /// file is not read again (the HTTP server passes the startup snapshot).
+    pub async fn create_with_primary(
+        config_name: Option<String>,
+        primary: Option<&ShaiConfig>,
+    ) -> Result<Self, AgentError> {
         match config_name {
             Some(name) => {
-                let config = AgentConfig::load(&name).map_err(|e| {
+                let config = AgentConfig::load_with_primary(&name, primary).map_err(|e| {
                     AgentError::ConfigurationError(format!(
                         "Failed to load agent '{}': {}",
                         name, e
@@ -51,16 +60,23 @@ impl AgentBuilder {
                 })?;
                 Self::from_config(config).await
             }
-            None => Self::default().await,
+            None => Self::default_from(primary).await,
         }
     }
 
     /// Create a default AgentBuilder using ShaiConfig LLM and default tools
     pub async fn default() -> Result<Self, AgentError> {
+        Self::default_from(None).await
+    }
+
+    /// [`AgentBuilder::default`] from an already-loaded config, or a fresh
+    /// [`ShaiConfig::primary`] load if none is passed.
+    pub async fn default_from(primary: Option<&ShaiConfig>) -> Result<Self, AgentError> {
         // Same rule as the TUI and headless mode: the built-in default is
         // used only when there is no config file. A file that is there and
         // cannot be read is an error, never a silent fallback.
-        let config = ShaiConfig::primary().map_err(AgentError::ConfigurationError)?;
+        let config = ShaiConfig::from_snapshot_or_primary(primary)
+            .map_err(AgentError::ConfigurationError)?;
         let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;

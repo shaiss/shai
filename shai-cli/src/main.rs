@@ -794,13 +794,16 @@ async fn handle_serve(
     max_sessions: Option<usize>,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The default agent is built later with AgentBuilder::default. Refuse to
-    // start if the auth config is there and cannot be read, so a typo never
-    // silently runs the built-in default model.
-    if let Err(error) = SessionOptions::primary_config() {
-        eprintln!("error: {}", error);
-        std::process::exit(2);
-    }
+    // Load the auth config once: refuse to start if the file is there and
+    // cannot be read, and pass the same snapshot to every HTTP session so
+    // a later edit cannot change credentials or silently fall back.
+    let primary = match SessionOptions::primary_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {}", error);
+            std::process::exit(2);
+        }
+    };
 
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
@@ -815,7 +818,8 @@ async fn handle_serve(
     let config = shai_http::ServerConfig::new(addr)
         .with_ephemeral(ephemeral)
         .with_max_sessions(max_sessions)
-        .with_allow_all_tools(yes);
+        .with_allow_all_tools(yes)
+        .with_primary_config(primary);
 
     shai_http::start_server(config).await?;
 

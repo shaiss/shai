@@ -7,6 +7,7 @@ use tracing::{error, info};
 
 use crate::session::{log_event, logger::colored_session_id};
 use shai_core::agent::AgentBuilder;
+use shai_core::config::config::ShaiConfig;
 use shai_core::session::SessionPersist;
 
 use super::AgentSession;
@@ -23,6 +24,9 @@ pub struct SessionManagerConfig {
     /// uses the network is denied at once: HTTP clients cannot answer a
     /// permission prompt.
     pub allow_all_tools: bool,
+    /// Auth config loaded at serve startup. Sessions build default agents
+    /// from this snapshot instead of reading the file again.
+    pub primary: Option<Arc<ShaiConfig>>,
 }
 
 impl Default for SessionManagerConfig {
@@ -31,6 +35,7 @@ impl Default for SessionManagerConfig {
             max_sessions: Some(100),
             ephemeral: false,
             allow_all_tools: false,
+            primary: None,
         }
     }
 }
@@ -42,6 +47,7 @@ pub struct SessionManager {
     max_sessions: Option<usize>,
     ephemeral: bool,
     allow_all_tools: bool,
+    primary: Option<Arc<ShaiConfig>>,
 }
 
 impl SessionManager {
@@ -51,6 +57,7 @@ impl SessionManager {
             max_sessions: config.max_sessions,
             ephemeral: config.ephemeral,
             allow_all_tools: config.allow_all_tools,
+            primary: config.primary,
         }
     }
 
@@ -83,10 +90,14 @@ impl SessionManager {
             colored_session_id(session_id)
         );
 
-        // Build the agent with the server's tool policy and optional trace
-        let builder = AgentBuilder::create(agent_name.clone().filter(|name| name != "default"))
-            .await
-            .map_err(|e| AgentError::ExecutionError(format!("Failed to create agent: {}", e)))?;
+        // Build the agent from the startup config snapshot so a later edit
+        // of the auth file cannot change credentials mid-server.
+        let builder = AgentBuilder::create_with_primary(
+            agent_name.clone().filter(|name| name != "default"),
+            self.primary.as_deref(),
+        )
+        .await
+        .map_err(|e| AgentError::ExecutionError(format!("Failed to create agent: {}", e)))?;
 
         let mut agent = self.prepare_agent(builder, trace).build();
 
@@ -447,5 +458,24 @@ mod tests {
         assert!(result.is_success(), "{result:?}");
         assert!(marker.exists(), "bash did not run with --yes");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sessions_keep_the_startup_config_snapshot() {
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"snapshot-model","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let manager = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot)),
+            ..SessionManagerConfig::default()
+        });
+        assert_eq!(
+            manager.primary.as_ref().unwrap().providers[0].model,
+            "snapshot-model"
+        );
+        // create_session passes this snapshot to AgentBuilder::create_with_primary;
+        // a later change to the auth file is not reread.
+        assert!(manager.primary.is_some());
     }
 }
