@@ -229,6 +229,32 @@ impl LlmClient {
         .map(ProviderSettings::into_client)
     }
 
+    /// Create a provider from `env_values` alone, still applying the built-in
+    /// defaults [`LlmClient::create_provider`] uses when a setting is omitted
+    /// (Ollama's localhost URL, anonymous OVHcloud).
+    ///
+    /// Unlike [`LlmClient::create_provider`], a missing setting is never read
+    /// from the process environment. Use this when the map is already the
+    /// environment the client should see, for example a replacement built
+    /// from the original user env plus the new provider's config.
+    ///
+    /// No network I/O is performed.
+    pub fn create_provider_from_map(
+        provider_name: &str,
+        env_values: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, LlmError> {
+        Self::settings_from_map(provider_name, SettingsSource::ConfigOrEnv, env_values)
+            .map(ProviderSettings::into_client)
+    }
+
+    fn settings_from_map(
+        provider_name: &str,
+        source: SettingsSource,
+        env_values: &std::collections::HashMap<String, String>,
+    ) -> Result<ProviderSettings, LlmError> {
+        ProviderSettings::resolve(provider_name, source, &|key| env_values.get(key).cloned())
+    }
+
     /// Create a provider from `env_values` alone.
     ///
     /// Unlike [`LlmClient::create_provider`], a setting missing from
@@ -1026,7 +1052,7 @@ mod retry_logic {
 
 #[cfg(test)]
 mod provider_settings_tests {
-    use super::{test_env, LlmClient, ProviderSettings};
+    use super::{test_env, LlmClient, ProviderSettings, SettingsSource};
     use std::collections::HashMap;
 
     /// Every key a provider reads, each with a value, as the process
@@ -1078,6 +1104,40 @@ mod provider_settings_tests {
                     "{provider} should be built from the environment"
                 );
             }
+        });
+    }
+
+    fn from_map(provider: &str, entry: &[(&str, &str)]) -> Result<ProviderSettings, String> {
+        LlmClient::settings_from_map(provider, SettingsSource::ConfigOrEnv, &vars(entry))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn create_provider_from_map_does_not_read_process_env() {
+        test_env::with(FULL_ENV, || {
+            use ProviderSettings::*;
+            let url = "http://127.0.0.1:9/v1".to_string();
+
+            assert_eq!(
+                from_map("ollama", &[("OLLAMA_BASE_URL", "http://127.0.0.1:9/v1")]),
+                Ok(Ollama {
+                    base_url: url,
+                    api_key: None,
+                })
+            );
+            // An omitted optional key must stay omitted even if the process
+            // environment has one. Built-in defaults still apply.
+            assert_eq!(
+                from_map("ovhcloud", &[]),
+                Ok(OvhCloud {
+                    api_key: String::new(),
+                    base_url: None,
+                })
+            );
+            assert!(
+                from_map("openai", &[]).is_err(),
+                "a required key missing from the map must not come from the environment"
+            );
         });
     }
 
