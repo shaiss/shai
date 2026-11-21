@@ -1,0 +1,11 @@
+# Pin the compiler used for shaiss/shai fork releases (and local/CI cargo
+# in this tree). main's release.yml installed the floating `stable`
+# channel; this repository had no rust-toolchain file and no rust-version
+# in any Cargo.toml.
+#
+# 1.100.0 is current stable (released 2026-11-12) and is the rustc this
+# fork already dogfoods: shaiss/shai CI Build run 44837052958, job
+# 136636005806 (2026-11-20) logged "rustc 1.100.0 (0ef1bc386 2026-11-09)".
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
