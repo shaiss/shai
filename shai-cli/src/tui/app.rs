@@ -332,6 +332,7 @@ impl App<'_> {
             .session_manager_mut()
             .set_session_id(&session.session_id);
 
+        // Signals were reset in `try_run` before this agent was started.
         if let Some(ref agent) = self.agent {
             let _ = agent.controller.load_trace(session.trace.clone()).await;
         }
@@ -415,6 +416,29 @@ impl App<'_> {
         prepared: PreparedAgent,
         keep_current_trace: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.finish_replacement(prepared, keep_current_trace, false)
+            .await
+    }
+
+    /// Install a replacement for a restored conversation.
+    ///
+    /// The prewalk trigger starts over only after the replacement has been
+    /// built, and before it is armed, so the new agent holds empty signals.
+    /// If the build fails, the live agent is kept and its signals and the
+    /// spent one-shot latch are left as they are.
+    pub(crate) async fn install_restored_agent(
+        &mut self,
+        prepared: PreparedAgent,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.finish_replacement(prepared, false, true).await
+    }
+
+    async fn finish_replacement(
+        &mut self,
+        prepared: PreparedAgent,
+        keep_current_trace: bool,
+        reset_prewalk: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let built = match self.build_agent(prepared).await {
             Ok(built) => built,
             Err(error) => {
@@ -423,6 +447,13 @@ impl App<'_> {
                 return Ok(false);
             }
         };
+
+        // Reset only once the replacement is known to start, and before
+        // install arms the new agent. A reset after arm would leave the
+        // running agent holding the previous conversation's signals.
+        if reset_prewalk {
+            self.session_options.reset_prewalk_signals();
+        }
 
         let trace = if keep_current_trace {
             if let Some(ref agent) = self.agent {
@@ -603,6 +634,12 @@ impl App<'_> {
         restore_session_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let agent_name_ref = agent_name.as_deref();
+        // A restored conversation starts the trigger over. Reset before the
+        // agent is armed, so it holds the new empty signals; after start the
+        // agent runs in another task and cannot be given a new Arc.
+        if restore_session_id.is_some() {
+            self.session_options.reset_prewalk_signals();
+        }
         let banner =
             self.start_agent(agent_name_ref)
                 .await
@@ -1031,6 +1068,149 @@ mod tests {
         assert_eq!(
             app.agent_state.session_manager().session_id(),
             "live-session-1"
+        );
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+    }
+
+    fn due_prewalk() -> Prewalk {
+        let prewalk = prewalk();
+        prewalk.record_success("write", None);
+        prewalk.record_success("todo_write", Some(1));
+        assert!(prewalk.trigger_is_due());
+        assert!(!prewalk.is_spent());
+        prewalk
+    }
+
+    fn primary_without_a_provider() -> PreparedAgent {
+        PreparedAgent::Primary(
+            serde_json::from_str(r#"{"providers":[],"selected_provider":0}"#)
+                .expect("empty-provider config should deserialize"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_restored_replacement_does_not_reset_prewalk_signals() {
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let mut app = App::new();
+        let prewalk = due_prewalk();
+        app.session_options = SessionOptions::with_prewalk(prewalk.clone());
+        attach_live_agent(&mut app);
+
+        let replaced = app
+            .install_restored_agent(primary_without_a_provider())
+            .await
+            .unwrap();
+
+        assert!(!replaced);
+        assert!(
+            app.agent.is_some(),
+            "the live agent must survive a failed restore replacement"
+        );
+        let kept = app.session_options.prewalk().expect("prewalk still set");
+        assert!(
+            kept.trigger_is_due(),
+            "a failed replacement must not start the trigger over"
+        );
+        assert!(!kept.is_spent(), "the latch must stay unspent");
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_restored_replacement_starts_the_trigger_over() {
+        let home = broken_auth_home(
+            r#"{
+                "name": "reviewer",
+                "description": "has its own provider",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        );
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let previous = set_config_home(home.path());
+        let mut app = App::new();
+        let prewalk = due_prewalk();
+        app.session_options = SessionOptions::with_prewalk(prewalk.clone());
+        attach_live_agent(&mut app);
+
+        let prepared = app
+            .prepared_replacement(Some("reviewer"))
+            .expect("the reviewer snapshot should load");
+        let replaced = app
+            .install_restored_agent(prepared)
+            .await
+            .expect("install from the snapshot should not error");
+        restore_config_home(previous);
+        drop(_guard);
+
+        assert!(replaced);
+        let restored = app.session_options.prewalk().expect("prewalk still set");
+        assert!(
+            !restored.trigger_is_due(),
+            "the restored agent must start the trigger over"
+        );
+        assert!(!restored.is_spent(), "the one-shot latch must stay unspent");
+        // The previous conversation's copy still has the old signals.
+        assert!(prewalk.trigger_is_due());
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_restored_replacement_keeps_a_spent_latch() {
+        let home = broken_auth_home(
+            r#"{
+                "name": "reviewer",
+                "description": "has its own provider",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        );
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let previous = set_config_home(home.path());
+        let mut app = App::new();
+        let prewalk = prewalk();
+        hand_off(&prewalk, true).await;
+        assert!(prewalk.is_spent());
+        app.session_options = SessionOptions::with_prewalk(prewalk.clone());
+        attach_live_agent(&mut app);
+
+        let prepared = app
+            .prepared_replacement(Some("reviewer"))
+            .expect("the reviewer snapshot should load");
+        let replaced = app
+            .install_restored_agent(prepared)
+            .await
+            .expect("install from the snapshot should not error");
+        restore_config_home(previous);
+        drop(_guard);
+
+        assert!(replaced);
+        assert!(
+            prewalk.is_spent(),
+            "resetting signals must not revive a spent latch"
+        );
+        assert!(
+            !app.session_options.prewalk_pending(),
+            "a spent handoff is not armed again on the restored agent"
         );
 
         if let Some(agent) = app.agent.take() {

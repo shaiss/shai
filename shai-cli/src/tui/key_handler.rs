@@ -89,13 +89,9 @@ impl App<'_> {
                             Duration::from_secs(2),
                         );
 
-                        if !self
-                            .install_replacement(prepared, false)
-                            .await
-                            .map_err(|e| {
-                                io::Error::other(format!("Failed to start agent: {}", e))
-                            })?
-                        {
+                        if !self.install_restored_agent(prepared).await.map_err(|e| {
+                            io::Error::other(format!("Failed to start agent: {}", e))
+                        })? {
                             return Ok(());
                         }
 

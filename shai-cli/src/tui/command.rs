@@ -276,13 +276,9 @@ impl CommandRegistry {
                                     Duration::from_secs(2),
                                 );
 
-                                if !app
-                                    .install_replacement(prepared, false)
-                                    .await
-                                    .map_err(|e| {
-                                        io::Error::other(format!("Failed to start agent: {}", e))
-                                    })?
-                                {
+                                if !app.install_restored_agent(prepared).await.map_err(|e| {
+                                    io::Error::other(format!("Failed to start agent: {}", e))
+                                })? {
                                     return Ok(());
                                 }
 
@@ -348,50 +344,50 @@ impl CommandRegistry {
                     app.notify("Failed to get current directory", Duration::from_secs(3));
                 }
             },
-            "/latest" => match shai_core::session::SessionPersist::list_sessions() {
-                Ok(sessions) if !sessions.is_empty() => {
-                    let session = &sessions[0];
-                    let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                    let Some(prepared) = app.prepared_replacement(agent_name.as_deref()) else {
-                        return Ok(());
-                    };
-                    app.notify(
-                        &format!("Restoring session {}...", &session.session_id[..8]),
-                        Duration::from_secs(2),
-                    );
+            "/latest" => {
+                match shai_core::session::SessionPersist::list_sessions() {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        let session = &sessions[0];
+                        let agent_name = app.agent_meta.name().map(|s| s.to_string());
+                        let Some(prepared) = app.prepared_replacement(agent_name.as_deref()) else {
+                            return Ok(());
+                        };
+                        app.notify(
+                            &format!("Restoring session {}...", &session.session_id[..8]),
+                            Duration::from_secs(2),
+                        );
 
-                    if !app
-                        .install_replacement(prepared, false)
-                        .await
-                        .map_err(|e| io::Error::other(format!("Failed to start agent: {}", e)))?
-                    {
-                        return Ok(());
+                        if !app.install_restored_agent(prepared).await.map_err(|e| {
+                            io::Error::other(format!("Failed to start agent: {}", e))
+                        })? {
+                            return Ok(());
+                        }
+
+                        if let Some(ref agent) = app.agent {
+                            let _ = agent.controller.load_trace(session.trace.clone()).await;
+                        }
+
+                        app.agent_state
+                            .session_manager_mut()
+                            .set_session_id(&session.session_id);
+                        app.render_restored_trace(&session.trace);
+
+                        app.notify(
+                            &format!("Session {} restored", &session.session_id[..8]),
+                            Duration::from_secs(2),
+                        );
                     }
-
-                    if let Some(ref agent) = app.agent {
-                        let _ = agent.controller.load_trace(session.trace.clone()).await;
+                    Ok(_) => {
+                        app.notify("No saved sessions found", Duration::from_secs(2));
                     }
-
-                    app.agent_state
-                        .session_manager_mut()
-                        .set_session_id(&session.session_id);
-                    app.render_restored_trace(&session.trace);
-
-                    app.notify(
-                        &format!("Session {} restored", &session.session_id[..8]),
-                        Duration::from_secs(2),
-                    );
+                    Err(e) => {
+                        app.notify(
+                            &format!("Failed to list sessions: {}", e),
+                            Duration::from_secs(3),
+                        );
+                    }
                 }
-                Ok(_) => {
-                    app.notify("No saved sessions found", Duration::from_secs(2));
-                }
-                Err(e) => {
-                    app.notify(
-                        &format!("Failed to list sessions: {}", e),
-                        Duration::from_secs(3),
-                    );
-                }
-            },
+            }
             "/skills" => {
                 let skills = shai_core::tools::skills::discovery::discover_skills();
                 if skills.is_empty() {
