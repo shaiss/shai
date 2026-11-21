@@ -252,7 +252,9 @@ impl LlmClient {
         source: SettingsSource,
         env_values: &std::collections::HashMap<String, String>,
     ) -> Result<ProviderSettings, LlmError> {
-        ProviderSettings::resolve(provider_name, source, &|key| env_values.get(key).cloned())
+        ProviderSettings::resolve(provider_name, source, &|key| {
+            env_values.get(env_map_key(key).as_ref()).cloned()
+        })
     }
 
     /// Create a provider from `env_values` alone.
@@ -298,6 +300,19 @@ impl LlmClient {
                 .cloned()
         })
         .map(IsolatedSettings)
+    }
+}
+
+/// Key used to look up an environment variable in a provider map.
+/// On Windows, names are case-insensitive, matching [`std::env::var`].
+fn env_map_key(name: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        std::borrow::Cow::Owned(name.to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(name)
     }
 }
 

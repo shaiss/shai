@@ -530,32 +530,59 @@ impl ShaiConfig {
     /// Process environment with live-provider exports removed, then `overlay`
     /// applied. On first start, before any [`Self::set_env_vars`], this is
     /// the process environment plus the entry's own values.
+    ///
+    /// Only UTF-8 names and values are kept, so an unrelated non-Unicode
+    /// variable cannot panic the start. [`APPLIED_ENV_VARS`] is walked newest
+    /// first, matching [`restore_env_vars`], so a name written twice is
+    /// restored to its original value. Keys are stored in the same form
+    /// [`LlmClient::create_provider_from_map`] uses when looking them up.
     pub(crate) fn env_vars_for_llm(overlay: &HashMap<String, String>) -> HashMap<String, String> {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        let mut env: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(name, value)| {
+                let name = name.into_string().ok()?;
+                let value = value.into_string().ok()?;
+                Some((env_map_key(&name).into_owned(), value))
+            })
+            .collect();
         {
             let applied = APPLIED_ENV_VARS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (name, previous) in applied.iter() {
+            for (name, previous) in applied.iter().rev() {
+                let name = env_map_key(name);
                 match previous {
                     Some(value) => match value.to_str() {
                         Some(value) => {
-                            env.insert(name.clone(), value.to_string());
+                            env.insert(name.into_owned(), value.to_string());
                         }
                         None => {
-                            env.remove(name);
+                            env.remove(name.as_ref());
                         }
                     },
                     None => {
-                        env.remove(name);
+                        env.remove(name.as_ref());
                     }
                 }
             }
         }
         for (name, value) in overlay {
-            env.insert(name.clone(), value.clone());
+            env.insert(env_map_key(name).into_owned(), value.clone());
         }
         env
+    }
+}
+
+/// Key used to store an environment variable in the map
+/// [`LlmClient::create_provider_from_map`] reads. On Windows, names are
+/// case-insensitive, matching [`std::env::var`].
+fn env_map_key(name: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        std::borrow::Cow::Owned(name.to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(name)
     }
 }
 
@@ -886,5 +913,47 @@ mod tests {
             Some(value) => std::env::set_var(URL, value),
             None => std::env::remove_var(URL),
         }
+    }
+
+    // An unrelated non-Unicode variable must not panic provider construction.
+    // vars() would; vars_os() plus a UTF-8 filter does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn env_vars_for_llm_skips_a_non_utf8_process_variable() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        const JUNK: &str = "SHAI_TEST_NON_UTF8_ENV";
+        struct RestoreOsVar {
+            name: &'static str,
+            previous: Option<OsString>,
+        }
+        impl Drop for RestoreOsVar {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+
+        let _restore = RestoreOsVar {
+            name: JUNK,
+            previous: std::env::var_os(JUNK),
+        };
+        std::env::set_var(JUNK, OsStr::from_bytes(&[0xff]));
+
+        let config = config_with("openai", &[("OPENAI_API_KEY", "test-key")]);
+        let env = ShaiConfig::env_vars_for_llm(&config.get_selected_provider().unwrap().env_vars);
+        let built = config.llm_from_config().await;
+
+        assert!(
+            !env.contains_key(JUNK),
+            "a non-UTF-8 process variable must not be collected"
+        );
+        let (_, model) =
+            built.expect("llm_from_config must not panic on an unrelated non-UTF-8 variable");
+        assert_eq!(model, "test-model");
     }
 }
