@@ -15,6 +15,9 @@ pub(crate) mod test_env {
 
     pub static XDG_CONFIG_HOME_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes tests that read or write `set_env_vars` / APPLIED_ENV_VARS.
+    pub static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Restores the previous `XDG_CONFIG_HOME` when dropped, including when
     /// a test panics. Keep this guard inside the lock scope so restoration
     /// finishes before another test can acquire the lock.

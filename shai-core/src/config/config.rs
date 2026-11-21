@@ -504,20 +504,33 @@ impl ShaiConfig {
         let Some(provider_config) = self.get_selected_provider() else {
             return Err("No provider configured".into());
         };
-        let env_vars = Self::env_vars_for_llm(provider_config);
-        let llm = LlmClient::create_provider_from_map(&provider_config.provider, &env_vars)
-            .map_err(|e| {
-                format!(
-                    "Failed to create {} client: {}",
-                    provider_config.provider, e
-                )
-            })?;
-        Ok((llm, provider_config.model.clone()))
+        Self::llm_from_provider_env(
+            &provider_config.provider,
+            &provider_config.env_vars,
+            &provider_config.model,
+        )
     }
 
-    /// Process environment with live-provider exports removed, then the
-    /// selected provider's own `env_vars` overlaid.
-    fn env_vars_for_llm(provider_config: &ProviderConfig) -> HashMap<String, String> {
+    /// Build an LLM client from a provider entry without writing process env.
+    ///
+    /// Omitted settings are resolved against the original user environment,
+    /// then `env_vars` are applied. The model is `model`, not `SHAI_MODEL`.
+    /// Used by [`Self::llm_from_config`] and by named-agent construction.
+    pub(crate) fn llm_from_provider_env(
+        provider: &str,
+        env_vars: &HashMap<String, String>,
+        model: &str,
+    ) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
+        let env = Self::env_vars_for_llm(env_vars);
+        let llm = LlmClient::create_provider_from_map(provider, &env)
+            .map_err(|e| format!("Failed to create {provider} client: {e}"))?;
+        Ok((llm, model.to_string()))
+    }
+
+    /// Process environment with live-provider exports removed, then `overlay`
+    /// applied. On first start, before any [`Self::set_env_vars`], this is
+    /// the process environment plus the entry's own values.
+    pub(crate) fn env_vars_for_llm(overlay: &HashMap<String, String>) -> HashMap<String, String> {
         let mut env: HashMap<String, String> = std::env::vars().collect();
         {
             let applied = APPLIED_ENV_VARS
@@ -539,7 +552,7 @@ impl ShaiConfig {
                 }
             }
         }
-        for (name, value) in &provider_config.env_vars {
+        for (name, value) in overlay {
             env.insert(name.clone(), value.clone());
         }
         env
@@ -680,7 +693,7 @@ mod tests {
     // Serializes tests that read or write APPLIED_ENV_VARS / set_env_vars.
     // Unique variable names are not enough: undo_set_env_vars drains the
     // whole tracked list, which would drop another test's writes.
-    static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::config::test_env::ENV_TEST_LOCK;
 
     fn config_with_model(provider: &str, env: &[(&str, &str)], model: &str) -> ShaiConfig {
         let mut config = config_with(provider, env);
@@ -838,7 +851,8 @@ mod tests {
         assert_eq!(std::env::var(KEY).as_deref(), Ok("live-key"));
 
         let replacement = config_with("ollama", &[(URL, "http://replacement.example/v1")]);
-        let env = ShaiConfig::env_vars_for_llm(replacement.get_selected_provider().unwrap());
+        let env =
+            ShaiConfig::env_vars_for_llm(&replacement.get_selected_provider().unwrap().env_vars);
         assert_eq!(
             env.get(KEY),
             None,
@@ -859,7 +873,8 @@ mod tests {
         std::env::set_var(KEY, "user-key");
         live.set_env_vars();
         assert_eq!(std::env::var(KEY).as_deref(), Ok("live-key"));
-        let env = ShaiConfig::env_vars_for_llm(replacement.get_selected_provider().unwrap());
+        let env =
+            ShaiConfig::env_vars_for_llm(&replacement.get_selected_provider().unwrap().env_vars);
         assert_eq!(env.get(KEY).map(String::as_str), Some("user-key"));
 
         undo_set_env_vars();
