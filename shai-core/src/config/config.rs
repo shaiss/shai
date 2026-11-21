@@ -305,11 +305,17 @@ impl ShaiConfig {
 
     /// Set environment variables from the currently selected provider.
     ///
+    /// The user's process environment is snapshotted first, before any
+    /// variable is written, so a role or prewalk client can fill a missing
+    /// official-endpoint API key from what the user exported, never from
+    /// values this method writes.
+    ///
     /// Variables set by a previous call are first put back to what the process
     /// had before, so switching providers never leaves the old provider's values
     /// (e.g. an `OLLAMA_API_KEY`) behind for the env fallback to pick up.
     /// Variables the user exported themselves are left as they were.
     pub fn set_env_vars(&self) {
+        super::user_env::capture_user_env();
         let mut applied = APPLIED_ENV_VARS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

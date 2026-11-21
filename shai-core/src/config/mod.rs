@@ -5,6 +5,7 @@ pub mod prewalk;
 pub mod roles;
 pub(crate) mod section;
 pub mod tui;
+mod user_env;
 
 /// Serializes unit tests that mutate process-wide `XDG_CONFIG_HOME`.
 /// Integration tests (`tests/*.rs`) are a separate process and do not share it.
