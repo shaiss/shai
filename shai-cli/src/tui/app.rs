@@ -1435,4 +1435,42 @@ mod tests {
             "a pump that keeps receiving must not lose events to broadcast lag"
         );
     }
+
+    #[tokio::test]
+    async fn held_events_are_replayed_when_a_replacement_fails() {
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let mut app = App::new();
+        let (txcmd, _rxcmd) =
+            tokio::sync::mpsc::unbounded_channel::<shai_core::agent::protocol::SentCommand>();
+        let (tx, rx) = broadcast::channel(16);
+        app.agent = Some(AppRunningAgent {
+            handle: tokio::spawn(async {}),
+            controller: shai_core::agent::AgentController { txcmd },
+            events: rx,
+            tools: Vec::new(),
+            identity: std::sync::Arc::new(()),
+        });
+
+        let _ = tx.send(AgentEvent::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cached_tokens: 0,
+        });
+        assert_eq!(app.agent_state.token_counter().input_tokens(), 0);
+        assert_eq!(app.agent_state.token_counter().output_tokens(), 0);
+
+        let replaced = app
+            .install_restored_agent(primary_without_a_provider())
+            .await
+            .expect("a failed build is reported, not a hard error");
+
+        assert!(!replaced);
+        assert!(app.agent.is_some(), "the live agent must be kept");
+        assert_eq!(
+            app.agent_state.token_counter().input_tokens(),
+            7,
+            "held events must be replayed onto the kept agent"
+        );
+        assert_eq!(app.agent_state.token_counter().output_tokens(), 3);
+    }
 }
