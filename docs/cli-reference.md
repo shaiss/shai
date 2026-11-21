@@ -20,13 +20,14 @@ These flags work with most commands.
 | `--remove <list>` | Remove specific tools (comma-separated, headless mode), also from the `--agent`'s tools. MCP tools are removed as `<server>:<tool>` |
 | `--yes` | Headless mode only: allow tools that write files, run bash or use the network. Without it, headless runs only read-only tools and denies the rest (see [Headless permissions](#headless-permissions)) |
 | `--list-tools` | List all available tools |
+| `--default-shai-config-url <url>` | Opt-in URL of a starter auth config to download when none exists. There is no default URL. A failed pull writes nothing; the built-in anonymous default is never written |
 | `-v`, `--version` | Show version information |
 
 ## Commands
 
 ### `shai`
 
-Start the interactive TUI.
+Start the interactive TUI. Without an auth config file, the TUI refuses to start and exits with status 2. Other start failures after a config is loaded exit with status 1.
 
 ```bash
 shai                        # Default TUI

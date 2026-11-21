@@ -225,8 +225,12 @@ fn a_missing_config_file_stops_the_session_and_writes_nothing() {
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    for args in [&["-p", "hello"][..], &["serve"][..]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_shai"))
+    // Bare `shai` is the TUI path: stdin is not a terminal here, so it
+    // still reaches App::run. A timeout keeps a hung TUI from stalling
+    // the suite. This case must fail on a build that swallows the start
+    // error and exits 0.
+    for args in [&[][..], &["-p", "hello"][..], &["serve"][..]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_shai"))
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -240,8 +244,18 @@ fn a_missing_config_file_stops_the_session_and_writes_nothing() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .expect("the shai binary should start");
+
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("shai {args:?} did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(

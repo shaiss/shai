@@ -72,11 +72,11 @@ impl AgentBuilder {
     /// [`AgentBuilder::default`] from an already-loaded config, or a fresh
     /// [`ShaiConfig::primary`] load if none is passed.
     pub async fn default_from(primary: Option<&ShaiConfig>) -> Result<Self, AgentError> {
-        // Same rule as the TUI and headless mode: the built-in default is
-        // used only when there is no config file. A file that is there and
-        // cannot be read is an error, never a silent fallback.
+        // Same rule as the TUI and headless mode: a missing file and a
+        // file that is there and cannot be read are both errors. The
+        // built-in anonymous default is never used to start an agent.
         let config = ShaiConfig::from_snapshot_or_primary(primary)
-            .map_err(AgentError::ConfigurationError)?;
+            .map_err(|e| AgentError::ConfigurationError(e.to_string()))?;
         let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;

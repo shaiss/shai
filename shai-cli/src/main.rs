@@ -9,7 +9,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use headless::app::AppHeadless;
-use session_options::SessionOptions;
+use session_options::{SessionOptions, SessionStartError};
 
 use console::strip_ansi_codes;
 use futures::StreamExt;
@@ -65,7 +65,8 @@ struct Cli {
     /// Dump entire trace upon completion (headless mode only)
     #[arg(long, global = true)]
     trace: bool,
-    /// the url to pull the default shai config
+    /// Opt-in URL of a starter auth config to pull when none exists.
+    /// There is no default URL. A failed pull writes nothing.
     #[arg(long)]
     default_shai_config_url: Option<String>,
     /// List all available tools
@@ -509,15 +510,11 @@ async fn handle_main_with_prompt(
 }
 
 /// A refused start (no config, unreadable config) is exit 2; any other
-/// failure starting or running the TUI is exit 1. These paths used to
-/// print the error and still return success.
-fn exit_session_error(err: impl std::fmt::Display) -> ! {
-    let text = err.to_string();
-    eprintln!("error: {}", text);
-    if text.contains("no config file found") || text.contains("could not be loaded") {
-        std::process::exit(2);
-    }
-    std::process::exit(1);
+/// failure starting or running the TUI is exit 1. The code comes from
+/// the error's kind, not from matching the message text.
+fn exit_session_error(err: SessionStartError) -> ! {
+    eprintln!("error: {}", err);
+    std::process::exit(err.exit_code());
 }
 
 async fn handle_config() -> Result<(), Box<dyn std::error::Error>> {

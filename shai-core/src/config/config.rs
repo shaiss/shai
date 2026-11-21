@@ -288,10 +288,13 @@ impl ShaiConfig {
             .unwrap_or(false)
     }
 
-    /// Load the config, falling back to the default one.
+    /// Load the config, or the built-in default as an in-memory template.
     ///
-    /// Returns a warning message only when a config file exists but could not
-    /// be loaded; a missing file is the normal first-run case.
+    /// Used by the auth wizard so a first `shai auth` has something to show.
+    /// This is not a session-start path: [`ShaiConfig::primary`] refuses a
+    /// missing or unreadable file and does not fall back. A warning is
+    /// returned only when a config file exists but could not be loaded; the
+    /// default is not written unless the user saves.
     pub fn load_or_default() -> (ShaiConfig, Option<String>) {
         match Self::load() {
             Ok(config) => (config, None),

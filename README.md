@@ -33,11 +33,13 @@ The `shai` binary will be installed in `$HOME/.local/bin`
 
 ## Quick Start
 
-`shai` will not start on the built-in anonymous OVHcloud default. Sign in or select a provider first:
+`shai` will not start on the built-in anonymous OVHcloud default. Anonymous use is off until you opt in. Sign in or select a provider first:
 
 ```bash
 shai auth
 ```
+
+Without a config file, `shai`, `shai -p`, and `shai serve` exit with status 2 and ask you to run `shai auth`. On first run the wizard shows `ovhcloud - Qwen3-32B (anonymous)` in memory; press Enter on that row to save it, or add another provider. You can also write a keyless `ovhcloud` entry in `auth.config.json`, or pass `--default-shai-config-url <url>` to pull a starter (the flag is opt-in, has no default URL, and a failed pull writes nothing). See [Auth configuration](docs/configurations/auth.md#first-run).
 
 ![shai auth](./docs/assets/auth.gif)
 

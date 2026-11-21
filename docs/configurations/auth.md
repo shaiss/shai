@@ -18,6 +18,40 @@ $XDG_CONFIG_HOME/shai/auth.config.json
 
 Previous versions of Shai used `auth.config` (without `.json` extension). If `auth.config.json` does not exist, Shai will fall back to reading the legacy `auth.config` file automatically. No manual migration is needed.
 
+## First run
+
+Anonymous use is off by default, as a security posture. A first `shai`, `shai -p`, or `shai serve` with no config file exits with status 2 and asks you to run `shai auth`. Nothing is written automatically, and the built-in anonymous OVHcloud default is not used to start a session. Turning anonymous use back on is deliberate and easy.
+
+**The usual path is `shai auth`.** On a first run the wizard loads the built-in template in memory only, and lists it as `ovhcloud - Qwen3-32B (anonymous)`. Press Enter on that row to write it to `~/.config/shai/auth.config.json`. Esc exits without writing anything. You can also add an `ovhcloud` provider yourself and leave `OVH_API_KEY` blank: empty fields are not stored, and the primary model accepts a keyless OVHcloud entry. The wizard still asks you to pick a model after it can list them.
+
+**Or write a keyless `ovhcloud` entry** in `auth.config.json` yourself. This is the same entry the built-in template uses:
+
+```json
+{
+  "providers": [
+    {
+      "provider": "ovhcloud",
+      "env_vars": {
+        "OVH_BASE_URL": "https://qwen-3-32b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat/v1"
+      },
+      "model": "Qwen3-32B",
+      "tool_method": "FunctionCall"
+    }
+  ],
+  "selected_provider": 0
+}
+```
+
+A keyless `ovhcloud` entry is accepted for the primary model only. A role or other secondary model still needs its own `OVH_API_KEY`.
+
+**Or pull a starter config** with `--default-shai-config-url <url>` when no config file exists. The flag is opt-in and has no default URL. A failed pull writes nothing.
+
+```bash
+shai --default-shai-config-url https://example.com/auth.config.json
+```
+
+The starter is whatever that URL returns; it enables anonymous access only if it contains a keyless `ovhcloud` entry like the one above.
+
 ## Schema
 
 ```jsonc
@@ -88,7 +122,7 @@ Each role is a `<provider>/<model>` string:
 The rules are strict on purpose, so that a mistake does not quietly send a conversation to a model you did not pick:
 
 - A role that is not listed is simply off.
-- Roles only come from your own config file. The starter config Shai downloads on first run never carries any.
+- Roles only come from your own config file. Shai does not download a starter config on first run unless you pass `--default-shai-config-url`; that flag has no default URL, and a failed pull writes nothing. A starter you opt into is not a source of roles unless you add them.
 - A role is a string. It cannot hold credentials of its own; an object is rejected.
 - A role that names a provider with no entry in `providers`, or whose reference is malformed, is an error when a feature tries to use it. Shai does not substitute the primary model, another provider, or the built-in default configuration.
 - A role only reads the provider entry it names. Unlike the primary model, it does not pick a missing key or base URL up from your shell environment. Concretely, an entry of a provider that needs an API key must hold its own to back a role (so an `ovhcloud` entry without `OVH_API_KEY`, which uses anonymous access, cannot), and an `ollama` entry must hold its `OLLAMA_BASE_URL`; its `OLLAMA_API_KEY` stays optional.
@@ -98,7 +132,7 @@ The rules are strict on purpose, so that a mistake does not quietly send a conve
 Two limits to keep in mind:
 
 - Resolving a role is offline. Shai does not ask the provider whether it serves the model, so a wrong model name shows up as that provider's error the first time the role is used. A role also inherits the entry's base URL: if that URL serves a single model, as OVHcloud's per-model endpoints do, name that model in the role.
-- A wrong value inside `roles`, or a `roles` section written twice, does not stop the rest of the file from loading. A JSON syntax error does, in `roles` like anywhere else in the file, and so does a `roles` section that is not valid UTF-8 text. When the file cannot be read, no command starts a session or a server on the built-in default: the TUI, headless mode, `shai serve` and the shell assistant all refuse, with the same error (see [Prewalk](#prewalk)). A named agent that has no provider of its own is refused the same way; one that names its own provider can be loaded after a session is already running, but `shai agent` and `shai --agent` still refuse at startup. A first run with no config file at all still uses the built-in default.
+- A wrong value inside `roles`, or a `roles` section written twice, does not stop the rest of the file from loading. A JSON syntax error does, in `roles` like anywhere else in the file, and so does a `roles` section that is not valid UTF-8 text. When the file cannot be read, no command starts a session or a server on the built-in default: the TUI, headless mode, `shai serve` and the shell assistant all refuse, with the same error (see [Prewalk](#prewalk)). A named agent that has no provider of its own is refused the same way (exit 2). One that names its own provider can start without an auth file, and can also be loaded after a session is already running. A first run with no config file at all also refuses, with the same exit 2, and asks you to run `shai auth` (see [Prewalk](#prewalk)).
 
 ## Prewalk
 
@@ -125,7 +159,7 @@ What to expect:
 - **Once.** After the switch the conversation stays on the target; nothing switches it back. In the TUI, an agent you start afterwards (another agent, a restored conversation, `/auth`) is a new agent on its own model, and prewalk does not move it: Shai says so with a `prewalk is over` line.
 - **A restored conversation starts the trigger over.** The todo list and the edits already in the saved trace, or in a conversation you just left with `/restore`, `/latest` or the session picker, do not count. The handoff waits for a new `todo_write` with items **and** a new successful `write` or `edit` in the restored session. The handoff itself is still one-shot: if it already happened in this process, it is not tried again.
 - **If the target cannot be resolved, the session does not start.** A role that is not configured, a provider with no entry, a `prewalk` section that is invalid or written twice: each is reported as an error and Shai exits with status 2 instead of running without the handoff. The error names a target taken from the config by its key (`prewalk.into`) and does not repeat its value, unless the value is the name of a role or provider that is configured. `--prewalk-into` on a command that starts no session (`shai serve`, `shai auth`, `shai --list-tools`, ...) is an error too. HTTP server mode does not use prewalk.
-- **A missing or unreadable config file is never replaced by the built-in default.** If `auth.config.json` (or the legacy `auth.config`) exists and does not load, Shai cannot tell what it asks for, so it exits with status 2 and says where the file is broken, without repeating what it holds. That is true of the TUI, headless mode, `shai serve`, the shell assistant, and an agent the TUI would start later in the session (agent picker, restored session, `/auth`): those later starts are refused and the live agent is kept. A named agent that names its own provider can still be loaded once a session is running, and when listing agents; `shai agent reviewer` and `shai --agent reviewer` still exit 2 at startup, because session options are resolved before the agent file is read. No starter config is downloaded over such a file. A first run with no config file at all also does not write or start on the built-in anonymous default: the session exits with status 2 and asks you to run `shai auth`. `shai serve` reads the auth config once at startup, so a later edit to the file needs a restart. `shai auth` and the other commands that start no session still work.
+- **A missing or unreadable config file is never replaced by the built-in default.** If `auth.config.json` (or the legacy `auth.config`) exists and does not load, Shai cannot tell what it asks for, so it exits with status 2 and says where the file is broken, without repeating what it holds. That is true of the TUI, headless mode, `shai serve`, the shell assistant, and an agent the TUI would start later in the session (agent picker, restored session, `/auth`): those later starts are refused and the live agent is kept. A named agent that names its own provider can still start with no auth file, and can be loaded once a session is running and when listing agents. A named agent that omits `llm_provider` still needs a usable auth config and exits 2 without one. No starter config is downloaded over an unreadable file. A first run with no config file at all also does not write or start on the built-in anonymous default: the session exits with status 2 and asks you to run `shai auth`. `shai serve` reads the auth config once at startup, so a later edit to the file needs a restart. `shai auth` and the other commands that start no session still work.
 - **An agent that could never trigger it is not armed.** The handoff needs the built-in `todo_write` tool and at least one of `write` and `edit`. If the agent's tools leave them out (`--tools`, `--remove`, a custom agent), or a headless run has no `--yes` (headless mode denies `write` and `edit` without it), Shai says `prewalk not armed` with the reason, in the same place as the armed notice, and the session runs on its own model. Tools of the same names served by an MCP server do not count.
 - **The configuration is followed.** Each time the TUI starts an agent (after `/auth`, when you pick another agent, when you restore a conversation), a handoff that is still to come is resolved again against the configuration as it is then. If it no longer resolves, the handoff is given up with a `prewalk disarmed` line; it is never sent to credentials or an endpoint you have just removed.
 - If the target's provider rejects the request after the switch (for example because the model name is wrong, or it does not accept the conversation another provider produced), that error is shown and the session stays on the target.
@@ -139,3 +173,5 @@ shai auth
 ```
 
 You can also run auth from within the TUI using the `/auth` slash command — this will save your current conversation context and restart the agent with the new provider settings.
+
+How to opt back into anonymous OVHcloud, write a keyless provider entry, or pull a starter with `--default-shai-config-url` is in [First run](#first-run).

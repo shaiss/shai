@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::agent_meta::AgentMeta;
 use super::agent_state::AgentState;
-use crate::session_options::SessionOptions;
+use crate::session_options::{SessionOptions, SessionStartError};
 
 use super::handler::AgentHandler;
 use super::input::InputArea;
@@ -727,9 +727,11 @@ impl App<'_> {
         &mut self,
         agent_name: Option<String>,
         restore_session_id: Option<String>,
-    ) -> io::Result<()> {
-        let x = self.try_run(agent_name, restore_session_id).await;
+    ) -> Result<(), SessionStartError> {
+        let result = self.try_run(agent_name, restore_session_id).await;
 
+        // Always restore the terminal, including when start is refused
+        // before raw mode is enabled: these calls are then no-ops.
         let _ = execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -738,21 +740,16 @@ impl App<'_> {
         std::io::stdout().flush().ok();
         let _ = disable_raw_mode();
 
-        if let Err(e) = x {
-            println!();
-            eprintln!("{}\r\n", e);
-        }
-
         println!();
         println!();
-        Ok(())
+        result
     }
 
     async fn try_run(
         &mut self,
         agent_name: Option<String>,
         restore_session_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), SessionStartError> {
         let agent_name_ref = agent_name.as_deref();
         // A restored conversation starts the trigger over. Reset before the
         // agent is armed, so it holds the new empty signals; after start the
@@ -760,18 +757,10 @@ impl App<'_> {
         if restore_session_id.is_some() {
             self.session_options.reset_prewalk_signals();
         }
-        let banner =
-            self.start_agent(agent_name_ref)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    if let Some(name) = agent_name_ref {
-                        format!("could not start custom agent '{}': {}", name, e).into()
-                    } else {
-                        "could not start shai agent, run shai auth first"
-                            .to_string()
-                            .into()
-                    }
-                })?;
+        let banner = self
+            .start_agent(agent_name_ref)
+            .await
+            .map_err(|e| SessionStartError::from_start(agent_name_ref, e))?;
 
         self.terminal = Some(ratatui::init_with_options(TerminalOptions {
             viewport: Viewport::Fullscreen,
@@ -827,7 +816,7 @@ impl App<'_> {
         while !self.ui_state.exit {
             self.show_session_notices();
             self.draw_ui()
-                .map_err(|_| -> Box<dyn std::error::Error> { "oops... (x_x)'".into() })?;
+                .map_err(|_| SessionStartError::other("oops... (x_x)'"))?;
 
             let mut reader = self.event_reader.take().unwrap_or_default();
 
