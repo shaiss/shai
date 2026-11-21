@@ -450,6 +450,14 @@ impl CommandRegistry {
                 // lock held, deadlocking the auth view's own EventStream
                 // (black screen until a key press). The live agent stays
                 // until the new config is known to be usable.
+                //
+                // Drain its events while the loop is blocked, and remember
+                // the process env the live agent was using. The auth view
+                // may export a newly saved provider; if the replacement
+                // then cannot start, put the previous env back and replay
+                // any prompts that arrived in the meantime.
+                let env_snapshot = shai_core::config::config::ShaiConfig::snapshot_applied_env();
+                let hold = app.start_holding_events().await;
                 app.suspend_event_reader();
                 let mut auth = crate::tui::auth::auth::AppAuth::new();
                 auth.run().await;
@@ -458,16 +466,24 @@ impl CommandRegistry {
                 // Recreate the agent from a snapshot taken after the auth
                 // TUI, built before the live agent is torn down, so a later
                 // change on disk cannot leave the session without one.
-                match app.swap_agent(agent_name.as_deref()).await {
+                let replaced = match app.swap_agent(agent_name.as_deref()).await {
                     Ok(true) => {
                         app.notify("Provider configuration updated", Duration::from_secs(2));
+                        true
                     }
-                    Ok(false) => {}
+                    Ok(false) => false,
                     // Say why there is no agent, instead of reporting an
                     // update that started nothing.
-                    Err(error) => app
-                        .session_notices
-                        .push(format!("no agent was started: {error}")),
+                    Err(error) => {
+                        app.session_notices
+                            .push(format!("no agent was started: {error}"));
+                        false
+                    }
+                };
+                let held = app.stop_holding_events(hold).await;
+                if !replaced {
+                    shai_core::config::config::ShaiConfig::restore_applied_env(&env_snapshot);
+                    app.replay_held_events(held).await?;
                 }
             }
             "/agent" => {

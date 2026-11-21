@@ -35,6 +35,7 @@ pub struct AppRunningAgent {
     pub(crate) events: broadcast::Receiver<AgentEvent>,
     pub(crate) controller: AgentController,
     pub(crate) tools: Vec<(String, String)>,
+    identity: std::sync::Arc<()>,
 }
 
 pub enum InitialModal {
@@ -61,6 +62,7 @@ pub struct App<'a> {
     /// Agents this session has started so far.
     pub(crate) agents_started: u32,
     pub(crate) event_reader: Option<crossterm::event::EventStream>,
+    event_hold_depth: u32,
 }
 
 /// A replacement loaded once, so construction does not read the agent
@@ -79,6 +81,51 @@ struct BuiltAgent {
     model: String,
     provider: String,
     mcp_status: Option<Vec<shai_core::tools::McpServerStatus>>,
+    apply_env: Option<shai_core::config::config::ShaiConfig>,
+}
+
+pub(crate) struct EventPump {
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    handle: JoinHandle<(broadcast::Receiver<AgentEvent>, Vec<AgentEvent>)>,
+    identity: std::sync::Arc<()>,
+}
+
+struct EventPumpTask {
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    handle: JoinHandle<(broadcast::Receiver<AgentEvent>, Vec<AgentEvent>)>,
+    ready_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+fn start_event_pump(mut rx: broadcast::Receiver<AgentEvent>) -> EventPumpTask {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        let mut held = Vec::new();
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Ok(ev) => held.push(ev),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut stop_rx => break,
+            }
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => held.push(ev),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        (rx, held)
+    });
+    EventPumpTask {
+        stop_tx,
+        handle,
+        ready_rx,
+    }
 }
 
 impl App<'_> {
@@ -151,10 +198,15 @@ impl App<'_> {
                     model,
                     provider,
                     mcp_status: Some(mcp_status),
+                    apply_env: None,
                 })
             }
             PreparedAgent::Primary(config) => {
-                let (llm, model) = config.get_llm_from_config().await?;
+                // Do not call get_llm_from_config: that exports provider
+                // variables into the process before we know this build will
+                // be installed. Child tools of a still-running live agent
+                // would then see the replacement's credentials.
+                let (llm, model) = config.llm_from_config().await?;
                 let provider = llm.provider().name().to_string();
                 Ok(BuiltAgent {
                     agent: coder(Arc::new(llm), model.clone()),
@@ -162,6 +214,7 @@ impl App<'_> {
                     model,
                     provider,
                     mcp_status: None,
+                    apply_env: Some(config),
                 })
             }
         }
@@ -169,6 +222,10 @@ impl App<'_> {
 
     async fn install_built(&mut self, mut built: BuiltAgent) -> String {
         use shai_core::agent::Agent;
+
+        if let Some(config) = built.apply_env.as_ref() {
+            config.set_env_vars();
+        }
 
         // The agent this one replaces may have handed off without its
         // announcement having been read. Say so before moving on.
@@ -218,6 +275,7 @@ impl App<'_> {
             controller: controller.clone(),
             events,
             tools: Vec::new(),
+            identity: std::sync::Arc::new(()),
         });
 
         let saved_prompts = shai_core::tools::prompts::load_active_prompts_from_disk();
@@ -439,9 +497,15 @@ impl App<'_> {
         keep_current_trace: bool,
         reset_prewalk: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        let hold = self.start_holding_events().await;
         let built = match self.build_agent(prepared).await {
-            Ok(built) => built,
+            Ok(built) => {
+                let _held = self.stop_holding_events(hold).await;
+                built
+            }
             Err(error) => {
+                let held = self.stop_holding_events(hold).await;
+                self.replay_held_events(held).await?;
                 self.session_notices
                     .push(format!("the agent was not replaced: {error}"));
                 return Ok(false);
@@ -578,6 +642,7 @@ impl App<'_> {
             session_notices: Vec::new(),
             agents_started: 0,
             event_reader: None,
+            event_hold_depth: 0,
         }
     }
 
@@ -597,6 +662,61 @@ impl App<'_> {
     /// Re-create the main event reader after a nested view exited.
     pub(crate) fn resume_event_reader(&mut self) {
         self.event_reader = Some(crossterm::event::EventStream::new());
+    }
+
+    /// Drain `AgentEvent`s on a background task while the TUI loop is
+    /// blocked (the auth view, or building a replacement). Broadcast lag
+    /// would otherwise drop permission prompts and tool results; if the
+    /// live agent is then kept, the session can hang on a prompt the UI
+    /// never showed.
+    ///
+    /// Nested calls share the outer pump: `/auth` holds events for the
+    /// whole view, and `finish_replacement` does not start a second one.
+    pub(crate) async fn start_holding_events(&mut self) -> Option<EventPump> {
+        let agent = self.agent.as_mut()?;
+        if self.event_hold_depth > 0 {
+            self.event_hold_depth += 1;
+            return None;
+        }
+        self.event_hold_depth = 1;
+        let placeholder = agent.events.resubscribe();
+        let rx = std::mem::replace(&mut agent.events, placeholder);
+        let identity = std::sync::Arc::clone(&agent.identity);
+        let task = start_event_pump(rx);
+        let _ = task.ready_rx.await;
+        Some(EventPump {
+            stop_tx: task.stop_tx,
+            handle: task.handle,
+            identity,
+        })
+    }
+
+    pub(crate) async fn stop_holding_events(&mut self, pump: Option<EventPump>) -> Vec<AgentEvent> {
+        if self.event_hold_depth == 0 {
+            return Vec::new();
+        }
+        self.event_hold_depth -= 1;
+        let Some(pump) = pump else {
+            return Vec::new();
+        };
+        let _ = pump.stop_tx.send(());
+        let (rx, held) = match pump.handle.await {
+            Ok(result) => result,
+            Err(_) => return Vec::new(),
+        };
+        if let Some(agent) = self.agent.as_mut() {
+            if std::sync::Arc::ptr_eq(&agent.identity, &pump.identity) {
+                agent.events = rx;
+            }
+        }
+        held
+    }
+
+    pub(crate) async fn replay_held_events(&mut self, held: Vec<AgentEvent>) -> io::Result<()> {
+        for event in held {
+            self.handle_agent_event(event).await?;
+        }
+        Ok(())
     }
 
     pub fn notify(&mut self, msg: &str, duration: std::time::Duration) {
@@ -899,12 +1019,31 @@ mod tests {
         }
     }
 
+    /// Restores `XDG_CONFIG_HOME` on drop, including when a test panics.
+    /// Keep this guard inside the lock scope so restoration finishes
+    /// before another test can acquire the lock.
+    struct ConfigHomeGuard {
+        previous: Option<String>,
+    }
+
+    impl ConfigHomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            Self {
+                previous: set_config_home(home),
+            }
+        }
+    }
+
+    impl Drop for ConfigHomeGuard {
+        fn drop(&mut self) {
+            restore_config_home(self.previous.take());
+        }
+    }
+
     fn with_config_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = CONFIG_HOME_LOCK.blocking_lock();
-        let previous = set_config_home(home);
-        let result = f();
-        restore_config_home(previous);
-        result
+        let _lock = CONFIG_HOME_LOCK.blocking_lock();
+        let _home = ConfigHomeGuard::set(home);
+        f()
     }
 
     fn broken_auth_home(agent_json: &str) -> tempfile::TempDir {
@@ -954,6 +1093,7 @@ mod tests {
             controller,
             events,
             tools: Vec::new(),
+            identity: std::sync::Arc::new(()),
         });
         app.agent_state
             .session_manager_mut()
@@ -966,12 +1106,10 @@ mod tests {
         let home =
             broken_auth_home(r#"{"name": "reviewer", "description": "needs the auth config"}"#);
         let _guard = CONFIG_HOME_LOCK.lock().await;
-        let previous = set_config_home(home.path());
+        let _home = ConfigHomeGuard::set(home.path());
         let mut app = App::new();
         attach_live_agent(&mut app);
         let replaced = app.swap_agent(Some("reviewer")).await.unwrap();
-        restore_config_home(previous);
-        drop(_guard);
 
         assert!(!replaced);
         assert!(
@@ -1038,7 +1176,7 @@ mod tests {
             .join("reviewer.config.json");
 
         let _guard = CONFIG_HOME_LOCK.lock().await;
-        let previous = set_config_home(home.path());
+        let _home = ConfigHomeGuard::set(home.path());
         let mut app = App::new();
         attach_live_agent(&mut app);
 
@@ -1054,8 +1192,6 @@ mod tests {
             .install_replacement(prepared, true)
             .await
             .expect("install from the snapshot should not error");
-        restore_config_home(previous);
-        drop(_guard);
 
         assert!(
             replaced,
@@ -1138,7 +1274,7 @@ mod tests {
             }"#,
         );
         let _guard = CONFIG_HOME_LOCK.lock().await;
-        let previous = set_config_home(home.path());
+        let _home = ConfigHomeGuard::set(home.path());
         let mut app = App::new();
         let prewalk = due_prewalk();
         app.session_options = SessionOptions::with_prewalk(prewalk.clone());
@@ -1151,8 +1287,6 @@ mod tests {
             .install_restored_agent(prepared)
             .await
             .expect("install from the snapshot should not error");
-        restore_config_home(previous);
-        drop(_guard);
 
         assert!(replaced);
         let restored = app.session_options.prewalk().expect("prewalk still set");
@@ -1185,7 +1319,7 @@ mod tests {
             }"#,
         );
         let _guard = CONFIG_HOME_LOCK.lock().await;
-        let previous = set_config_home(home.path());
+        let _home = ConfigHomeGuard::set(home.path());
         let mut app = App::new();
         let prewalk = prewalk();
         hand_off(&prewalk, true).await;
@@ -1200,8 +1334,6 @@ mod tests {
             .install_restored_agent(prepared)
             .await
             .expect("install from the snapshot should not error");
-        restore_config_home(previous);
-        drop(_guard);
 
         assert!(replaced);
         assert!(
@@ -1217,5 +1349,90 @@ mod tests {
             let _ = agent.controller.terminate().await;
             let _ = agent.handle.await;
         }
+    }
+
+    fn auth_home(auth_json: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai = dir.path().join("shai");
+        std::fs::create_dir_all(&shai).unwrap();
+        std::fs::write(shai.join("auth.config.json"), auth_json).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_failed_primary_build_does_not_change_process_env() {
+        const KEY: &str = "SHAI_TEST_TUI_REPLACEMENT_ENV";
+        let home = auth_home(
+            r#"{
+                "providers":[{
+                    "provider":"not-a-real-provider",
+                    "env_vars":{"SHAI_TEST_TUI_REPLACEMENT_ENV":"must-not-leak"},
+                    "model":"x",
+                    "tool_method":"FunctionCall"
+                }],
+                "selected_provider":0
+            }"#,
+        );
+        let previous = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let _home = ConfigHomeGuard::set(home.path());
+        let mut app = App::new();
+        attach_live_agent(&mut app);
+        let replaced = app
+            .swap_agent(None)
+            .await
+            .expect("a failed build is reported, not a hard error");
+        let leaked = std::env::var(KEY).ok();
+
+        match previous {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+
+        assert!(!replaced);
+        assert!(
+            app.agent.is_some(),
+            "the live agent must survive a failed primary build"
+        );
+        assert!(
+            leaked.is_none(),
+            "the failed replacement must not export its provider variables"
+        );
+        assert!(
+            app.session_notices
+                .iter()
+                .any(|n| n.contains("the agent was not replaced")
+                    && n.contains("not-a-real-provider")),
+            "notices={:?}",
+            app.session_notices
+        );
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_pump_keeps_up_with_a_full_broadcast() {
+        let (tx, rx) = broadcast::channel(16);
+        let task = start_event_pump(rx);
+        task.ready_rx.await.expect("event pump should start");
+        for i in 0..128 {
+            let _ = tx.send(AgentEvent::ThinkingStart);
+            if i % 8 == 7 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(tx);
+        let _ = task.stop_tx.send(());
+        let (_rx, held) = task.handle.await.expect("event pump should finish");
+        assert_eq!(
+            held.len(),
+            128,
+            "a pump that keeps receiving must not lose events to broadcast lag"
+        );
     }
 }
