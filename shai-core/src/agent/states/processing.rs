@@ -36,10 +36,16 @@ impl AgentCore {
                 }
                 if any_denied {
                     self.set_state(InternalAgentState::Paused).await;
-                } else {
+                } else if !self.start_advisor_review().await {
+                    // No review is due: go straight to the next step.
+                    // Otherwise the agent waits for the advisor in a
+                    // `Processing` phase of its own.
                     self.set_state(InternalAgentState::Running).await;
                 }
                 Ok(())
+            }
+            InternalAgentEvent::AdvisorCompleted { review_id, outcome } => {
+                self.finish_advisor_review(review_id, outcome).await
             }
             _ => Ok(()),
         }

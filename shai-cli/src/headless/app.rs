@@ -158,11 +158,12 @@ impl AppHeadless {
             *agent.temperature.write().await = temp;
         }
 
-        // One line on stderr when a handoff is armed, or when one was asked
-        // for and this agent cannot take it. The switch itself is announced,
-        // also in one line, by the event handler below.
+        // One line on stderr per option that is on, or that was asked for and
+        // does not apply to this agent. What happens later (the switch, each
+        // advisor note) is announced, also one line each, by the event
+        // handler below.
         let mut session_options = self.session_options.clone();
-        if let Some(notice) = session_options.arm_headless(&mut agent, yes) {
+        for notice in session_options.arm_headless(&mut agent, yes) {
             eprintln!("{}", shai_core::agent::output::notice_line(&notice));
         }
 

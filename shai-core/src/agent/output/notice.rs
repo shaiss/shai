@@ -18,8 +18,39 @@ pub fn notice_text(event: &AgentEvent) -> Option<String> {
             "prewalk: switched to {}/{}, the conversation continues there",
             provider, model
         )),
+        AgentEvent::AdvisorNote { severity, note } => {
+            Some(format!("advisor ({}): {}", severity, note))
+        }
+        AgentEvent::AdvisorFailed { error, disabled } => Some(if *disabled {
+            format!(
+                "advisor: review failed ({}); the advisor is off for the rest of this session",
+                error
+            )
+        } else {
+            format!("advisor: review failed ({})", error)
+        }),
         _ => None,
     }
+}
+
+/// The notice shown when a session starts with an advisor.
+pub fn advisor_on_notice(model: &str, max_calls: u32) -> String {
+    format!(
+        "advisor on: {} reviews this session's steps, read-only, at most {} times",
+        model, max_calls
+    )
+}
+
+/// The notice shown when an advisor that was asked for is not attached to
+/// the agent that is starting. `reason` says why.
+pub fn advisor_not_attached_notice(reason: &str) -> String {
+    format!("advisor not attached: {}", reason)
+}
+
+/// The notice shown when the advisor of a session is given up while the
+/// session is running, because it stopped resolving. `reason` says why.
+pub fn advisor_off_notice(reason: &str) -> String {
+    format!("advisor off for the rest of this session: {}", reason)
 }
 
 /// The notice shown when a session starts with a prewalk armed.
@@ -91,6 +122,38 @@ mod tests {
             let line = notice_line(&notice);
             assert!(line.contains(&notice));
             assert_eq!(line.lines().count(), 1);
+        }
+    }
+
+    #[test]
+    fn advisor_events_are_one_line_notices() {
+        let note = notice_text(&AgentEvent::AdvisorNote {
+            severity: crate::advisor::Severity::Blocker,
+            note: "this deletes the repository".to_string(),
+        })
+        .unwrap();
+        assert_eq!(note, "advisor (blocker): this deletes the repository");
+
+        let failed = |disabled| {
+            notice_text(&AgentEvent::AdvisorFailed {
+                error: "the review took too long".to_string(),
+                disabled,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            failed(false),
+            "advisor: review failed (the review took too long)"
+        );
+        assert!(failed(true).ends_with("the advisor is off for the rest of this session"));
+
+        let on = advisor_on_notice("openai/gpt-4o-mini", 10);
+        assert!(
+            on.contains("openai/gpt-4o-mini") && on.contains("10"),
+            "{on}"
+        );
+        for text in [note, failed(true), on] {
+            assert_eq!(text.lines().count(), 1);
         }
     }
 

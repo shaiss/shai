@@ -34,6 +34,7 @@ pub struct AgentBuilder {
     pub working_dir: Option<String>,
     pub todo_storage: Option<Arc<TodoStorage>>,
     pub mcp_status: Vec<McpServerStatus>,
+    redaction_secrets: Vec<(String, String)>,
 }
 
 impl AgentBuilder {
@@ -115,6 +116,7 @@ impl AgentBuilder {
             working_dir: None,
             todo_storage: None,
             mcp_status: Vec::new(),
+            redaction_secrets: Vec::new(),
         }
     }
 
@@ -137,6 +139,7 @@ impl AgentBuilder {
             working_dir: parent.working_dir.clone(),
             todo_storage: Some(parent.todo_storage.clone()),
             mcp_status: Vec::new(),
+            redaction_secrets: Vec::new(),
         }
     }
 
@@ -238,7 +241,7 @@ impl AgentBuilder {
             .todo_storage
             .unwrap_or_else(|| Arc::new(TodoStorage::new()));
 
-        AgentCore::new(
+        let mut agent = AgentCore::new(
             self.session_id.clone(),
             self.brain,
             self.trace,
@@ -249,7 +252,9 @@ impl AgentBuilder {
             self.fs_operation_log,
             self.working_dir,
             todo_storage,
-        )
+        );
+        agent.redaction_secrets = self.redaction_secrets;
+        agent
     }
 
     /// Create an AgentBuilder from an AgentConfig
@@ -304,6 +309,7 @@ impl AgentBuilder {
         builder.verification_config = config.verification.clone();
         builder.fs_operation_log = fs_log;
         builder.mcp_status = mcp_status;
+        builder.redaction_secrets = agent_redaction_secrets(&config);
         Ok(builder
             .tools(tools)
             .set_todo_storage(todo_storage)
@@ -543,6 +549,22 @@ impl AgentBuilder {
 
         Ok(config_changed)
     }
+}
+
+/// Provider and MCP values an advisor should keep out of what it is sent.
+fn agent_redaction_secrets(config: &AgentConfig) -> Vec<(String, String)> {
+    let mut secrets: Vec<(String, String)> = config
+        .llm_provider
+        .env_vars
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for mcp in config.tools.mcp.values() {
+        for (name, value) in crate::advisor::mcp_settings(&mcp.config) {
+            secrets.push((name.to_string(), value));
+        }
+    }
+    secrets
 }
 
 #[cfg(test)]

@@ -13,13 +13,20 @@
 //! agent a session runs is decided when that agent is armed, and the user is
 //! told when it does not.
 
+use shai_core::advisor::Advisor;
 use shai_core::agent::output::{
-    prewalk_armed_notice, prewalk_disarmed_notice, prewalk_not_armed_notice, prewalk_over_notice,
+    advisor_not_attached_notice, advisor_off_notice, advisor_on_notice, prewalk_armed_notice,
+    prewalk_disarmed_notice, prewalk_not_armed_notice, prewalk_over_notice,
 };
 use shai_core::agent::{AgentCore, AgentEvent, Prewalk, PrewalkArmError};
+use shai_core::config::advisor::resolve_advisor;
 use shai_core::config::config::ShaiConfig;
 use shai_core::config::prewalk::resolve_prewalk;
-use shai_core::config::roles::RoleError;
+use shai_core::config::roles::{BoundModel, RoleError};
+
+/// Why an agent gets no advisor when the session's one failed too often
+/// under an earlier agent.
+const SWITCHED_OFF_EARLIER: &str = "it was switched off earlier, after its reviews kept failing";
 
 /// Why a headless agent run without `--yes` is not armed.
 const HEADLESS_WITHOUT_YES: &str = "headless mode without --yes denies write and edit, \
@@ -37,21 +44,30 @@ pub struct SessionOptions {
     announced: Option<String>,
     /// Where the session went, once the handoff has happened.
     handed_off: Option<String>,
+    /// Whether `--advisor` was given, kept for the same reason as the flag
+    /// above.
+    advisor_flag: bool,
+    /// Second model that reviews the session's steps, if any. It follows the
+    /// session from one agent to the next, and so does its review counter.
+    advisor: Option<Advisor>,
+    /// The advisor model the user was last told is on.
+    advisor_announced: Option<String>,
 }
 
 impl SessionOptions {
     /// Resolve the options of a session about to start.
     ///
-    /// `prewalk_into` is the value of `--prewalk-into`. Nothing here performs
-    /// network I/O.
-    pub fn resolve(prewalk_into: Option<&str>) -> Result<Self, String> {
+    /// `prewalk_into` is the value of `--prewalk-into` and `advisor` is
+    /// `--advisor`. Nothing here performs network I/O.
+    pub fn resolve(prewalk_into: Option<&str>, advisor: bool) -> Result<Self, String> {
         // The user's own config, never the built-in default.
         let config = ShaiConfig::load_for_roles();
-        Self::resolve_from(prewalk_into, config.as_ref())
+        Self::resolve_from(prewalk_into, advisor, config.as_ref())
     }
 
     fn resolve_from(
         prewalk_into: Option<&str>,
+        advisor: bool,
         config: Result<&ShaiConfig, &RoleError>,
     ) -> Result<Self, String> {
         if let Some(problem) = Self::unreadable(config) {
@@ -62,11 +78,15 @@ impl SessionOptions {
             ));
         }
         let prewalk = Self::resolve_prewalk(prewalk_into, config)?;
+        let advisor_handle = Self::resolve_advisor(advisor, config, None)?;
         Ok(Self {
             prewalk_into: prewalk_into.map(str::to_string),
             prewalk: prewalk.map(Prewalk::new),
             announced: None,
             handed_off: None,
+            advisor_flag: advisor,
+            advisor: advisor_handle,
+            advisor_announced: None,
         })
     }
 
@@ -101,19 +121,51 @@ impl SessionOptions {
     fn resolve_prewalk(
         prewalk_into: Option<&str>,
         config: Result<&ShaiConfig, &RoleError>,
-    ) -> Result<Option<shai_core::config::roles::BoundModel>, String> {
+    ) -> Result<Option<BoundModel>, String> {
         if let Some(problem) = Self::unreadable(config) {
             return Err(problem);
         }
         resolve_prewalk(prewalk_into, config).map_err(|e| e.to_string())
     }
 
+    /// The advisor the session is asked for, as things are now. `previous`
+    /// is the one it had before the config changed: what that one has
+    /// already spent stays spent.
+    fn resolve_advisor(
+        flag: bool,
+        config: Result<&ShaiConfig, &RoleError>,
+        previous: Option<&Advisor>,
+    ) -> Result<Option<Advisor>, String> {
+        if let Some(problem) = Self::unreadable(config) {
+            return Err(problem);
+        }
+        let Some((model, limits)) = resolve_advisor(flag, config).map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // An advisor only resolves against a config that loaded.
+        let config = config.map_err(|e| e.to_string())?;
+        // The advisor is confined to the directory the session runs in.
+        let working_dir = std::env::current_dir().map_err(|e| {
+            format!(
+                "cannot start the advisor: no working directory ({})",
+                e.kind()
+            )
+        })?;
+        match previous {
+            Some(previous) => previous.renewed(model, &working_dir, limits, config),
+            None => Advisor::new(model, &working_dir, limits, config),
+        }
+        .map(Some)
+        .map_err(|e| e.to_string())
+    }
+
     /// Like [`SessionOptions::resolve`], but a failure ends the process: the
     /// reason goes to stderr and the exit code is 2. The callers of the
     /// session entry points do not propagate errors, so this is where
     /// "refuse to start" is enforced.
-    pub fn resolve_or_exit(prewalk_into: Option<&str>) -> Self {
-        match Self::resolve(prewalk_into) {
+    pub fn resolve_or_exit(prewalk_into: Option<&str>, advisor: bool) -> Self {
+        match Self::resolve(prewalk_into, advisor) {
             Ok(options) => options,
             Err(error) => {
                 eprintln!("error: {}", error);
@@ -135,6 +187,12 @@ impl SessionOptions {
     #[cfg(test)]
     pub(crate) fn on_model_switched_is_recorded(&self) -> bool {
         self.handed_off.is_some()
+    }
+
+    /// True while the session has an advisor.
+    #[cfg(test)]
+    pub(crate) fn has_advisor(&self) -> bool {
+        self.advisor.is_some()
     }
 
     /// True while a handoff is still to come.
@@ -160,12 +218,65 @@ impl SessionOptions {
         }
     }
 
-    /// Arm `agent` with what this session was asked for.
+    /// Set `agent` up with what this session was asked for.
+    ///
+    /// Returns the lines there are for the user: one when a handoff is armed
+    /// or an advisor attached for the first time or with a new model, one
+    /// whenever something the session still has does not apply to this
+    /// agent, and one, once, when the advisor is found switched off.
+    pub fn arm(&mut self, agent: &mut AgentCore) -> Vec<String> {
+        self.arm_prewalk(agent)
+            .into_iter()
+            .chain(self.attach_advisor(agent))
+            .collect()
+    }
+
+    fn attach_advisor(&mut self, agent: &mut AgentCore) -> Option<String> {
+        let advisor = self.advisor.clone()?;
+        if advisor.is_off() {
+            // Its reviews failed while an earlier agent was running, and
+            // that holds for the session: neither a new agent nor a new
+            // model brings it back, so it is not announced as on. The
+            // session lets go of it, which is why this is said once.
+            self.advisor = None;
+            self.advisor_announced = None;
+            return Some(advisor_off_notice(SWITCHED_OFF_EARLIER));
+        }
+        let label = advisor.label();
+        let max_calls = advisor.limits().max_calls;
+        let left = max_calls.saturating_sub(advisor.calls_made());
+        if left == 0 {
+            // It has nothing left to review with, whatever agent or model
+            // comes next: it is not announced as on, and this is said once.
+            self.advisor = None;
+            self.advisor_announced = None;
+            return Some(advisor_off_notice(&format!(
+                "it has used all {max_calls} of its reviews"
+            )));
+        }
+        match agent.set_advisor(advisor) {
+            Ok(()) => {
+                if self.advisor_announced.as_deref() == Some(label.as_str()) {
+                    return None;
+                }
+                // What it may still do, not what it could do at the start.
+                let notice = advisor_on_notice(&label, left);
+                self.advisor_announced = Some(label);
+                Some(notice)
+            }
+            Err(error) => {
+                self.advisor_announced = None;
+                Some(advisor_not_attached_notice(&error.to_string()))
+            }
+        }
+    }
+
+    /// Arm `agent` with the handoff this session was asked for.
     ///
     /// Returns a line for the user when there is something to say: when a
     /// handoff is armed for the first time or for a new target, and whenever
     /// one that is still to come cannot be armed on this agent.
-    pub fn arm(&mut self, agent: &mut AgentCore) -> Option<String> {
+    fn arm_prewalk(&mut self, agent: &mut AgentCore) -> Option<String> {
         // A handoff that happened without this session being told is
         // accounted for here at the latest.
         self.note_switch();
@@ -199,14 +310,18 @@ impl SessionOptions {
     /// Arm a headless agent. Headless denies `write` and `edit` unless
     /// `yes` (`--yes`) is given, so without it the first edit that triggers a
     /// handoff can never happen: the agent is not armed and the user is told.
-    pub fn arm_headless(&mut self, agent: &mut AgentCore, yes: bool) -> Option<String> {
+    pub fn arm_headless(&mut self, agent: &mut AgentCore, yes: bool) -> Vec<String> {
         let pending = self
             .prewalk
             .as_ref()
             .is_some_and(|prewalk| !prewalk.is_spent());
         if !yes && pending {
+            // The handoff is not armed, but the advisor is read-only and
+            // still attaches.
             self.announced = None;
-            return Some(prewalk_not_armed_notice(HEADLESS_WITHOUT_YES));
+            return std::iter::once(prewalk_not_armed_notice(HEADLESS_WITHOUT_YES))
+                .chain(self.attach_advisor(agent))
+                .collect();
         }
         self.arm(agent)
     }
@@ -248,16 +363,41 @@ impl SessionOptions {
     /// Resolve the options again, after the config may have changed while
     /// the session was running.
     ///
-    /// A handoff that is still to come follows the config: it is aimed at
-    /// what its target resolves to now, and given up if that no longer
-    /// resolves. It is never left bound to credentials or an endpoint the
-    /// config no longer holds. Returns lines to show the user.
+    /// A handoff that is still to come, and the advisor, follow the config:
+    /// each is bound to what it resolves to now, and given up if it no
+    /// longer resolves. Neither is left bound to credentials or an endpoint
+    /// the config no longer holds, and the advisor learns which credentials
+    /// to keep out of what it is sent from the config as it is now. Nothing
+    /// that was off when the session started is turned on. Returns lines to
+    /// show the user.
     pub fn refresh(&mut self) -> Vec<String> {
         let config = ShaiConfig::load_for_roles();
         self.refresh_from(config.as_ref())
     }
 
     fn refresh_from(&mut self, config: Result<&ShaiConfig, &RoleError>) -> Vec<String> {
+        self.refresh_prewalk(config)
+            .into_iter()
+            .chain(self.refresh_advisor(config))
+            .collect()
+    }
+
+    fn refresh_advisor(&mut self, config: Result<&ShaiConfig, &RoleError>) -> Option<String> {
+        let current = self.advisor.take()?;
+        let reason = match Self::resolve_advisor(self.advisor_flag, config, Some(&current)) {
+            Ok(Some(advisor)) => {
+                // `arm` announces it again if it is not the same model.
+                self.advisor = Some(advisor);
+                return None;
+            }
+            Ok(None) => "the config no longer turns it on".to_string(),
+            Err(error) => error,
+        };
+        self.advisor_announced = None;
+        Some(advisor_off_notice(&reason))
+    }
+
+    fn refresh_prewalk(&mut self, config: Result<&ShaiConfig, &RoleError>) -> Vec<String> {
         let Some(current) = self.prewalk.clone().filter(|prewalk| !prewalk.is_spent()) else {
             return Vec::new();
         };
@@ -519,6 +659,39 @@ mod tests {
             .build()
     }
 
+    /// The one line there is to show.
+    fn only(mut notices: Vec<String>) -> String {
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        notices.remove(0)
+    }
+
+    /// A brain that neither changes model nor takes advisor notes.
+    struct PlainBrain;
+
+    #[async_trait::async_trait]
+    impl shai_core::agent::Brain for PlainBrain {
+        async fn next_step(
+            &mut self,
+            _: shai_core::agent::ThinkerContext,
+            _: shai_core::agent::ToolBudgetRef,
+        ) -> Result<shai_core::agent::ThinkerDecision, shai_core::agent::AgentError> {
+            unreachable!("the agent is never run")
+        }
+    }
+
+    /// The same config with the role `advisor` on the `ollama` entry.
+    fn config_with_advisor(tail: &str) -> ShaiConfig {
+        serde_json::from_str(
+            &serde_json::to_string(&config(Some(URL_A), tail))
+                .unwrap()
+                .replace(
+                    r#""cheap": "ollama/qwen3:8b""#,
+                    r#""cheap": "ollama/qwen3:8b", "advisor": "ollama/reviewer""#,
+                ),
+        )
+        .unwrap()
+    }
+
     fn invalid() -> RoleError {
         RoleError::ConfigInvalid {
             path: "/home/me/.config/shai/auth.config.json".to_string(),
@@ -529,16 +702,17 @@ mod tests {
     #[test]
     fn nothing_asked_for_means_nothing_to_arm() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(None, Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&cfg)).unwrap();
         assert!(!options.prewalk_pending());
         let mut agent = agent(&[]);
-        assert_eq!(options.arm(&mut agent), None);
+        assert_eq!(options.arm_prewalk(&mut agent), None);
         assert!(!agent.is_prewalk_armed());
         assert!(options.refresh_from(Ok(&cfg)).is_empty());
         assert!(options.take_unseen_switch().is_none());
 
         // The same when there is no config file at all.
-        let options = SessionOptions::resolve_from(None, Err(&RoleError::ConfigMissing)).unwrap();
+        let options =
+            SessionOptions::resolve_from(None, false, Err(&RoleError::ConfigMissing)).unwrap();
         assert!(!options.prewalk_pending());
     }
 
@@ -546,7 +720,7 @@ mod tests {
     fn a_config_file_that_cannot_be_read_stops_the_session() {
         // With or without the flag: the file may ask for a handoff.
         for flag in [None, Some("cheap")] {
-            let error = SessionOptions::resolve_from(flag, Err(&invalid()))
+            let error = SessionOptions::resolve_from(flag, false, Err(&invalid()))
                 .err()
                 .expect("the session must not start");
             assert!(error.contains("auth.config.json"), "{error}");
@@ -557,22 +731,25 @@ mod tests {
     #[test]
     fn an_unresolvable_target_stops_the_session() {
         let cfg = config(Some(URL_A), "");
-        assert!(SessionOptions::resolve_from(Some("planner"), Ok(&cfg)).is_err());
+        assert!(SessionOptions::resolve_from(Some("planner"), false, Ok(&cfg)).is_err());
         let cfg = config(Some(URL_A), r#", "prewalk": {"into": "planner"}"#);
-        assert!(SessionOptions::resolve_from(None, Ok(&cfg)).is_err());
+        assert!(SessionOptions::resolve_from(None, false, Ok(&cfg)).is_err());
         assert!(
-            SessionOptions::resolve_from(Some("cheap"), Err(&RoleError::ConfigMissing)).is_err()
+            SessionOptions::resolve_from(Some("cheap"), false, Err(&RoleError::ConfigMissing))
+                .is_err()
         );
     }
 
     #[test]
     fn arming_is_announced_once_per_target() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
         assert!(options.prewalk_pending());
 
         let mut first = agent(&[]);
-        let notice = options.arm(&mut first).expect("armed for the first time");
+        let notice = options
+            .arm_prewalk(&mut first)
+            .expect("armed for the first time");
         assert!(
             notice.starts_with("prewalk armed:") && notice.contains("ollama/qwen3:8b"),
             "{notice}"
@@ -581,17 +758,19 @@ mod tests {
 
         // An agent that replaces it is armed too, without saying it again.
         let mut second = agent(&[]);
-        assert_eq!(options.arm(&mut second), None);
+        assert_eq!(options.arm_prewalk(&mut second), None);
         assert!(second.is_prewalk_armed());
     }
 
     #[test]
     fn an_agent_that_can_never_hand_off_is_not_armed_and_the_user_is_told() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
 
         let mut no_todo = agent(&["todo_write"]);
-        let notice = options.arm(&mut no_todo).expect("the user must be told");
+        let notice = options
+            .arm_prewalk(&mut no_todo)
+            .expect("the user must be told");
         assert!(notice.starts_with("prewalk not armed:"), "{notice}");
         assert!(notice.contains("todo_write"), "{notice}");
         assert!(!no_todo.is_prewalk_armed());
@@ -599,25 +778,27 @@ mod tests {
         // Said every time, and the handoff is still there for an agent that
         // can take it, which is announced as armed.
         let mut no_edit = agent(&["write", "edit"]);
-        let notice = options.arm(&mut no_edit).expect("the user must be told");
+        let notice = options
+            .arm_prewalk(&mut no_edit)
+            .expect("the user must be told");
         assert!(notice.contains("write or edit"), "{notice}");
         assert!(options.prewalk_pending());
         let mut usable = agent(&[]);
-        let notice = options.arm(&mut usable).expect("armed");
+        let notice = options.arm_prewalk(&mut usable).expect("armed");
         assert!(notice.starts_with("prewalk armed:"), "{notice}");
     }
 
     #[test]
     fn headless_without_yes_is_not_armed_and_the_user_is_told() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
 
         // Without --yes, write and edit are denied, so the handoff could
         // never come due: no "armed" line, and the reason names --yes.
         let mut denied = agent(&[]);
-        let notice = options
-            .arm_headless(&mut denied, false)
-            .expect("the user must be told");
+        let notices = options.arm_headless(&mut denied, false);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
         assert!(notice.starts_with("prewalk not armed:"), "{notice}");
         assert!(notice.contains("--yes"), "{notice}");
         assert!(!denied.is_prewalk_armed());
@@ -625,16 +806,47 @@ mod tests {
 
         // With --yes the same agent is armed, and that is announced.
         let mut allowed = agent(&[]);
-        let notice = options
-            .arm_headless(&mut allowed, true)
-            .expect("armed for the first time");
+        let notices = options.arm_headless(&mut allowed, true);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
         assert!(notice.starts_with("prewalk armed:"), "{notice}");
         assert!(allowed.is_prewalk_armed());
 
         // Nothing asked for: nothing to say, with or without --yes.
-        let mut options = SessionOptions::resolve_from(None, Ok(&cfg)).unwrap();
-        assert_eq!(options.arm_headless(&mut agent(&[]), false), None);
-        assert_eq!(options.arm_headless(&mut agent(&[]), true), None);
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&cfg)).unwrap();
+        assert_eq!(
+            options.arm_headless(&mut agent(&[]), false),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            options.arm_headless(&mut agent(&[]), true),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn headless_without_yes_still_attaches_the_read_only_advisor() {
+        let cfg = config_with_advisor("");
+        let mut options = SessionOptions::resolve_from(Some("cheap"), true, Ok(&cfg)).unwrap();
+
+        // Without --yes the handoff is not armed, but the advisor writes
+        // nothing, so it is attached and announced all the same.
+        let mut denied = agent(&[]);
+        let notices = options.arm_headless(&mut denied, false);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("prewalk not armed:"), "{notices:?}");
+        assert!(notices[0].contains("--yes"), "{notices:?}");
+        assert!(notices[1].starts_with("advisor on:"), "{notices:?}");
+        assert!(!denied.is_prewalk_armed());
+        assert!(denied.has_advisor());
+        assert!(options.prewalk_pending());
+
+        // With only the advisor asked for, --yes makes no difference.
+        let mut options = SessionOptions::resolve_from(None, true, Ok(&cfg)).unwrap();
+        let mut plain = agent(&[]);
+        let notice = only(options.arm_headless(&mut plain, false));
+        assert!(notice.starts_with("advisor on:"), "{notice}");
+        assert!(plain.has_advisor());
     }
 
     #[test]
@@ -663,9 +875,9 @@ mod tests {
     #[test]
     fn a_changed_config_re_aims_or_gives_up_the_handoff() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
         let mut before = agent(&[]);
-        assert!(options.arm(&mut before).is_some());
+        assert!(options.arm_prewalk(&mut before).is_some());
 
         // The same config: nothing to say, still armed.
         assert!(options.refresh_from(Ok(&cfg)).is_empty());
@@ -679,7 +891,7 @@ mod tests {
         )
         .unwrap();
         assert!(options.refresh_from(Ok(&other_model)).is_empty());
-        let notice = options.arm(&mut agent(&[])).expect("a new target");
+        let notice = options.arm_prewalk(&mut agent(&[])).expect("a new target");
         assert!(notice.contains("ollama/phi4"), "{notice}");
 
         // The provider entry is gone: the handoff is given up, visibly, and
@@ -693,7 +905,7 @@ mod tests {
         );
         assert!(!options.prewalk_pending());
         let mut after = agent(&[]);
-        assert_eq!(options.arm(&mut after), None);
+        assert_eq!(options.arm_prewalk(&mut after), None);
         assert!(!after.is_prewalk_armed());
 
         // Given up for good: a later change does not bring it back.
@@ -705,13 +917,13 @@ mod tests {
     fn a_config_that_stops_loading_or_asking_gives_up_the_handoff() {
         let asking = config(Some(URL_A), r#", "prewalk": {"into": "cheap"}"#);
 
-        let mut options = SessionOptions::resolve_from(None, Ok(&asking)).unwrap();
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&asking)).unwrap();
         assert!(options.prewalk_pending());
         let notices = options.refresh_from(Err(&invalid()));
         assert!(notices[0].contains("could not be loaded"), "{notices:?}");
         assert!(!options.prewalk_pending());
 
-        let mut options = SessionOptions::resolve_from(None, Ok(&asking)).unwrap();
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&asking)).unwrap();
         let notices = options.refresh_from(Ok(&config(Some(URL_A), "")));
         assert!(
             notices[0].contains("no longer names a target"),
@@ -720,7 +932,7 @@ mod tests {
         assert!(!options.prewalk_pending());
 
         // A target given on the command line does not depend on the section.
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&asking)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&asking)).unwrap();
         assert!(options
             .refresh_from(Ok(&config(Some(URL_A), "")))
             .is_empty());
@@ -730,7 +942,7 @@ mod tests {
     #[test]
     fn a_switch_is_accounted_for_once() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
         // Nothing has happened: nothing unseen.
         assert!(options.take_unseen_switch().is_none());
         assert!(options.prewalk_pending());
@@ -745,7 +957,9 @@ mod tests {
         // target either: the user is told, every time.
         for _ in 0..2 {
             let mut later = agent(&[]);
-            let notice = options.arm(&mut later).expect("the user must be told");
+            let notice = options
+                .arm_prewalk(&mut later)
+                .expect("the user must be told");
             assert!(
                 notice.starts_with("prewalk is over:") && notice.contains("ollama/qwen3:8b"),
                 "{notice}"
@@ -755,21 +969,23 @@ mod tests {
         // A config change does not bring the handoff back.
         assert!(options.refresh_from(Ok(&cfg)).is_empty());
         assert!(options
-            .arm(&mut agent(&[]))
+            .arm_prewalk(&mut agent(&[]))
             .is_some_and(|n| n.starts_with("prewalk is over:")));
     }
 
     #[tokio::test]
     async fn a_switch_nobody_announced_is_accounted_for_when_the_next_agent_is_armed() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
         let handoff = options.prewalk.clone().expect("a handoff to come");
         test_support::hand_off(&handoff, true).await;
 
         // Headless mode and any path that skipped `take_unseen_switch`: the
         // next agent is still not armed, and the user is told why.
         let mut next = agent(&[]);
-        let notice = options.arm(&mut next).expect("the user must be told");
+        let notice = options
+            .arm_prewalk(&mut next)
+            .expect("the user must be told");
         assert!(
             notice.starts_with("prewalk is over:") && notice.contains("ollama/qwen3:8b"),
             "{notice}"
@@ -781,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn a_handoff_that_failed_is_not_tried_again_and_the_user_is_told() {
         let cfg = config(Some(URL_A), "");
-        let mut options = SessionOptions::resolve_from(Some("cheap"), Ok(&cfg)).unwrap();
+        let mut options = SessionOptions::resolve_from(Some("cheap"), false, Ok(&cfg)).unwrap();
         let handoff = options.prewalk.clone().expect("a handoff to come");
         // An agent takes the handoff and its brain then fails to switch.
         test_support::hand_off(&handoff, false).await;
@@ -792,14 +1008,396 @@ mod tests {
 
         // The next agent is not armed, with the reason, once.
         let mut next = agent(&[]);
-        let notice = options.arm(&mut next).expect("the user must be told");
+        let notice = options
+            .arm_prewalk(&mut next)
+            .expect("the user must be told");
         assert!(
             notice.starts_with("prewalk not armed:") && notice.contains("already tried"),
             "{notice}"
         );
         assert!(!next.is_prewalk_armed());
-        assert_eq!(options.arm(&mut agent(&[])), None);
+        assert_eq!(options.arm_prewalk(&mut agent(&[])), None);
         assert!(options.refresh_from(Ok(&cfg)).is_empty());
+    }
+
+    #[test]
+    fn the_advisor_is_off_unless_asked_for_and_refused_when_it_cannot_resolve() {
+        // A role named `advisor` alone turns nothing on.
+        let cfg = config_with_advisor("");
+        let options = SessionOptions::resolve_from(None, false, Ok(&cfg)).unwrap();
+        assert!(!options.has_advisor());
+
+        // Asked for without the role, or without a config: no session.
+        let without_role = config(Some(URL_A), "");
+        let error = SessionOptions::resolve_from(None, true, Ok(&without_role))
+            .err()
+            .expect("the session must not start");
+        assert!(error.contains("advisor"), "{error}");
+        let enabled = config(Some(URL_A), r#", "advisor": {"enabled": true}"#);
+        assert!(SessionOptions::resolve_from(None, false, Ok(&enabled)).is_err());
+        assert!(SessionOptions::resolve_from(None, true, Err(&RoleError::ConfigMissing)).is_err());
+        assert!(SessionOptions::resolve_from(None, true, Err(&invalid())).is_err());
+    }
+
+    #[test]
+    fn the_advisor_is_attached_to_each_agent_and_announced_once() {
+        let cfg = config_with_advisor("");
+        let mut options = SessionOptions::resolve_from(None, true, Ok(&cfg)).unwrap();
+        assert!(options.has_advisor());
+
+        let mut first = agent(&[]);
+        let notice = only(options.arm(&mut first));
+        assert!(
+            notice.starts_with("advisor on: ollama/reviewer") && notice.contains("at most 10"),
+            "{notice}"
+        );
+        assert!(first.has_advisor());
+
+        let mut second = agent(&[]);
+        assert!(options.arm(&mut second).is_empty());
+        assert!(second.has_advisor());
+
+        // From the config alone, with its own limit.
+        let cfg = config_with_advisor(r#", "advisor": {"enabled": true, "max_calls": 3}"#);
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&cfg)).unwrap();
+        let notice = only(options.arm(&mut agent(&[])));
+        assert!(notice.contains("at most 3"), "{notice}");
+    }
+
+    #[test]
+    fn an_agent_that_takes_no_notes_gets_no_advisor_and_the_user_is_told() {
+        let cfg = config_with_advisor("");
+        let mut options = SessionOptions::resolve_from(Some("cheap"), true, Ok(&cfg)).unwrap();
+        let mut plain = AgentBuilder::with_brain(Box::new(PlainBrain)).build();
+
+        // Neither option applies to this agent, and each says so.
+        let notices = options.arm(&mut plain);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("prewalk not armed:"), "{notices:?}");
+        assert!(
+            notices[1].starts_with("advisor not attached:") && notices[1].contains("notes"),
+            "{notices:?}"
+        );
+        assert!(!plain.has_advisor());
+        assert!(!plain.is_prewalk_armed());
+
+        // The session keeps both for an agent that can use them.
+        let mut usable = agent(&[]);
+        let notices = options.arm(&mut usable);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("prewalk armed:"), "{notices:?}");
+        assert!(notices[1].starts_with("advisor on:"), "{notices:?}");
+        assert!(usable.has_advisor());
+    }
+
+    #[test]
+    fn a_changed_config_renews_or_gives_up_the_advisor() {
+        let cfg = config_with_advisor("");
+        let mut options = SessionOptions::resolve_from(None, true, Ok(&cfg)).unwrap();
+        assert_eq!(options.arm(&mut agent(&[])).len(), 1);
+
+        // The same config: still on, nothing to say.
+        assert!(options.refresh_from(Ok(&cfg)).is_empty());
+        assert!(options.has_advisor());
+        assert!(options.arm(&mut agent(&[])).is_empty());
+
+        // The role points at another model: on, and announced again.
+        let other: ShaiConfig = serde_json::from_str(
+            &serde_json::to_string(&cfg)
+                .unwrap()
+                .replace("ollama/reviewer", "ollama/second-opinion"),
+        )
+        .unwrap();
+        assert!(options.refresh_from(Ok(&other)).is_empty());
+        let notice = only(options.arm(&mut agent(&[])));
+        assert!(notice.contains("ollama/second-opinion"), "{notice}");
+
+        // The role is gone: the advisor is given up, visibly, and the next
+        // agent does not get the one that was bound at start-up.
+        let notices = options.refresh_from(Ok(&config(Some(URL_A), "")));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("advisor off for the rest of this session:"),
+            "{notices:?}"
+        );
+        assert!(!options.has_advisor());
+        let mut after = agent(&[]);
+        assert!(options.arm(&mut after).is_empty());
+        assert!(!after.has_advisor());
+
+        // Given up for good, and never turned on by a later change.
+        assert!(options.refresh_from(Ok(&cfg)).is_empty());
+        assert!(!options.has_advisor());
+        let enabled = config_with_advisor(r#", "advisor": {"enabled": true}"#);
+        let mut off = SessionOptions::resolve_from(None, false, Ok(&cfg)).unwrap();
+        assert!(off.refresh_from(Ok(&enabled)).is_empty());
+        assert!(!off.has_advisor());
+    }
+
+    /// A provider that answers every request with an error, without a socket.
+    struct Unreachable;
+
+    #[async_trait::async_trait]
+    impl shai_llm::provider::LlmProvider for Unreachable {
+        async fn models(
+            &self,
+        ) -> Result<
+            openai_dive::v1::resources::model::ListModelResponse,
+            shai_llm::provider::LlmError,
+        > {
+            Err("no model listing".into())
+        }
+
+        async fn chat(
+            &self,
+            _: openai_dive::v1::resources::chat::ChatCompletionParameters,
+        ) -> Result<
+            openai_dive::v1::resources::chat::ChatCompletionResponse,
+            shai_llm::provider::LlmError,
+        > {
+            // Of a kind the client does not try again.
+            Err(Box::new(
+                openai_dive::v1::error::APIError::InvalidRequestError(
+                    "model not found".to_string(),
+                ),
+            ))
+        }
+
+        async fn chat_stream(
+            &self,
+            _: openai_dive::v1::resources::chat::ChatCompletionParameters,
+        ) -> Result<shai_llm::provider::LlmStream, shai_llm::provider::LlmError> {
+            Err("no streaming".into())
+        }
+
+        fn supports_functions(&self, _: String) -> bool {
+            true
+        }
+
+        fn supports_structured_output(&self, _: String) -> bool {
+            false
+        }
+
+        fn name(&self) -> &'static str {
+            "unreachable"
+        }
+
+        fn info() -> shai_llm::provider::ProviderInfo {
+            shai_llm::provider::ProviderInfo {
+                name: "unreachable",
+                display_name: "Unreachable (tests)",
+                env_vars: Vec::new(),
+            }
+        }
+    }
+
+    /// A brain that lists a directory a few times and then stops, without
+    /// asking a model. It answers that it takes advisor notes, so that an
+    /// advisor can be attached to its agent.
+    struct ListingBrain {
+        steps: usize,
+        directory: String,
+    }
+
+    #[async_trait::async_trait]
+    impl shai_core::agent::Brain for ListingBrain {
+        async fn next_step(
+            &mut self,
+            _: shai_core::agent::ThinkerContext,
+            _: shai_core::agent::ToolBudgetRef,
+        ) -> Result<shai_core::agent::ThinkerDecision, shai_core::agent::AgentError> {
+            use openai_dive::v1::resources::chat::{ChatMessage, Function, ToolCall};
+            let tool_calls = (self.steps > 0).then(|| {
+                self.steps -= 1;
+                vec![ToolCall {
+                    id: format!("call_ls_{}", self.steps),
+                    r#type: "function".to_string(),
+                    function: Function {
+                        name: "ls".to_string(),
+                        arguments: serde_json::json!({"directory": self.directory}).to_string(),
+                    },
+                }]
+            });
+            Ok(shai_core::agent::ThinkerDecision::agent_pause(
+                ChatMessage::Assistant {
+                    content: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    tool_calls,
+                    name: None,
+                    audio: None,
+                    refusal: None,
+                },
+            ))
+        }
+
+        fn takes_advisor_notes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A session whose advisor has just been switched off: an agent of the
+    /// session did two steps, and the review of each failed.
+    async fn session_with_a_failed_advisor() -> SessionOptions {
+        let (options, advisor) = session_after_failed_reviews(10, 2).await;
+        assert_eq!(advisor.calls_made(), 2);
+        assert!(advisor.is_off());
+        options
+    }
+
+    /// A session in which an agent did `steps` steps and the review of each
+    /// failed, with an advisor allowed `max_calls` reviews.
+    async fn session_after_failed_reviews(
+        max_calls: u32,
+        steps: usize,
+    ) -> (SessionOptions, Advisor) {
+        use shai_core::advisor::AdvisorLimits;
+        use shai_core::agent::Agent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let advisor = Advisor::new(
+            BoundModel::new(
+                Arc::new(LlmClient::from_provider(Box::new(Unreachable))),
+                "reviewer",
+            ),
+            dir.path(),
+            AdvisorLimits {
+                max_calls,
+                cooldown_turns: 0,
+            },
+            &config_with_advisor(""),
+        )
+        .expect("advisor");
+        let mut options = SessionOptions {
+            advisor_flag: true,
+            advisor: Some(advisor.clone()),
+            ..SessionOptions::default()
+        };
+
+        let (tools, _) = AgentBuilder::create_default_tools(Arc::new(FsOperationLog::new()));
+        let brain = ListingBrain {
+            steps,
+            directory: dir.path().to_string_lossy().into_owned(),
+        };
+        let mut agent = AgentBuilder::with_brain(Box::new(brain))
+            .tools(tools)
+            .goal("look around")
+            .sudo()
+            .build();
+        let notice = only(options.arm(&mut agent));
+        assert!(
+            notice.starts_with("advisor on: unreachable/reviewer"),
+            "{notice}"
+        );
+        assert!(agent.has_advisor());
+        tokio::time::timeout(std::time::Duration::from_secs(60), agent.run())
+            .await
+            .expect("the agent run should finish")
+            .expect("the agent run should succeed");
+        (options, advisor)
+    }
+
+    #[tokio::test]
+    async fn an_advisor_that_has_used_its_reviews_is_not_announced_as_on_again() {
+        // One review allowed, and it was made. It failed once, which does
+        // not switch the advisor off.
+        let (mut options, advisor) = session_after_failed_reviews(1, 1).await;
+        assert_eq!(advisor.calls_made(), 1);
+        assert!(!advisor.is_off());
+
+        let mut next = agent(&[]);
+        let notice = only(options.arm(&mut next));
+        assert_eq!(
+            notice,
+            "advisor off for the rest of this session: it has used all 1 of its reviews"
+        );
+        assert!(!next.has_advisor());
+        // Said once.
+        assert!(!options.has_advisor());
+        assert!(options.arm(&mut agent(&[])).is_empty());
+
+        // With reviews left, what is announced is what is left.
+        let (mut options, advisor) = session_after_failed_reviews(3, 1).await;
+        assert_eq!(advisor.calls_made(), 1);
+        options.advisor_announced = None;
+        let mut next = agent(&[]);
+        let notice = only(options.arm(&mut next));
+        assert!(notice.ends_with("read-only, at most 2 times"), "{notice}");
+        assert!(next.has_advisor());
+    }
+
+    #[tokio::test]
+    async fn an_advisor_that_was_switched_off_is_not_announced_as_on_again() {
+        let cfg = config_with_advisor("");
+        // Each case below starts from the same moment of the same session.
+        let failed = session_with_a_failed_advisor().await;
+
+        // The config is read again for the next agent and names a model the
+        // advisor has not been announced with.
+        let mut options = failed.clone();
+        assert!(options.refresh_from(Ok(&cfg)).is_empty());
+        let mut next = agent(&[]);
+        let notice = only(options.arm(&mut next));
+        assert_eq!(
+            notice,
+            "advisor off for the rest of this session: \
+             it was switched off earlier, after its reviews kept failing"
+        );
+        assert!(!next.has_advisor());
+        // Said once, and nothing brings the advisor back.
+        assert!(!options.has_advisor());
+        assert!(options.arm(&mut agent(&[])).is_empty());
+        assert!(options.refresh_from(Ok(&cfg)).is_empty());
+        let mut later = agent(&[]);
+        assert!(options.arm(&mut later).is_empty());
+        assert!(!later.has_advisor());
+
+        // The same when the next agent is one that takes no notes, and the
+        // one after it is one that does.
+        let mut options = failed.clone();
+        let mut plain = AgentBuilder::with_brain(Box::new(PlainBrain)).build();
+        let notice = only(options.arm(&mut plain));
+        assert!(
+            notice.starts_with("advisor off for the rest of this session:"),
+            "{notice}"
+        );
+        let mut usable = agent(&[]);
+        assert!(options.arm(&mut usable).is_empty());
+        assert!(!usable.has_advisor());
+
+        // And when nothing changed at all: the next agent is not attached to
+        // an advisor that will not run, and the user is told why.
+        let mut options = failed;
+        let mut next = agent(&[]);
+        let notice = only(options.arm(&mut next));
+        assert!(
+            notice.starts_with("advisor off for the rest of this session:"),
+            "{notice}"
+        );
+        assert!(!next.has_advisor());
+    }
+
+    #[test]
+    fn a_config_that_stops_loading_or_asking_gives_up_the_advisor() {
+        let enabled = config_with_advisor(r#", "advisor": {"enabled": true}"#);
+
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&enabled)).unwrap();
+        assert!(options.has_advisor());
+        let notices = options.refresh_from(Err(&invalid()));
+        assert!(notices[0].contains("could not be loaded"), "{notices:?}");
+        assert!(!options.has_advisor());
+
+        let mut options = SessionOptions::resolve_from(None, false, Ok(&enabled)).unwrap();
+        let notices = options.refresh_from(Ok(&config_with_advisor("")));
+        assert!(notices[0].contains("no longer turns it on"), "{notices:?}");
+        assert!(!options.has_advisor());
+
+        // Asked for on the command line: it does not depend on the section.
+        let mut options = SessionOptions::resolve_from(None, true, Ok(&enabled)).unwrap();
+        assert!(options
+            .refresh_from(Ok(&config_with_advisor("")))
+            .is_empty());
+        assert!(options.has_advisor());
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ These flags work with most commands.
 | `--latest` | Restore the most recent session |
 | `--trace` | Dump entire trace upon completion (headless mode only) |
 | `--temperature <float>` | Set the LLM sampling temperature |
+| `--advisor` | Have a second model, the `advisor` role, review the agent's steps and leave short notes. Read-only. See [Advisor](configurations/auth.md#advisor) |
 | `--prewalk-into <target>` | Hand the session off to another model after its first edit. `<target>` is a role name or `<provider>/<model>`; overrides `prewalk.into` from the config. See [Prewalk](configurations/auth.md#prewalk) |
 | `--tools <list>` | Only allow these built-in tools (comma-separated, headless mode). With `--agent`, restricts the agent's tools: tools it does not have are not added, and its MCP tools are dropped unless listed as `<server>:<tool>`. A built-in name never matches an MCP tool that reuses it |
 | `--remove <list>` | Remove specific tools (comma-separated, headless mode), also from the `--agent`'s tools. MCP tools are removed as `<server>:<tool>` |
@@ -135,6 +136,9 @@ shai -a myagent --yes -p "fix this bug"
 
 # With temperature
 shai -p "review this function" --temperature 0.5
+
+# Let a second model review the work as it goes (needs an "advisor" role)
+shai -p "migrate the config loader to the new schema" --advisor --yes
 
 # Plan on the primary model, then continue on a cheaper one after the first edit
 shai -p "add input validation to the signup form" --prewalk-into cheap --yes

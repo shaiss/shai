@@ -151,8 +151,10 @@ impl PrettyFormatter {
                 // Todo updates are displayed in the sidebar, not in the main output
                 None
             }
-            AgentEvent::ModelSwitched { .. } => {
-                // A one-line notice, rendered by each front-end (see `notice_text`)
+            AgentEvent::ModelSwitched { .. }
+            | AgentEvent::AdvisorNote { .. }
+            | AgentEvent::AdvisorFailed { .. } => {
+                // One-line notices, rendered by each front-end (see `notice_text`)
                 None
             }
         }

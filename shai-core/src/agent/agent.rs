@@ -1,3 +1,4 @@
+use crate::agent::actions::advisor::AdvisorSession;
 use crate::agent::prewalk::{Prewalk, PrewalkSignals};
 use crate::agent::ClaimManager;
 use crate::tools::fs::operation_log::FsOperationLog;
@@ -187,6 +188,17 @@ pub struct AgentCore {
 
     /// handoff to another model, while one is armed (see `agent::prewalk`)
     pub(crate) prewalk: Option<Prewalk>,
+
+    /// second model reviewing this session's steps, if any
+    pub(crate) advisor: Option<AdvisorSession>,
+
+    /// Provider and MCP values this agent was built with, so an advisor can
+    /// keep them out of what it is sent. Never logged.
+    pub(crate) redaction_secrets: Vec<(String, String)>,
+
+    /// Next advisor review ID, kept at the agent level so that reattaching
+    /// the advisor does not reuse IDs of reviews that may still complete.
+    pub(crate) next_review_id: u64,
 }
 
 pub struct AgentSocket {
@@ -241,6 +253,9 @@ impl AgentCore {
                 tool_budget,
             },
             prewalk: None,
+            advisor: None,
+            redaction_secrets: Vec::new(),
+            next_review_id: 0,
         }
     }
 
@@ -575,7 +590,7 @@ impl AgentCore {
                     .and({
                         // Remove trailing assistant messages and tool calls to re-think
                         // from the last user message
-                        {
+                        let rewound_to = {
                             let mut trace = self.tool_ctx.trace.write().await;
                             while let Some(msg) = trace.last() {
                                 match msg {
@@ -585,7 +600,9 @@ impl AgentCore {
                                     }
                                 }
                             }
-                        }
+                            trace.len()
+                        };
+                        self.advisor_rewound(rewound_to);
                         self.set_state(InternalAgentState::Running).await;
                         Ok(AgentResponse::Ack)
                     })
