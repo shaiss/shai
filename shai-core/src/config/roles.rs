@@ -555,6 +555,34 @@ fn describe_load_error(error: &(dyn std::error::Error + 'static)) -> String {
     }
 }
 
+/// Why [`ShaiConfig::primary`] could not load a config for the session.
+///
+/// Every variant is a refused start: the session must not begin without a
+/// usable primary config. Front-ends map this to process exit code 2.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrimaryConfigError {
+    /// There is no config file. The built-in anonymous default is never used
+    /// to start a session.
+    #[error("no config file found; run `shai auth` to choose a provider (see docs/configurations/auth.md#first-run)")]
+    Missing,
+
+    /// The config file exists but could not be read or parsed.
+    #[error("the config file {path} could not be loaded ({reason})")]
+    Invalid { path: String, reason: String },
+
+    /// The file was seen but could not be used as a primary config (for
+    /// example a malformed `roles` section that `load_for_roles` rejects).
+    #[error("{0}")]
+    Other(String),
+}
+
+impl PrimaryConfigError {
+    /// A missing or unusable auth config is a refused start (exit 2).
+    pub fn is_refused_start(&self) -> bool {
+        true
+    }
+}
+
 impl ShaiConfig {
     /// Why the user's config file cannot be loaded, if it is there and does
     /// not load: its path and what is wrong with it, without repeating
@@ -568,17 +596,19 @@ impl ShaiConfig {
 
     /// The config the primary model runs on, loaded once.
     ///
-    /// The built-in default stands in only when there is no config file. A
-    /// file that is there and cannot be read is an error, never a silent
-    /// fallback to that default.
-    pub fn primary() -> Result<ShaiConfig, String> {
+    /// A missing file is an error: the built-in anonymous OVHcloud default is
+    /// never used to start a session. A file that is there and cannot be
+    /// read is also an error, never a silent fallback to that default.
+    pub fn primary() -> Result<ShaiConfig, PrimaryConfigError> {
         Self::primary_from(Self::load_for_roles())
     }
 
     /// The caller's already-loaded config, or a fresh [`ShaiConfig::primary`]
     /// load if they have not passed one. Serve uses this so HTTP sessions
     /// keep the startup snapshot instead of reading the file again.
-    pub fn from_snapshot_or_primary(primary: Option<&ShaiConfig>) -> Result<ShaiConfig, String> {
+    pub fn from_snapshot_or_primary(
+        primary: Option<&ShaiConfig>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         match primary {
             Some(config) => Ok(config.clone()),
             None => Self::primary(),
@@ -586,14 +616,16 @@ impl ShaiConfig {
     }
 
     /// [`ShaiConfig::primary`] from an already-attempted load.
-    pub fn primary_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
+    pub fn primary_from(
+        config: Result<ShaiConfig, RoleError>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         match config {
             Ok(config) => Ok(config),
-            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
-            Err(RoleError::ConfigInvalid { path, reason }) => Err(format!(
-                "the config file {path} could not be loaded ({reason})"
-            )),
-            Err(error) => Err(error.to_string()),
+            Err(RoleError::ConfigMissing) => Err(PrimaryConfigError::Missing),
+            Err(RoleError::ConfigInvalid { path, reason }) => {
+                Err(PrimaryConfigError::Invalid { path, reason })
+            }
+            Err(error) => Err(PrimaryConfigError::Other(error.to_string())),
         }
     }
 
@@ -601,13 +633,13 @@ impl ShaiConfig {
     pub fn primary_from_paths(
         config_path: &std::path::Path,
         legacy_path: &std::path::Path,
-    ) -> Result<ShaiConfig, String> {
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         Self::primary_from(Self::load_for_roles_from(config_path, legacy_path))
     }
 
     /// Load the user's config for resolving secondary models.
     ///
-    /// Unlike [`ShaiConfig::get_llm`] and [`ShaiConfig::load_or_default`], this
+    /// Unlike [`ShaiConfig::load_or_default`] (used by the auth wizard), this
     /// never substitutes the built-in default config: without a readable
     /// config file there is nothing a role could legitimately refer to.
     pub fn load_for_roles() -> Result<ShaiConfig, RoleError> {
@@ -1081,16 +1113,22 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_config_defaults_only_when_the_file_is_missing() {
+    fn the_primary_config_does_not_use_the_default_when_the_file_is_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("auth.config.json");
         let legacy = dir.path().join("auth.config");
 
-        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
-        assert_eq!(
-            primary.providers[0].provider,
-            ShaiConfig::default().providers[0].provider
+        let error = ShaiConfig::primary_from_paths(&path, &legacy).unwrap_err();
+        assert!(matches!(error, PrimaryConfigError::Missing), "{error:?}");
+        assert!(error.is_refused_start());
+        let message = error.to_string();
+        assert!(message.contains("no config file found"), "{message}");
+        assert!(message.contains("shai auth"), "{message}");
+        assert!(
+            message.contains("docs/configurations/auth.md#first-run"),
+            "{message}"
         );
+        assert!(!message.to_lowercase().contains("ovh"), "{message}");
 
         std::fs::write(
             &path,
@@ -1103,9 +1141,15 @@ mod tests {
 
         std::fs::write(&path, "{ this is not json").unwrap();
         let error = ShaiConfig::primary_from_paths(&path, &legacy).unwrap_err();
-        assert!(error.contains("auth.config.json"), "{error}");
-        assert!(error.contains("could not be loaded"), "{error}");
-        assert!(!error.to_lowercase().contains("ovh"), "{error}");
+        assert!(
+            matches!(error, PrimaryConfigError::Invalid { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_refused_start());
+        let message = error.to_string();
+        assert!(message.contains("auth.config.json"), "{message}");
+        assert!(message.contains("could not be loaded"), "{message}");
+        assert!(!message.to_lowercase().contains("ovh"), "{message}");
 
         // A caller that already holds a good snapshot must not reread the
         // now-broken file.

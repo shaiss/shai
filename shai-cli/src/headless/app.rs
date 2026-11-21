@@ -171,37 +171,49 @@ impl AppHeadless {
             .run()
             .await;
 
-        match result {
-            Ok(AgentResult {
-                success: _success,
-                message: _message,
-                trace: agent_trace,
-            }) => {
-                // TODO: use `success` to set exit code and `message` for summary output
-                if trace {
-                    println!("{}", serde_json::to_string_pretty(&agent_trace)?);
-                } else {
-                    if let Some(message) = agent_trace.last() {
-                        match message {
-                            ChatMessage::Assistant {
-                                content: Some(ChatMessageContent::Text(content)),
-                                ..
-                            } => {
-                                println!("{}", content);
-                            }
-                            ChatMessage::Tool { content, .. } => {
-                                println!("{}", content);
-                            }
-                            _ => {}
-                        }
+        finish_headless_run(result, trace)
+    }
+}
+
+/// Print the headless result and return an error when the agent did not
+/// succeed, so the process exits non-zero. Exit 0 used to be returned
+/// after `Agent failed: …` as well.
+fn finish_headless_run(
+    result: Result<AgentResult, AgentError>,
+    trace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match result {
+        Ok(AgentResult {
+            success,
+            message: _,
+            trace: agent_trace,
+        }) => {
+            if trace {
+                println!("{}", serde_json::to_string_pretty(&agent_trace)?);
+            } else if let Some(message) = agent_trace.last() {
+                match message {
+                    ChatMessage::Assistant {
+                        content: Some(ChatMessageContent::Text(content)),
+                        ..
+                    } => {
+                        println!("{}", content);
                     }
+                    ChatMessage::Tool { content, .. } => {
+                        println!("{}", content);
+                    }
+                    _ => {}
                 }
             }
-            Err(e) => {
-                eprintln!("Agent failed: {}", e);
+            if !success {
+                eprintln!("Agent failed");
+                return Err("agent did not succeed".into());
             }
+            Ok(())
         }
-        Ok(())
+        Err(e) => {
+            eprintln!("Agent failed: {}", e);
+            Err(e.into())
+        }
     }
 }
 
@@ -382,5 +394,28 @@ mod tests {
         .await;
         assert!(!prompted);
         assert!(target.exists(), "write did not run with --yes");
+    }
+
+    #[test]
+    fn finish_headless_run_errors_when_the_agent_does_not_succeed() {
+        let failed = AgentResult {
+            success: false,
+            message: "Agent completed".to_string(),
+            trace: vec![],
+        };
+        let error =
+            finish_headless_run(Ok(failed), false).expect_err("success: false must not exit 0");
+        assert!(error.to_string().contains("did not succeed"), "{error}");
+
+        let error = finish_headless_run(Err(AgentError::ExecutionError("boom".into())), false)
+            .expect_err("Agent failed must not exit 0");
+        assert!(error.to_string().contains("boom"), "{error}");
+
+        let ok = AgentResult {
+            success: true,
+            message: "Agent completed".to_string(),
+            trace: vec![],
+        };
+        finish_headless_run(Ok(ok), false).expect("a successful run still exits 0");
     }
 }

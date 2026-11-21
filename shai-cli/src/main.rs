@@ -9,7 +9,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use headless::app::AppHeadless;
-use session_options::SessionOptions;
+use session_options::{SessionOptions, SessionStartError};
 
 use console::strip_ansi_codes;
 use futures::StreamExt;
@@ -65,7 +65,8 @@ struct Cli {
     /// Dump entire trace upon completion (headless mode only)
     #[arg(long, global = true)]
     trace: bool,
-    /// the url to pull the default shai config
+    /// Opt-in URL of a starter auth config to pull when none exists.
+    /// There is no default URL. A failed pull writes nothing.
     #[arg(long)]
     default_shai_config_url: Option<String>,
     /// List all available tools
@@ -359,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref stdin_content) = stdin_input {
                     messages.push(stdin_content.clone());
                 }
-                let _ = handle_fix(HeadlessRun {
+                handle_fix(HeadlessRun {
                     prompt: messages,
                     tools: cli.tools,
                     remove: cli.remove,
@@ -369,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     yes: cli.yes,
                     session_options: session_options.clone(),
                 })
-                .await;
+                .await?;
                 return Ok(());
             }
 
@@ -393,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 } else {
                     // Headless mode from pipe
-                    let _ = handle_fix(HeadlessRun {
+                    handle_fix(HeadlessRun {
                         prompt: vec![stdin_content],
                         tools: cli.tools,
                         remove: cli.remove,
@@ -403,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         yes: cli.yes,
                         session_options: session_options.clone(),
                     })
-                    .await;
+                    .await?;
                     return Ok(());
                 }
             }
@@ -456,22 +457,25 @@ async fn default_config(default_config_url: Option<String>) {
         Err(_) => {}
     }
 
-    let default_url = match default_config_url {
-        Some(url) => url,
-        None => {
-            "https://raw.githubusercontent.com/ovh/shai/refs/heads/main/.shai.config".to_string()
+    // A missing file is no longer filled with the built-in anonymous
+    // OVHcloud default, and the upstream starter config is not fetched
+    // unless the user passed --default-shai-config-url. Session start then
+    // fails closed and asks them to run `shai auth`.
+    let Some(default_url) = default_config_url else {
+        return;
+    };
+    let Ok(parsed_url) = default_url.parse() else {
+        eprintln!("error: invalid --default-shai-config-url");
+        return;
+    };
+    match ShaiConfig::pull_from_url(parsed_url).await {
+        Ok(config) => {
+            let _ = config.save();
         }
-    };
-
-    let config = if let Ok(parsed_url) = default_url.parse() {
-        ShaiConfig::pull_from_url(parsed_url)
-            .await
-            .unwrap_or_else(|_| ShaiConfig::default())
-    } else {
-        ShaiConfig::default()
-    };
-
-    let _ = config.save();
+        Err(error) => {
+            eprintln!("error: failed to pull starter config: {error}");
+        }
+    }
 }
 
 async fn handle_main(
@@ -486,7 +490,7 @@ async fn handle_main(
         app.initial_modal = modal;
     }
     if let Err(e) = app.run(agent_name, restore_session_id).await {
-        eprintln!("error: {}", e)
+        exit_session_error(e);
     }
     Ok(())
 }
@@ -500,9 +504,17 @@ async fn handle_main_with_prompt(
     app.session_options = session_options;
     app.initial_prompt = Some(prompt);
     if let Err(e) = app.run(agent_name, None).await {
-        eprintln!("error: {}", e)
+        exit_session_error(e);
     }
     Ok(())
+}
+
+/// A refused start (no config, unreadable config) is exit 2; any other
+/// failure starting or running the TUI is exit 1. The code comes from
+/// the error's kind, not from matching the message text.
+fn exit_session_error(err: SessionStartError) -> ! {
+    eprintln!("error: {}", err);
+    std::process::exit(err.exit_code());
 }
 
 async fn handle_config() -> Result<(), Box<dyn std::error::Error>> {

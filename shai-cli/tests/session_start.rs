@@ -3,8 +3,9 @@
 
 //! What the `shai` binary does when a session option cannot be honoured.
 //!
-//! Every case here ends before a session starts, so no model is contacted,
-//! and every case has a config file, so no starter config is downloaded.
+//! Every case here ends before a session starts, so no model is contacted.
+//! Cases with a config file must not download a starter over it. A first
+//! run with no config file must not write the built-in anonymous default.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -213,5 +214,69 @@ fn the_flag_is_refused_where_no_session_starts() {
         outcome.stdout.contains("shai version"),
         "{}",
         outcome.stdout
+    );
+}
+
+#[test]
+fn a_missing_config_file_stops_the_session_and_writes_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_home = dir.path().join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // Bare `shai` is the TUI path: stdin is not a terminal here, so it
+    // still reaches App::run. A timeout keeps a hung TUI from stalling
+    // the suite. This case must fail on a build that swallows the start
+    // error and exits 0.
+    for args in [&[][..], &["-p", "hello"][..], &["serve"][..]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_shai"))
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("NO_COLOR", "1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .current_dir(&work)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the shai binary should start");
+
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("shai {args:?} did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "shai {args:?} must exit 2 without a config file, got {:?}\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            stderr.contains("no config file found") && stderr.contains("shai auth"),
+            "shai {args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.to_lowercase().contains("ovh"),
+            "shai {args:?} must not mention the anonymous default: {stderr}"
+        );
+    }
+
+    let shai_dir = config_home.join("shai");
+    assert!(
+        !shai_dir.exists() || std::fs::read_dir(&shai_dir).unwrap().next().is_none(),
+        "a missing config must not be replaced by a starter file"
     );
 }

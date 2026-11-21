@@ -288,10 +288,13 @@ impl ShaiConfig {
             .unwrap_or(false)
     }
 
-    /// Load the config, falling back to the default one.
+    /// Load the config, or the built-in default as an in-memory template.
     ///
-    /// Returns a warning message only when a config file exists but could not
-    /// be loaded; a missing file is the normal first-run case.
+    /// Used by the auth wizard so a first `shai auth` has something to show.
+    /// This is not a session-start path: [`ShaiConfig::primary`] refuses a
+    /// missing or unreadable file and does not fall back. A warning is
+    /// returned only when a config file exists but could not be loaded; the
+    /// default is not written unless the user saves.
     pub fn load_or_default() -> (ShaiConfig, Option<String>) {
         match Self::load() {
             Ok(config) => (config, None),
@@ -468,16 +471,14 @@ impl Default for ShaiConfig {
 
 impl ShaiConfig {
     pub async fn get_llm() -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
-        let config = ShaiConfig::load().unwrap_or_else(|e| {
-            tracing::warn!("Failed to load config, using default: {}", e);
-            ShaiConfig::default()
-        });
+        // Same rule as a session start: a missing or unreadable file is an
+        // error, never a silent fallback to the built-in anonymous default.
+        let config = ShaiConfig::primary()?;
         config.get_llm_from_config().await
     }
 
     /// Build the LLM client and default model from this already-loaded config.
-    /// Unlike [`ShaiConfig::get_llm`], this never loads the file again and never
-    /// falls back to [`ShaiConfig::default`].
+    /// Unlike [`ShaiConfig::get_llm`], this never loads the file again.
     ///
     /// This exports the selected provider's variables into the process
     /// environment, so child tools can see them. When a replacement is being

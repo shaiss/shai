@@ -45,7 +45,6 @@ pub struct AgentTools {
 pub struct AgentConfig {
     pub name: String,
     pub description: String,
-    #[serde(default = "default_llm_provider")]
     pub llm_provider: AgentProviderConfig,
     #[serde(default)]
     pub tools: AgentTools,
@@ -224,29 +223,13 @@ fn llm_provider_from_config(shai_config: &ShaiConfig) -> AgentProviderConfig {
     }
 }
 
-fn default_llm_provider() -> AgentProviderConfig {
-    // Used when an agent file omits `llm_provider` and is deserialized
-    // without going through [`AgentConfig::load`]. `load` refuses a broken
-    // auth config before this is called.
-    match ShaiConfig::primary() {
-        Ok(config) => llm_provider_from_config(&config),
-        Err(error) => {
-            tracing::error!(
-                "broken auth config while defaulting an agent's provider: {}",
-                error
-            );
-            llm_provider_from_config(&ShaiConfig::default())
-        }
-    }
-}
-
 /// Fill in `llm_provider` from the auth config when the agent file omits it.
-/// A broken auth config is an error; the built-in default is used only when
-/// there is no config file. If the agent file names its own provider, a
-/// broken auth config is ignored.
+/// A missing or unusable auth config is an error; the built-in anonymous
+/// default is never used. If the agent file names its own provider, a
+/// missing or broken auth config is ignored.
 pub(crate) fn agent_config_from_value(
     mut value: serde_json::Value,
-    primary: Result<ShaiConfig, String>,
+    primary: Result<ShaiConfig, crate::config::roles::PrimaryConfigError>,
     path: Option<&Path>,
 ) -> Result<AgentConfig, Box<dyn std::error::Error>> {
     if !value.is_object() {
@@ -529,7 +512,7 @@ mod broken_config_fallback_tests {
         .unwrap()
     }
 
-    fn broken() -> Result<ShaiConfig, String> {
+    fn broken() -> Result<ShaiConfig, crate::config::roles::PrimaryConfigError> {
         ShaiConfig::primary_from(Err(RoleError::ConfigInvalid {
             path: "/home/me/.config/shai/auth.config.json".to_string(),
             reason: "JSON syntax error at line 3 column 7".to_string(),
@@ -548,8 +531,7 @@ mod broken_config_fallback_tests {
     }
 
     #[test]
-    fn a_named_agent_without_its_own_provider_uses_the_auth_config_or_the_default_if_it_is_missing()
-    {
+    fn a_named_agent_without_its_own_provider_uses_the_auth_config_and_errors_if_it_is_missing() {
         let cfg: ShaiConfig = serde_json::from_str(
             r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
         )
@@ -558,16 +540,16 @@ mod broken_config_fallback_tests {
         assert_eq!(loaded.llm_provider.provider, "openai");
         assert_eq!(loaded.llm_provider.model, "gpt-4o");
 
-        let loaded = agent_config_from_value(
+        let error = agent_config_from_value(
             agent_json(false),
             ShaiConfig::primary_from(Err(RoleError::ConfigMissing)),
             None,
         )
-        .unwrap();
-        assert_eq!(
-            loaded.llm_provider.provider,
-            ShaiConfig::default().providers[0].provider
-        );
+        .map(|_| ())
+        .expect_err("a missing auth config must not be replaced by the default");
+        let message = error.to_string();
+        assert!(message.contains("no config file found"), "{message}");
+        assert!(message.contains("shai auth"), "{message}");
     }
 
     #[test]
@@ -631,5 +613,24 @@ mod broken_config_fallback_tests {
         let loaded = AgentConfig::load_with_primary("reviewer", Some(&snapshot)).unwrap();
         assert_eq!(loaded.llm_provider.provider, "openai");
         assert_eq!(loaded.llm_provider.model, "snapshot-model");
+    }
+
+    #[test]
+    fn deserializing_an_agent_config_without_llm_provider_does_not_use_the_anonymous_default() {
+        // The serde default on `llm_provider` is gone: a bare deserialize
+        // (not going through `agent_config_from_value`) must fail closed
+        // instead of filling the built-in anonymous OVHcloud provider.
+        let json = r#"{"name":"reviewer","description":"a named agent"}"#;
+        let error = serde_json::from_str::<AgentConfig>(json)
+            .expect_err("omitting llm_provider must not deserialize as the anonymous default");
+        let message = error.to_string();
+        assert!(
+            message.contains("llm_provider"),
+            "expected a missing-field error, got: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("ovh"),
+            "deserialize must not mention the anonymous default: {message}"
+        );
     }
 }
