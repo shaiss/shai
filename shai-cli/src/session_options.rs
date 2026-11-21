@@ -84,10 +84,10 @@ impl SessionOptions {
 
     /// The config an agent without its own provider runs on, loaded once.
     ///
-    /// The built-in default stands in only when there is no config file. A
-    /// file that is there and cannot be read is an error, as at start-up:
-    /// the primary model is built from this same load, so the file cannot
-    /// break between a check and the read that builds the client.
+    /// A missing file is an error (run `shai auth`). A file that is there
+    /// and cannot be read is also an error, as at start-up: the primary
+    /// model is built from this same load, so the file cannot break between
+    /// a check and the read that builds the client.
     pub fn primary_config() -> Result<ShaiConfig, String> {
         ShaiConfig::primary()
     }
@@ -638,18 +638,18 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_model_runs_on_the_default_only_without_a_config_file() {
+    fn the_primary_model_does_not_use_the_default_when_the_file_is_missing() {
         // The user's file, as loaded.
         let cfg = config(Some(URL_A), "");
         let primary = SessionOptions::primary_config_from(Ok(cfg)).unwrap();
         assert_eq!(primary.providers[0].provider, "openai");
 
-        // No file at all: the built-in default, as before.
-        let primary = SessionOptions::primary_config_from(Err(RoleError::ConfigMissing)).unwrap();
-        assert_eq!(
-            primary.providers[0].provider,
-            ShaiConfig::default().providers[0].provider
-        );
+        // No file at all: refuse to start, do not use the built-in default.
+        let error = SessionOptions::primary_config_from(Err(RoleError::ConfigMissing))
+            .map(|_| ())
+            .expect_err("no default for a missing file");
+        assert!(error.contains("no config file found"), "{error}");
+        assert!(error.contains("shai auth"), "{error}");
 
         // A file that is there and does not load is never replaced by the
         // default: the agent does not start, and the user is told why.

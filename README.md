@@ -33,7 +33,7 @@ The `shai` binary will be installed in `$HOME/.local/bin`
 
 ## Quick Start
 
-By default `shai` uses OVHcloud as an anonymous user meaning you will be rate limited! If you want to sign in with your account or select another provider, run:
+`shai` will not start on the built-in anonymous OVHcloud default. Sign in or select a provider first:
 
 ```bash
 shai auth

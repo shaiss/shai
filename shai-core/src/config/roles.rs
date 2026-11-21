@@ -568,9 +568,9 @@ impl ShaiConfig {
 
     /// The config the primary model runs on, loaded once.
     ///
-    /// The built-in default stands in only when there is no config file. A
-    /// file that is there and cannot be read is an error, never a silent
-    /// fallback to that default.
+    /// A missing file is an error: the built-in anonymous OVHcloud default is
+    /// never used to start a session. A file that is there and cannot be
+    /// read is also an error, never a silent fallback to that default.
     pub fn primary() -> Result<ShaiConfig, String> {
         Self::primary_from(Self::load_for_roles())
     }
@@ -589,7 +589,9 @@ impl ShaiConfig {
     pub fn primary_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
         match config {
             Ok(config) => Ok(config),
-            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
+            Err(RoleError::ConfigMissing) => {
+                Err("no config file found; run `shai auth` to choose a provider".to_string())
+            }
             Err(RoleError::ConfigInvalid { path, reason }) => Err(format!(
                 "the config file {path} could not be loaded ({reason})"
             )),
@@ -607,7 +609,7 @@ impl ShaiConfig {
 
     /// Load the user's config for resolving secondary models.
     ///
-    /// Unlike [`ShaiConfig::get_llm`] and [`ShaiConfig::load_or_default`], this
+    /// Unlike [`ShaiConfig::load_or_default`] (used by the auth wizard), this
     /// never substitutes the built-in default config: without a readable
     /// config file there is nothing a role could legitimately refer to.
     pub fn load_for_roles() -> Result<ShaiConfig, RoleError> {
@@ -1081,16 +1083,15 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_config_defaults_only_when_the_file_is_missing() {
+    fn the_primary_config_does_not_use_the_default_when_the_file_is_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("auth.config.json");
         let legacy = dir.path().join("auth.config");
 
-        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
-        assert_eq!(
-            primary.providers[0].provider,
-            ShaiConfig::default().providers[0].provider
-        );
+        let error = ShaiConfig::primary_from_paths(&path, &legacy).unwrap_err();
+        assert!(error.contains("no config file found"), "{error}");
+        assert!(error.contains("shai auth"), "{error}");
+        assert!(!error.to_lowercase().contains("ovh"), "{error}");
 
         std::fs::write(
             &path,

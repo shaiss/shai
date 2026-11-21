@@ -548,8 +548,7 @@ mod broken_config_fallback_tests {
     }
 
     #[test]
-    fn a_named_agent_without_its_own_provider_uses_the_auth_config_or_the_default_if_it_is_missing()
-    {
+    fn a_named_agent_without_its_own_provider_uses_the_auth_config_and_errors_if_it_is_missing() {
         let cfg: ShaiConfig = serde_json::from_str(
             r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
         )
@@ -558,16 +557,16 @@ mod broken_config_fallback_tests {
         assert_eq!(loaded.llm_provider.provider, "openai");
         assert_eq!(loaded.llm_provider.model, "gpt-4o");
 
-        let loaded = agent_config_from_value(
+        let error = agent_config_from_value(
             agent_json(false),
             ShaiConfig::primary_from(Err(RoleError::ConfigMissing)),
             None,
         )
-        .unwrap();
-        assert_eq!(
-            loaded.llm_provider.provider,
-            ShaiConfig::default().providers[0].provider
-        );
+        .map(|_| ())
+        .expect_err("a missing auth config must not be replaced by the default");
+        let message = error.to_string();
+        assert!(message.contains("no config file found"), "{message}");
+        assert!(message.contains("shai auth"), "{message}");
     }
 
     #[test]
