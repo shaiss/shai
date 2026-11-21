@@ -138,7 +138,7 @@ shai -a myagent --yes -p "fix this bug"
 shai -p "review this function" --temperature 0.5
 
 # Let a second model review the work as it goes (needs an "advisor" role)
-shai -p "migrate the config loader to the new schema" --advisor
+shai -p "migrate the config loader to the new schema" --advisor --yes
 
 # Plan on the primary model, then continue on a cheaper one after the first edit
 shai -p "add input validation to the signup form" --prewalk-into cheap --yes

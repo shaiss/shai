@@ -160,6 +160,17 @@ fn all_text(request: &Served) -> String {
         .join("\n")
 }
 
+/// Every message in a request, including system prompts. Used when asserting
+/// that a note or a secret is absent from what was sent.
+fn all_payloads(request: &Served) -> String {
+    request
+        .messages
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn tool_results(request: &Served) -> Vec<String> {
     request
         .messages
@@ -276,7 +287,7 @@ async fn a_note_reaches_the_agent_at_its_next_step_and_nowhere_else() {
     let main = outcome.main.served();
     assert_eq!(main.len(), 3);
     // Before the review there is nothing to show.
-    assert!(!all_text(&main[0]).contains("advisor note"));
+    assert!(!all_payloads(&main[0]).contains("advisor note"));
 
     // The next request carries the note, at the end of the tool result of
     // the step that was reviewed, inside its fixed frame.
@@ -293,7 +304,7 @@ async fn a_note_reaches_the_agent_at_its_next_step_and_nowhere_else() {
     assert_eq!(main[1].messages.len(), main[0].messages.len() + 2);
 
     // It is shown once: the request after that does not have it...
-    assert!(!all_text(&main[2]).contains("advisor note"));
+    assert!(!all_payloads(&main[2]).contains("advisor note"));
     // ...and it never enters the stored conversation.
     let stored = serde_json::to_string(&outcome.result.trace).unwrap();
     assert!(!stored.contains("advisor note"), "{stored}");
@@ -640,7 +651,7 @@ async fn secrets_and_the_environment_are_kept_out_of_what_the_advisor_is_sent() 
     let reviews = outcome.advisor.served();
     assert_eq!(reviews.len(), 2);
     for review in &reviews {
-        let sent = all_text(review);
+        let sent = all_payloads(review);
         for secret in [
             // Known to the process: a provider setting, an MCP token, a
             // value of the environment.
@@ -991,7 +1002,14 @@ async fn a_review_is_given_up_when_the_user_speaks() {
     assert!(!advisor.is_off());
 
     controller.terminate().await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(60), run).await;
+    let joined = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the agent task must exit after terminate");
+    let result = joined.expect("the agent task must not panic");
+    assert!(
+        result.is_ok(),
+        "terminate should complete the agent, got {result:?}"
+    );
     while let Ok(event) = events.try_recv() {
         assert!(
             !matches!(
@@ -1158,7 +1176,14 @@ async fn steps_done_again_after_a_regenerate_are_reviewed_again() {
     assert_eq!(advisor.calls_made(), 2);
 
     controller.terminate().await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(60), run).await;
+    let joined = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the agent task must exit after terminate");
+    let result = joined.expect("the agent task must not panic");
+    assert!(
+        result.is_ok(),
+        "terminate should complete the agent, got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -1485,6 +1510,7 @@ fn a_renewed_advisor_keeps_the_reviews_already_spent() {
     let script = Script::new(vec![]);
     let advisor = advisor_on(&script, dir.path(), limits(3, 1), &ShaiConfig::default());
     assert!(advisor.take_call());
+    advisor.elapse_cooldown();
     assert!(advisor.take_call());
 
     // Set up again after a config change: another model, a lower cap.
@@ -1513,6 +1539,7 @@ fn a_renewed_advisor_keeps_the_reviews_already_spent() {
             environment(),
         )
         .unwrap();
+    roomier.elapse_cooldown();
     assert!(roomier.take_call());
     assert_eq!(advisor.calls_made(), 3);
     assert_eq!(renewed.calls_made(), 3);
@@ -1642,4 +1669,67 @@ fn a_note_with_no_tool_result_to_carry_it_is_dropped() {
         attach_note(&mut trace, "NOTE");
         assert_eq!(trace, before);
     }
+}
+
+#[test]
+fn a_custom_agents_credentials_are_kept_out_of_what_is_sent() {
+    let dir = TempDir::new().unwrap();
+    let advisor = advisor_on(
+        &Script::new(vec![]),
+        dir.path(),
+        limits(1, 0),
+        &ShaiConfig::default(),
+    );
+    let secret = "ollama-custom-secret-key";
+    // Absent from the session config and from the test environment.
+    assert!(advisor
+        .reviewer()
+        .redactor
+        .redact(&format!("tool said {secret}"))
+        .contains(secret));
+    let advisor = advisor.include_settings([("OLLAMA_API_KEY", secret)]);
+    let sent = advisor
+        .reviewer()
+        .redactor
+        .redact(&format!("tool said {secret} as bare text"));
+    assert!(!sent.contains(secret), "{sent}");
+    assert!(sent.contains("[redacted]"), "{sent}");
+}
+
+#[test]
+fn an_empty_shai_dir_override_does_not_refuse_the_project() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("README.md"), "ok\n").unwrap();
+    let advisor = Advisor::with_environment(
+        BoundModel::new(Script::new(vec![]).client(ADVISOR), ADVISOR_MODEL),
+        dir.path(),
+        limits(1, 0),
+        &ShaiConfig::default(),
+        vec![
+            ("SHAI_LOG_DIR".to_string(), String::new()),
+            ("SHAI_SESSION_FOLDER".to_string(), String::new()),
+        ],
+    )
+    .expect("an empty override is ignored, the advisor starts");
+    let (bytes, _) = advisor
+        .reviewer()
+        .fs
+        .read("README.md", 1024)
+        .expect("the project is still readable");
+    assert_eq!(bytes, b"ok\n");
+}
+
+#[test]
+fn a_second_review_cannot_be_reserved_before_the_cooldown_elapses() {
+    let dir = TempDir::new().unwrap();
+    let advisor = advisor_on(
+        &Script::new(vec![]),
+        dir.path(),
+        limits(3, 1),
+        &ShaiConfig::default(),
+    );
+    assert!(advisor.take_call());
+    assert!(!advisor.take_call());
+    advisor.elapse_cooldown();
+    assert!(advisor.take_call());
 }

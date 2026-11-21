@@ -726,6 +726,18 @@ impl ConfinedFs {
             // The path grows in place: a copy of it at every name would make
             // a long path cost the square of its length.
             reached.push(&name);
+            // The component's own name is judged before the filesystem is
+            // asked, and before a symlink is followed: a request through
+            // `.env` or `.git` gets the same answer whether that name is
+            // missing, a directory or a link, and the destination is still
+            // checked as the walk continues.
+            let lower = name.to_string_lossy().to_lowercase();
+            if SENSITIVE_DIRS.contains(&without_backup_suffixes(&lower))
+                || names_a_secret_store(&lower)
+                || refusals.names(&reached)
+            {
+                return Route::EntersRefused;
+            }
             if exists {
                 lookups += 1;
                 // Each lookup goes through the whole path reached so far.
@@ -765,11 +777,6 @@ impl ConfinedFs {
                     Ok(_) => {}
                     Err(_) => exists = false,
                 }
-            }
-            let lower = name.to_string_lossy().to_lowercase();
-            if SENSITIVE_DIRS.contains(&without_backup_suffixes(&lower)) || refusals.names(&reached)
-            {
-                return Route::EntersRefused;
             }
         }
         Route::Inside
@@ -1268,6 +1275,52 @@ mod tests {
         assert_eq!(read_text(&fs, "alias.rs").unwrap(), "fn main() {}\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_sensitive_name_on_the_way_is_refused_whether_or_not_it_exists() {
+        use std::os::unix::fs::symlink;
+        let sb = sandbox();
+        fs::write(sb.root.join("README.md"), "ok\n").unwrap();
+        let fs = ConfinedFs::new(&sb.root).unwrap();
+
+        let paths = [
+            ".env/../README.md",
+            ".npmrc/../README.md",
+            ".git/../README.md",
+            ".env/../src/main.rs",
+        ];
+        let answers = |fs: &ConfinedFs| {
+            paths.map(|path| fs.resolve(path).map_err(|e| std::mem::discriminant(&e)))
+        };
+        let missing = answers(&fs);
+        assert!(missing.iter().all(Result::is_err), "{missing:?}");
+        for path in paths {
+            assert!(
+                matches!(fs.resolve(path), Err(ConfineError::Sensitive(_))),
+                "{path}"
+            );
+        }
+
+        // The same names as directories, and as symlinks to an allowed place.
+        for name in [".env", ".npmrc"] {
+            fs::create_dir_all(sb.root.join(name)).unwrap();
+        }
+        let as_dirs = answers(&fs);
+        assert_eq!(as_dirs, missing);
+        for name in [".env", ".npmrc"] {
+            fs::remove_dir(sb.root.join(name)).unwrap();
+            symlink(sb.root.join("src"), sb.root.join(name)).unwrap();
+        }
+        let as_links = answers(&fs);
+        assert_eq!(as_links, missing);
+        // A hop through a credential-store name that is a link, then into
+        // an ordinary file under its destination, is still refused.
+        assert!(matches!(
+            fs.resolve(".env/main.rs"),
+            Err(ConfineError::Sensitive(_))
+        ));
+    }
+
     #[test]
     fn sensitive_names_are_refused_inside_the_root() {
         let sb = sandbox();
@@ -1544,7 +1597,10 @@ mod tests {
         // comes back to it, and the last to nothing. Followed from the start
         // again at every link, this takes minutes.
         let sb = sandbox();
-        let detour = "x/../".repeat(600);
+        // Each symlink target must stay within macOS pathname limits
+        // (1024 bytes). The budget is exceeded by walking many short links,
+        // not by one over-long target.
+        let detour = "x/../".repeat(80);
         fs::create_dir_all(sb.root.join("x")).unwrap();
         for index in 0..40 {
             let target = if index == 39 {
@@ -1673,7 +1729,9 @@ mod tests {
     #[cfg(unix)]
     fn links_deep_in_a_tree_are_refused_before_they_cost_much() {
         let sb = sandbox();
-        let deep: PathBuf = std::iter::repeat_n("a", 600).collect();
+        // Stay well under the 1024-byte pathname limit once the temporary
+        // root is included; 200 components are enough with the chain below.
+        let deep: PathBuf = std::iter::repeat_n("a", 200).collect();
         fs::create_dir_all(sb.root.join(&deep)).unwrap();
         // Each link points at the next by its absolute path.
         for index in 0..40 {

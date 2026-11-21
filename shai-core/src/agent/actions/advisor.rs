@@ -43,9 +43,6 @@ pub(crate) struct AdvisorSession {
     advisor: Advisor,
     /// Length of the trace up to which a review has succeeded.
     reviewed_upto: usize,
-    /// Identifies the review in flight, so that a late result is recognized,
-    /// with the length the trace had when it started.
-    next_review_id: u64,
     pending: Option<(u64, usize)>,
     /// A note waiting to be shown to the agent at its next step.
     note: Option<AdvisorNote>,
@@ -56,7 +53,6 @@ impl AdvisorSession {
         Self {
             advisor,
             reviewed_upto: 0,
-            next_review_id: 0,
             pending: None,
             note: None,
         }
@@ -68,7 +64,14 @@ impl AgentCore {
     ///
     /// Refused, leaving the agent without an advisor, when its brain would
     /// not pass the notes on. The caller is expected to tell the user.
-    pub fn set_advisor(&mut self, advisor: Advisor) -> Result<(), AdvisorAttachError> {
+    pub fn set_advisor(&mut self, mut advisor: Advisor) -> Result<(), AdvisorAttachError> {
+        if !self.redaction_secrets.is_empty() {
+            advisor = advisor.include_settings(
+                self.redaction_secrets
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            );
+        }
         self.advisor = None;
         // Nothing else holds the brain before the agent runs. If something
         // does, the question cannot be answered, and the answer is no.
@@ -142,8 +145,8 @@ impl AgentCore {
         if !session.advisor.take_call() {
             return false;
         }
-        session.next_review_id += 1;
-        let review_id = session.next_review_id;
+        self.next_review_id += 1;
+        let review_id = self.next_review_id;
         session.pending = Some((review_id, trace.len()));
 
         let results = self.tool_ctx.internal_tx.clone();
@@ -291,5 +294,26 @@ mod tests {
         // A cut that leaves everything reviewed in place moves nothing.
         agent.advisor_rewound(40);
         assert_eq!(session(&mut agent).reviewed_upto, 2);
+    }
+
+    #[test]
+    fn review_ids_stay_unique_when_the_advisor_is_reattached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_an_advisor(dir.path());
+        agent.next_review_id = 7;
+        let script = Script::new(vec![]);
+        let advisor = Advisor::with_environment(
+            BoundModel::new(script.client("advisor"), "advisor-model"),
+            dir.path(),
+            AdvisorLimits::default(),
+            &ShaiConfig::default(),
+            Vec::new(),
+        )
+        .expect("advisor");
+        agent
+            .set_advisor(advisor)
+            .expect("the coder brain takes advisor notes");
+        assert_eq!(agent.next_review_id, 7);
+        assert!(agent.has_advisor());
     }
 }

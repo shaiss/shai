@@ -42,7 +42,7 @@ use redact::Redactor;
 use review::Reviewer;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -96,6 +96,9 @@ struct Spent {
     failures: AtomicU32,
     /// Set once the advisor has failed too often to keep trying.
     off: AtomicBool,
+    /// Held while a review is reserved, so two agents cannot both pass the
+    /// cooldown and take a call at once.
+    reserve: Mutex<()>,
 }
 
 /// The advisor of a session.
@@ -144,8 +147,10 @@ impl Advisor {
         // the file its own log is written to, which is rotated.
         let own_records = environment
             .iter()
-            .filter(|(name, _)| {
-                name.starts_with("SHAI_") && (name.ends_with("_FOLDER") || name.ends_with("_DIR"))
+            .filter(|(name, value)| {
+                name.starts_with("SHAI_")
+                    && (name.ends_with("_FOLDER") || name.ends_with("_DIR"))
+                    && !value.is_empty()
             })
             .map(|(_, value)| PathBuf::from(value));
         let own_log = environment
@@ -195,6 +200,7 @@ impl Advisor {
                 turns_since_review: AtomicU32::new(limits.cooldown_turns),
                 failures: AtomicU32::new(0),
                 off: AtomicBool::new(false),
+                reserve: Mutex::new(()),
             }),
         })
     }
@@ -226,6 +232,21 @@ impl Advisor {
         let mut renewed = Self::with_environment(model, working_dir, limits, config, environment)?;
         renewed.spent = self.spent.clone();
         Ok(renewed)
+    }
+
+    /// Also keep these `(name, value)` pairs out of what the advisor is sent.
+    ///
+    /// Used for the credentials of the agent that is running, which may not
+    /// be in the session's auth config. Values already known stay known.
+    pub fn include_settings<'a>(
+        &self,
+        settings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        let mut reviewer = (*self.reviewer).clone();
+        reviewer.redactor.extend_settings(settings);
+        let mut included = self.clone();
+        included.reviewer = Arc::new(reviewer);
+        included
     }
 
     /// `<provider>/<model>` of the advisor model, for notices.
@@ -275,19 +296,39 @@ impl Advisor {
     }
 
     /// Take one review out of the session's budget and start the cooldown.
-    /// False, changing nothing, when the budget is spent.
+    /// False, changing nothing, when the budget is spent or the cooldown
+    /// since the last review has not elapsed. The check and the reservation
+    /// are one transition, so two agents cannot both start a review without
+    /// the required steps between them.
     pub(crate) fn take_call(&self) -> bool {
-        let taken = self
+        let _reserve = self
             .spent
-            .calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
-                (calls < self.limits.max_calls).then_some(calls + 1)
-            })
-            .is_ok();
-        if taken {
-            self.spent.turns_since_review.store(0, Ordering::SeqCst);
+            .reserve
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_off() || !self.has_calls_left() {
+            return false;
         }
-        taken
+        // The first review of a session has no cooldown. After one has been
+        // taken, the shared turn count must have passed the cooldown again.
+        if self.calls_made() > 0
+            && self.spent.turns_since_review.load(Ordering::SeqCst) <= self.limits.cooldown_turns
+        {
+            return false;
+        }
+        self.spent.calls.fetch_add(1, Ordering::SeqCst);
+        self.spent.turns_since_review.store(0, Ordering::SeqCst);
+        true
+    }
+
+    /// Pretend the cooldown has elapsed, so a test can reserve another review
+    /// without running the agent loop.
+    #[cfg(test)]
+    pub(crate) fn elapse_cooldown(&self) {
+        self.spent.turns_since_review.store(
+            self.limits.cooldown_turns.saturating_add(1),
+            Ordering::SeqCst,
+        );
     }
 
     /// Record how a review ended. Returns true when this failure is the one
@@ -394,7 +435,7 @@ fn confined_to(
 /// credential are taken, and addresses like the ones above. Its other
 /// arguments are paths and package names, which a review has to be able to
 /// read.
-fn mcp_settings(mcp: &McpConfig) -> Vec<(&'static str, String)> {
+pub(crate) fn mcp_settings(mcp: &McpConfig) -> Vec<(&'static str, String)> {
     const URL: &str = "MCP_SERVER_URL";
     const TOKEN: &str = "MCP_ACCESS_TOKEN";
     // A URL, and the pieces of its path that are tokens.

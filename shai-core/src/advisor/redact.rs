@@ -1193,18 +1193,31 @@ struct AssignedValue<'a> {
     sample: &'a str,
     /// Whether `sample` is the whole value.
     whole: bool,
+    /// When true, a quoted value may span lines until its closing quote, as
+    /// a YAML quoted scalar does. Unterminated quotes still end at the first
+    /// newline, which is how ordinary logs are written.
+    across_lines: bool,
 }
 
 impl<'a> AssignedValue<'a> {
     fn at(rest: &'a str) -> Self {
+        Self::at_maybe_multiline(rest, false)
+    }
+
+    fn at_yaml(rest: &'a str) -> Self {
+        Self::at_maybe_multiline(rest, true)
+    }
+
+    fn at_maybe_multiline(rest: &'a str, across_lines: bool) -> Self {
         let (open, quote) = Self::opening(rest);
-        let (end, whole) = Self::content_end(&rest[open..], quote, VALUE_SAMPLE);
+        let (end, whole) = Self::content_end(&rest[open..], quote, VALUE_SAMPLE, across_lines);
         Self {
             rest,
             open,
             quote,
             sample: &rest[open..open + end],
             whole,
+            across_lines,
         }
     }
 
@@ -1257,15 +1270,28 @@ impl<'a> AssignedValue<'a> {
     /// within `limit` bytes. A quoted value ends at its quote, or at the end
     /// of the line when the quote is never closed; any other value ends at
     /// the first blank.
-    fn content_end(body: &str, quote: &str, limit: usize) -> (usize, bool) {
+    fn content_end(body: &str, quote: &str, limit: usize, across_lines: bool) -> (usize, bool) {
         let mut escaped = false;
         for (index, c) in body.char_indices() {
             let ends = match quote {
                 // In a list of `Name=value;` pairs, as connection strings are
                 // written, a value ends where the next pair starts.
                 "" => c.is_whitespace() || (c == ';' && starts_a_pair(&body[index + 1..])),
-                "\"" | "'" => !escaped && (c == '\n' || quote.starts_with(c)),
-                _ => c == '\n' || body[index..].starts_with(quote),
+                "\"" | "'" => {
+                    !escaped
+                        && (quote.starts_with(c)
+                            || (c == '\n' && !across_lines)
+                            || (c == '\n'
+                                && across_lines
+                                && !quoted_value_closes(&body[index + 1..], quote)))
+                }
+                _ => {
+                    body[index..].starts_with(quote)
+                        || (c == '\n' && !across_lines)
+                        || (c == '\n'
+                            && across_lines
+                            && !quoted_value_closes(&body[index + 1..], quote))
+                }
             };
             if ends {
                 return (index, true);
@@ -1426,7 +1452,12 @@ impl<'a> AssignedValue<'a> {
     /// How many bytes of `rest` the value takes, quotes included, and how
     /// many of them at its end are not part of it.
     fn extent(&self) -> (usize, usize) {
-        let (end, _) = Self::content_end(&self.rest[self.open..], self.quote, usize::MAX);
+        let (end, _) = Self::content_end(
+            &self.rest[self.open..],
+            self.quote,
+            usize::MAX,
+            self.across_lines,
+        );
         let end = self.open + end;
         if self.is_quoted() {
             let closed = self.rest[end..].starts_with(self.quote);
@@ -1435,6 +1466,28 @@ impl<'a> AssignedValue<'a> {
             (end, end - without_closers(&self.rest[..end]).len())
         }
     }
+}
+
+/// True when `rest` still contains a closing `quote`, looking only as far
+/// as a quoted scalar reasonably runs. Used to tell a YAML quoted value
+/// that continues on the next line from an unterminated quote in a log.
+fn quoted_value_closes(rest: &str, quote: &str) -> bool {
+    if quote.is_empty() {
+        return false;
+    }
+    let mut escaped = false;
+    let limit = rest.len().min(8 * 1024);
+    let body = &rest[..limit];
+    let mut i = 0;
+    while i < body.len() {
+        if !escaped && body[i..].starts_with(quote) {
+            return true;
+        }
+        let c = body[i..].chars().next().unwrap();
+        escaped = quote.len() == 1 && !escaped && c == '\\';
+        i += c.len_utf8();
+    }
+    false
 }
 
 /// Whether `rest` starts with `Name=`: the next pair of a list of pairs.
@@ -1608,9 +1661,11 @@ impl Rewrite<'_> {
     /// the opening and the closing of the quotation.
     fn replace(&mut self, from: usize, to: usize, quoted: Option<(&str, &str)>) {
         let (open, close) = quoted.unwrap_or_default();
+        let lines = self.text[from..to].matches('\n').count();
         self.out.push_str(&self.text[self.copied..from]);
         self.out.push_str(open);
         self.out.push_str(REDACTED);
+        self.out.extend(std::iter::repeat_n('\n', lines));
         self.out.push_str(close);
         self.copied = to;
     }
@@ -1700,7 +1755,11 @@ fn redact_assignments(text: &str) -> String {
             continue;
         }
 
-        let value = AssignedValue::at(rest);
+        let value = if operator == Operator::Colon {
+            AssignedValue::at_yaml(rest)
+        } else {
+            AssignedValue::at(rest)
+        };
         // `token.rs:12: ...` and `token.rs: a few words` are about a file. A
         // single value after `password.txt:` is what the file holds.
         if operator == Operator::Colon && is_file_name(name.as_str()) && !value.is_quoted() {
@@ -1812,6 +1871,25 @@ impl Redactor {
         known.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         known.dedup();
         Self { known }
+    }
+
+    /// Also treat these `(name, value)` settings as known secrets.
+    ///
+    /// The same rules as [`Redactor::new`] apply: URL-named values give up
+    /// only their credentials, and values shorter than [`MIN_SECRET_LEN`]
+    /// are ignored. Already-known values stay known.
+    pub(crate) fn extend_settings<'a>(
+        &mut self,
+        settings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) {
+        let extra = Self::new(settings, Vec::<(String, String)>::new(), &[]);
+        if extra.known.is_empty() {
+            return;
+        }
+        self.known.extend(extra.known);
+        self.known
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        self.known.dedup();
     }
 
     /// `text` with every known or recognizable secret replaced.
@@ -2387,6 +2465,16 @@ mod tests {
         assert_eq!(
             redactor.redact("password: \"hunter2 and more\nnext line"),
             "password: \"[redacted]\nnext line"
+        );
+        // A quoted YAML scalar may span lines; the whole value is masked
+        // and the line breaks are kept.
+        assert_eq!(
+            redactor.redact("password: \"hunter2 and more\nnext line\""),
+            "password: \"[redacted]\n\""
+        );
+        assert_eq!(
+            redactor.redact("db_password: 'line one\nline two\nline three'"),
+            "db_password: '[redacted]\n\n'"
         );
         // An escaped quote does not end the value.
         assert_eq!(

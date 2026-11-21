@@ -191,6 +191,14 @@ pub struct AgentCore {
 
     /// second model reviewing this session's steps, if any
     pub(crate) advisor: Option<AdvisorSession>,
+
+    /// Provider and MCP values this agent was built with, so an advisor can
+    /// keep them out of what it is sent. Never logged.
+    pub(crate) redaction_secrets: Vec<(String, String)>,
+
+    /// Next advisor review ID, kept at the agent level so that reattaching
+    /// the advisor does not reuse IDs of reviews that may still complete.
+    pub(crate) next_review_id: u64,
 }
 
 pub struct AgentSocket {
@@ -246,6 +254,8 @@ impl AgentCore {
             },
             prewalk: None,
             advisor: None,
+            redaction_secrets: Vec::new(),
+            next_review_id: 0,
         }
     }
 

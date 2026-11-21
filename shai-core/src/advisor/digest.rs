@@ -56,6 +56,40 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// Redact and clip the user's request messages, keeping the latest one
+/// when the joined text would exceed [`MAX_REQUEST_CHARS`]. Earlier
+/// context is added only if it fits, in the original order.
+fn clip_request<'a>(
+    messages: impl IntoIterator<Item = &'a str>,
+    redactor: &Redactor,
+) -> Vec<String> {
+    let messages: Vec<String> = messages
+        .into_iter()
+        .map(|text| redactor.redact(text))
+        .collect();
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let latest = clip(messages.last().unwrap(), MAX_REQUEST_CHARS);
+    let latest_len = latest.chars().count();
+    let mut kept = vec![latest];
+    let mut used = latest_len;
+    // Walk earlier messages from newest to oldest, then restore order.
+    for text in messages.iter().rev().skip(1) {
+        let candidate = clip(text, MAX_REQUEST_CHARS);
+        let size = candidate.chars().count();
+        // A blank line is inserted between messages when they are joined.
+        let gap = 2;
+        if used + gap + size > MAX_REQUEST_CHARS {
+            break;
+        }
+        used += gap + size;
+        kept.push(candidate);
+    }
+    kept.reverse();
+    kept
+}
+
 fn text_of(content: &ChatMessageContent) -> Option<&str> {
     match content {
         ChatMessageContent::Text(text) => Some(text),
@@ -86,14 +120,15 @@ pub(crate) fn build_digest(
             .map_or(0, |index| index + 1)
     });
     let request: Vec<String> = match (first_user, last_user) {
-        (Some(first), Some(last)) => trace[first..=last]
-            .iter()
-            .filter_map(|message| match message {
-                ChatMessage::User { content, .. } => text_of(content),
-                _ => None,
-            })
-            .map(|text| clip(&redactor.redact(text), MAX_REQUEST_CHARS))
-            .collect(),
+        (Some(first), Some(last)) => clip_request(
+            trace[first..=last]
+                .iter()
+                .filter_map(|message| match message {
+                    ChatMessage::User { content, .. } => text_of(content),
+                    _ => None,
+                }),
+            redactor,
+        ),
         _ => Vec::new(),
     };
 
@@ -190,9 +225,9 @@ pub(crate) fn build_digest(
 
     let mut digest = format!(
         "## The user's request\n{}\n\n## What the agent did since your last review\n",
-        // Each message was clipped on its own; so is the whole, however many
-        // messages make up the request. The text is redacted already.
-        clip(&request.join("\n\n"), MAX_REQUEST_CHARS)
+        // Messages were selected so the latest request always fits and
+        // earlier context is included only when it does. Already redacted.
+        request.join("\n\n")
     );
     if dropped {
         digest.push_str("[earlier steps omitted]\n\n");
@@ -341,9 +376,33 @@ mod tests {
             "{}",
             request.chars().count()
         );
-        assert!(request.starts_with("00 "), "{request}");
+        // The latest message is kept; earlier context does not fit.
+        assert!(request.starts_with("49 "), "{request}");
         assert!(request.ends_with(" [...]"), "{request}");
+        assert!(!request.contains("00 "), "{request}");
         assert!(digest.contains("calls ls"), "{digest}");
+    }
+
+    #[test]
+    fn a_short_latest_message_is_kept_when_earlier_context_is_long() {
+        let list = call("ls", json!({"directory": "."}));
+        let trace = vec![
+            user(&"context ".repeat(800)),
+            user("do the rename now"),
+            list.clone(),
+            result_of(&list, "a.txt"),
+        ];
+        let digest = plain_digest(&trace, 0).unwrap();
+        let request = digest
+            .strip_prefix("## The user's request\n")
+            .and_then(|rest| rest.split("\n\n## What the agent did").next())
+            .unwrap();
+        assert!(request.contains("do the rename now"), "{request}");
+        assert!(
+            request.chars().count() <= MAX_REQUEST_CHARS + " [...]".len(),
+            "{}",
+            request.chars().count()
+        );
     }
 
     #[test]

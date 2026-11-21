@@ -271,9 +271,14 @@ fn read(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
         shown += 1;
     }
     if shown == 0 {
+        let path = redactor.redact(path);
+        if truncated {
+            return Ok(format!(
+                "{path}: offset {offset} is beyond the part that was read ({total} lines in the prefix)"
+            ));
+        }
         return Ok(format!(
-            "{}: no lines at offset {offset} ({total} lines)",
-            redactor.redact(path)
+            "{path}: no lines at offset {offset} ({total} lines)"
         ));
     }
     if truncated {
@@ -294,6 +299,7 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
     // Entries the advisor may not look at are left out, by the same rule as
     // `read`, `find` and `grep` use, and only counted.
     let mut hidden = 0;
+    let mut unread = 0;
     for (scanned, entry) in listing.by_ref().enumerate() {
         // A directory can hold any number of entries: stop reading at some.
         if scanned >= MAX_LS_SCAN {
@@ -301,9 +307,11 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
             break;
         }
         let Ok(entry) = entry else {
+            unread += 1;
             continue;
         };
         let Ok(file_type) = entry.file_type() else {
+            unread += 1;
             continue;
         };
         // A link is judged by its own name here: it is never followed.
@@ -342,6 +350,14 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
         }
         out.push_str(&format!(
             "[{hidden} not shown: they may hold credentials or internal state]"
+        ));
+    }
+    if unread > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "[{unread} entries could not be read: the listing is incomplete]"
         ));
     }
     if out.is_empty() {
@@ -420,9 +436,11 @@ fn walk_within(
                     break 'walk Walk::CutShort;
                 }
                 let Ok(entry) = entry else {
+                    unreadable += 1;
                     continue;
                 };
                 let Ok(file_type) = entry.file_type() else {
+                    unreadable += 1;
                     continue;
                 };
                 // Links are never followed.
@@ -781,6 +799,16 @@ mod tests {
         std::fs::write(root.join("wide.txt"), "y".repeat(5000)).unwrap();
         let out = AdvisorTool::Read.run(&fs, &Redactor::default(), &json!({"path": "wide.txt"}));
         assert!(out.chars().count() < MAX_LINE_CHARS + 20, "{}", out.len());
+
+        // A huge file whose prefix has fewer lines than the requested offset.
+        let huge = "x".repeat(MAX_FILE_BYTES + 10);
+        std::fs::write(root.join("huge.txt"), huge).unwrap();
+        let out = AdvisorTool::Read.run(
+            &fs,
+            &Redactor::default(),
+            &json!({"path": "huge.txt", "offset": 5}),
+        );
+        assert!(out.contains("beyond the part that was read"), "{out}");
     }
 
     #[test]

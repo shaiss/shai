@@ -109,6 +109,7 @@ const OUT_OF_CALLS: &str = "error: no tool calls left for this review. Give your
 
 /// The advisor: a model, a confined view of the working directory, and the
 /// redaction applied to everything it is sent.
+#[derive(Clone)]
 pub(crate) struct Reviewer {
     pub(crate) llm: Arc<LlmClient>,
     pub(crate) model: String,
@@ -179,7 +180,11 @@ impl Reviewer {
                 return Ok(self.note_in(text));
             }
 
-            messages.push(choice.message.clone());
+            // The replayed assistant message goes through Redactor too: the
+            // contract is that everything sent to the advisor is redacted
+            // whole. Tool call IDs are kept so results still correlate. The
+            // original arguments are used only for the local tool run below.
+            messages.push(redact_assistant(&self.redactor, &choice.message));
             for call in calls {
                 let output = if tool_calls_left == 0 {
                     OUT_OF_CALLS.to_string()
@@ -207,16 +212,17 @@ impl Reviewer {
     /// is redacted before it is parsed, so that a secret is removed whole and
     /// the note is cut to size as the text the agent and the user will read.
     fn note_in(&self, reply: &str) -> Option<AdvisorNote> {
-        let mut note = parse_verdict(&self.redactor.redact(verdict_line(reply)?))?;
-        // Leaving out what cannot be seen can put a secret back together
-        // that was written with something invisible inside it: the note is
-        // looked at once more, as it will be shown, for the values the
-        // redactor knows. The other rules read the advisor's own prose.
-        let shown = self.redactor.redact_known(&note.text);
-        if shown != note.text {
-            note.text = sanitize_note(&shown);
-        }
-        (!note.text.is_empty()).then_some(note)
+        let line = verdict_line(reply)?;
+        // The severity is taken from the line as the model wrote it. The
+        // text is normalized in full, checked for known values, and only
+        // then cut to size: clipping first could hide a value that
+        // normalization puts back together across the limit.
+        let (severity, raw_text) = verdict_parts(line)?;
+        let redacted = self.redactor.redact(raw_text);
+        let normalized = sanitize_line(&redacted, usize::MAX);
+        let checked = self.redactor.redact_known(&normalized);
+        let text = sanitize_note(&checked);
+        (!text.is_empty()).then_some(AdvisorNote { severity, text })
     }
 
     /// Why a review failed, as it may be shown: what a provider answers can
@@ -243,14 +249,17 @@ impl Reviewer {
             None => return "error: the arguments must be a JSON object".to_string(),
         };
         // What this process was told to keep out of reach may have been
-        // created since the last look. What is found stays refused.
-        self.fs.refresh();
+        // created since the last look. What is found stays refused. Refresh
+        // is blocking filesystem work, so it runs in the same closure as
+        // the tool: a stalled lookup must not pin the review future.
         let fs = self.fs.clone();
         let redactor = self.redactor.clone();
-        // File I/O is blocking; keep it off the async workers.
-        tokio::task::spawn_blocking(move || tool.run(&fs, &redactor, &args))
-            .await
-            .unwrap_or_else(|_| "error: the tool failed".to_string())
+        tokio::task::spawn_blocking(move || {
+            fs.refresh();
+            tool.run(&fs, &redactor, &args)
+        })
+        .await
+        .unwrap_or_else(|_| "error: the tool failed".to_string())
     }
 }
 
@@ -321,17 +330,46 @@ fn verdict_line(reply: &str) -> Option<&str> {
 /// anything else yields no note. Nothing the model wrote is passed through
 /// unless it fits.
 fn parse_verdict(line: &str) -> Option<AdvisorNote> {
+    let (severity, text) = verdict_parts(line)?;
+    let text = sanitize_note(text);
+    if text.is_empty() {
+        return None;
+    }
+    Some(AdvisorNote { severity, text })
+}
+
+/// The severity and the raw text of a verdict line, without sanitizing.
+fn verdict_parts(line: &str) -> Option<(Severity, &str)> {
     let line = line
         .trim()
         // Models like to put the verdict in bold.
         .trim_matches('*');
     let (word, text) = line.split_once(':')?;
     let severity = Severity::parse(word.trim().trim_matches(|c| c == '*' || c == '`'))?;
-    let text = sanitize_note(text);
-    if text.is_empty() {
-        return None;
+    Some((severity, text))
+}
+
+/// A copy of an advisor assistant message with its visible text redacted,
+/// keeping tool call IDs so a later tool result still matches.
+fn redact_assistant(redactor: &Redactor, message: &ChatMessage) -> ChatMessage {
+    let mut message = message.clone();
+    if let ChatMessage::Assistant {
+        content,
+        tool_calls,
+        ..
+    } = &mut message
+    {
+        if let Some(ChatMessageContent::Text(text)) = content {
+            *text = redactor.redact(text);
+        }
+        if let Some(calls) = tool_calls {
+            for call in calls {
+                call.function.name = redactor.redact(&call.function.name);
+                call.function.arguments = redactor.redact_json(&call.function.arguments);
+            }
+        }
     }
-    Some(AdvisorNote { severity, text })
+    message
 }
 
 /// Reduce note text to one bounded line of plain characters.
@@ -596,6 +634,22 @@ mod tests {
         // Multi-byte text is cut on a character boundary.
         let parsed = parse_note(&format!("nit: {}", "é".repeat(1000))).unwrap();
         assert_eq!(parsed.text.chars().count(), MAX_NOTE_CHARS);
+    }
+
+    #[test]
+    fn known_values_are_removed_from_a_note_before_it_is_clipped() {
+        // A known value split by an invisible character, past the clip
+        // limit: normalizing first would have left a fragment if the note
+        // were cut before the second pass.
+        let secret = "S3CR3TK3Y";
+        let (_dir, reviewer) = reviewer_knowing(&[secret]);
+        let prefix = "x".repeat(MAX_NOTE_CHARS - 5);
+        let reply = format!("nit: {prefix}S3\u{200b}CR3TK3Y and more words after the secret");
+        let parsed = reviewer.note_in(&reply).unwrap();
+        assert_eq!(parsed.severity, Severity::Nit);
+        assert!(!parsed.text.contains(secret), "{}", parsed.text);
+        assert!(parsed.text.contains("[redacted]"), "{}", parsed.text);
+        assert!(parsed.text.chars().count() <= MAX_NOTE_CHARS);
     }
 
     #[test]
