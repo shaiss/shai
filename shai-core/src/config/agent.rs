@@ -616,8 +616,7 @@ mod broken_config_fallback_tests {
             r#"{"name": "reviewer", "description": "needs the auth config"}"#,
         )
         .unwrap();
-        let previous = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
 
         let load_error = AgentConfig::load("reviewer")
             .map(|_| ())
@@ -632,10 +631,5 @@ mod broken_config_fallback_tests {
         let loaded = AgentConfig::load_with_primary("reviewer", Some(&snapshot)).unwrap();
         assert_eq!(loaded.llm_provider.provider, "openai");
         assert_eq!(loaded.llm_provider.model, "snapshot-model");
-
-        match previous {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 }

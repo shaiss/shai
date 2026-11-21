@@ -30,6 +30,16 @@ fn restore_env_vars(applied: &mut Vec<(String, Option<OsString>)>) {
     }
 }
 
+/// The process environment as [`ShaiConfig::set_env_vars`] last left it.
+///
+/// Used to put the live agent's variables back if a later
+/// [`ShaiConfig::set_env_vars`] should not stick (for example, an `/auth`
+/// reload that could not start).
+pub struct AppliedEnvSnapshot {
+    applied: Vec<(String, Option<OsString>)>,
+    current: Vec<(String, Option<OsString>)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub provider: String,
@@ -319,6 +329,36 @@ impl ShaiConfig {
         }
     }
 
+    /// Capture the provider variables currently exported to the process.
+    pub fn snapshot_applied_env() -> AppliedEnvSnapshot {
+        let applied = APPLIED_ENV_VARS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let current = applied
+            .iter()
+            .map(|(name, _)| (name.clone(), std::env::var_os(name)))
+            .collect();
+        AppliedEnvSnapshot { applied, current }
+    }
+
+    /// Restore the process environment to a previous [`Self::snapshot_applied_env`].
+    ///
+    /// Any variables written by a later [`Self::set_env_vars`] are undone first.
+    pub fn restore_applied_env(snapshot: &AppliedEnvSnapshot) {
+        let mut applied = APPLIED_ENV_VARS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        restore_env_vars(&mut applied);
+        for (name, value) in &snapshot.current {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        *applied = snapshot.applied.clone();
+    }
+
     pub fn remove_provider(&mut self, index: usize) -> Result<ProviderConfig, String> {
         if index >= self.providers.len() {
             return Err(format!(
@@ -438,11 +478,26 @@ impl ShaiConfig {
     /// Build the LLM client and default model from this already-loaded config.
     /// Unlike [`ShaiConfig::get_llm`], this never loads the file again and never
     /// falls back to [`ShaiConfig::default`].
+    ///
+    /// This exports the selected provider's variables into the process
+    /// environment, so child tools can see them. When a replacement is being
+    /// built while a live agent is still running, use [`Self::llm_from_config`]
+    /// instead and call [`Self::set_env_vars`] only after that agent is
+    /// installed.
     pub async fn get_llm_from_config(
         &self,
     ) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
         self.set_env_vars();
+        self.llm_from_config().await
+    }
 
+    /// Build the LLM client and default model without writing provider
+    /// variables into the process environment.
+    ///
+    /// The client is created from the config's `env_vars` map, not from
+    /// process env. Call [`Self::set_env_vars`] once this provider should
+    /// actually be the one the process exports.
+    pub async fn llm_from_config(&self) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
         let llm = if let Some(provider_config) = self.get_selected_provider() {
             LlmClient::create_provider(&provider_config.provider, &provider_config.env_vars)
                 .map_err(|e| {
@@ -632,5 +687,44 @@ mod tests {
             Ok("http://exported.example.com/v1")
         );
         std::env::remove_var(URL);
+    }
+
+    // Unique names so this does not race with
+    // switching_provider_does_not_keep_previous_provider_vars.
+    #[tokio::test]
+    async fn llm_from_config_does_not_export_provider_env() {
+        const KEY: &str = "SHAI_TEST_LLM_FROM_CONFIG_ENV";
+        std::env::remove_var(KEY);
+        let config = config_with("not-a-real-provider", &[(KEY, "must-not-be-exported")]);
+        let error = config
+            .llm_from_config()
+            .await
+            .expect_err("an unknown provider must fail to build");
+        assert!(error.to_string().contains("not-a-real-provider"), "{error}");
+        assert!(
+            std::env::var_os(KEY).is_none(),
+            "llm_from_config must not write provider variables"
+        );
+    }
+
+    #[test]
+    fn restore_applied_env_puts_back_a_snapshot() {
+        const KEY: &str = "SHAI_TEST_ENV_SNAPSHOT_KEY";
+        std::env::remove_var(KEY);
+
+        let first = config_with("openai", &[(KEY, "live-agent-value")]);
+        first.set_env_vars();
+        let snapshot = ShaiConfig::snapshot_applied_env();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-agent-value"));
+
+        let second = config_with("openai", &[(KEY, "replacement-value")]);
+        second.set_env_vars();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("replacement-value"));
+
+        ShaiConfig::restore_applied_env(&snapshot);
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-agent-value"));
+
+        undo_set_env_vars();
+        assert!(std::env::var_os(KEY).is_none());
     }
 }
