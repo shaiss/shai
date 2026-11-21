@@ -82,13 +82,6 @@ impl SessionOptions {
         }
     }
 
-    /// What is wrong with the user's config file, when it is there and cannot
-    /// be read. The rule of start-up holds for every agent a session starts
-    /// later: such a file is not replaced by the built-in default.
-    pub fn config_problem() -> Option<String> {
-        Self::unreadable(ShaiConfig::load_for_roles().as_ref())
-    }
-
     /// The config an agent without its own provider runs on, loaded once.
     ///
     /// The built-in default stands in only when there is no config file. A
@@ -96,15 +89,12 @@ impl SessionOptions {
     /// the primary model is built from this same load, so the file cannot
     /// break between a check and the read that builds the client.
     pub fn primary_config() -> Result<ShaiConfig, String> {
-        Self::primary_config_from(ShaiConfig::load_for_roles())
+        ShaiConfig::primary()
     }
 
+    #[cfg(test)]
     fn primary_config_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
-        match config {
-            Ok(config) => Ok(config),
-            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
-            Err(error) => Err(Self::unreadable(Err(&error)).unwrap_or_else(|| error.to_string())),
-        }
+        ShaiConfig::primary_from(config)
     }
 
     /// The handoff target the session is asked for, as things are now.
@@ -153,6 +143,11 @@ impl SessionOptions {
         self.prewalk
             .as_ref()
             .is_some_and(|prewalk| !prewalk.is_spent())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prewalk(&self) -> Option<&Prewalk> {
+        self.prewalk.as_ref()
     }
 
     /// Start the prewalk trigger over, keeping the one-shot latch.

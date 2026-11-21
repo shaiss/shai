@@ -7,12 +7,13 @@ use tracing::{error, info};
 
 use crate::session::{log_event, logger::colored_session_id};
 use shai_core::agent::AgentBuilder;
+use shai_core::config::config::ShaiConfig;
 use shai_core::session::SessionPersist;
 
 use super::AgentSession;
 
 /// Configuration for the session manager
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionManagerConfig {
     /// Maximum number of concurrent sessions (None = unlimited)
     pub max_sessions: Option<usize>,
@@ -23,6 +24,9 @@ pub struct SessionManagerConfig {
     /// uses the network is denied at once: HTTP clients cannot answer a
     /// permission prompt.
     pub allow_all_tools: bool,
+    /// Auth config loaded at serve startup. Sessions build default agents
+    /// from this snapshot instead of reading the file again.
+    pub primary: Option<Arc<ShaiConfig>>,
 }
 
 impl Default for SessionManagerConfig {
@@ -31,7 +35,19 @@ impl Default for SessionManagerConfig {
             max_sessions: Some(100),
             ephemeral: false,
             allow_all_tools: false,
+            primary: None,
         }
+    }
+}
+
+impl std::fmt::Debug for SessionManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManagerConfig")
+            .field("max_sessions", &self.max_sessions)
+            .field("ephemeral", &self.ephemeral)
+            .field("allow_all_tools", &self.allow_all_tools)
+            .field("primary", &self.primary.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 
@@ -42,6 +58,7 @@ pub struct SessionManager {
     max_sessions: Option<usize>,
     ephemeral: bool,
     allow_all_tools: bool,
+    primary: Option<Arc<ShaiConfig>>,
 }
 
 impl SessionManager {
@@ -51,6 +68,7 @@ impl SessionManager {
             max_sessions: config.max_sessions,
             ephemeral: config.ephemeral,
             allow_all_tools: config.allow_all_tools,
+            primary: config.primary,
         }
     }
 
@@ -83,10 +101,14 @@ impl SessionManager {
             colored_session_id(session_id)
         );
 
-        // Build the agent with the server's tool policy and optional trace
-        let builder = AgentBuilder::create(agent_name.clone().filter(|name| name != "default"))
-            .await
-            .map_err(|e| AgentError::ExecutionError(format!("Failed to create agent: {}", e)))?;
+        // Build the agent from the startup config snapshot so a later edit
+        // of the auth file cannot change credentials mid-server.
+        let builder = AgentBuilder::create_with_primary(
+            agent_name.clone().filter(|name| name != "default"),
+            self.primary.as_deref(),
+        )
+        .await
+        .map_err(|e| AgentError::ExecutionError(format!("Failed to create agent: {}", e)))?;
 
         let mut agent = self.prepare_agent(builder, trace).build();
 
@@ -446,6 +468,145 @@ mod tests {
         assert!(!prompted);
         assert!(result.is_success(), "{result:?}");
         assert!(marker.exists(), "bash did not run with --yes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sessions_keep_the_startup_config_snapshot() {
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"snapshot-model","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let manager = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot)),
+            ..SessionManagerConfig::default()
+        });
+        assert_eq!(
+            manager.primary.as_ref().unwrap().providers[0].model,
+            "snapshot-model"
+        );
+        // create_session passes this snapshot to AgentBuilder::create_with_primary;
+        // a later change to the auth file is not reread.
+        assert!(manager.primary.is_some());
+    }
+
+    fn snapshot_with_key(key: &str) -> ShaiConfig {
+        serde_json::from_str(&format!(
+            r#"{{"providers":[{{"provider":"openai","env_vars":{{"OPENAI_API_KEY":"{key}"}},"model":"snapshot-model","tool_method":"FunctionCall"}}],"selected_provider":0}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn debug_does_not_contain_the_auth_config_key() {
+        let config = SessionManagerConfig {
+            primary: Some(Arc::new(snapshot_with_key("sk-test-do-not-leak"))),
+            ..SessionManagerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("sk-test-do-not-leak"),
+            "Debug leaked the key: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_uses_the_startup_snapshot_when_the_auth_file_is_broken() {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = LOCK.lock().await;
+
+        let dir = scratch_dir();
+        let shai = dir.join("config").join("shai");
+        std::fs::create_dir_all(&shai).unwrap();
+        std::fs::write(shai.join("auth.config.json"), "{ this is not json").unwrap();
+
+        fn take_var(key: &str) -> Option<String> {
+            std::env::var(key).ok()
+        }
+        fn put_var(key: &str, previous: Option<String>) {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let previous = [
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "SHAI_MODEL",
+            "SHAI_SESSION_PERSIST_ENABLE",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "OPENAI_API_KEY",
+        ]
+        .map(take_var);
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        std::env::set_var("HOME", dir.join("home"));
+        std::env::set_var("SHAI_MODEL", "snapshot-model");
+        std::env::set_var("SHAI_SESSION_PERSIST_ENABLE", "false");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
+
+        let restore = || {
+            for (key, value) in [
+                "XDG_CONFIG_HOME",
+                "HOME",
+                "SHAI_MODEL",
+                "SHAI_SESSION_PERSIST_ENABLE",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "OPENAI_API_KEY",
+            ]
+            .into_iter()
+            .zip(previous)
+            {
+                put_var(key, value);
+            }
+        };
+
+        let without = SessionManager::new(SessionManagerConfig::default());
+        let without_result = without
+            .create_new_session("req-1", "snapshot-session-missing", None, true)
+            .await;
+        let without_error = match without_result {
+            Ok(_) => {
+                restore();
+                panic!("a broken auth file and no snapshot must not start a session");
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            without_error.contains("could not be loaded")
+                || without_error.to_lowercase().contains("config"),
+            "{without_error}"
+        );
+
+        let manager = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot_with_key("k"))),
+            ..SessionManagerConfig::default()
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            manager.create_new_session("req-2", "snapshot-session-ok", None, true),
+        )
+        .await;
+        match result {
+            Err(_) => {
+                restore();
+                panic!("create_new_session hung; the snapshot path must not call the network");
+            }
+            Ok(Err(error)) => {
+                restore();
+                panic!("create_new_session should use the snapshot, not the broken file: {error}");
+            }
+            Ok(Ok(session)) => {
+                let _ = manager
+                    .cancel_session(&"req-2".to_string(), "snapshot-session-ok")
+                    .await;
+                assert_eq!(session.session_id, "snapshot-session-ok");
+            }
+        }
+        restore();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

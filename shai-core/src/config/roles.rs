@@ -566,6 +566,45 @@ impl ShaiConfig {
         }
     }
 
+    /// The config the primary model runs on, loaded once.
+    ///
+    /// The built-in default stands in only when there is no config file. A
+    /// file that is there and cannot be read is an error, never a silent
+    /// fallback to that default.
+    pub fn primary() -> Result<ShaiConfig, String> {
+        Self::primary_from(Self::load_for_roles())
+    }
+
+    /// The caller's already-loaded config, or a fresh [`ShaiConfig::primary`]
+    /// load if they have not passed one. Serve uses this so HTTP sessions
+    /// keep the startup snapshot instead of reading the file again.
+    pub fn from_snapshot_or_primary(primary: Option<&ShaiConfig>) -> Result<ShaiConfig, String> {
+        match primary {
+            Some(config) => Ok(config.clone()),
+            None => Self::primary(),
+        }
+    }
+
+    /// [`ShaiConfig::primary`] from an already-attempted load.
+    pub fn primary_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
+        match config {
+            Ok(config) => Ok(config),
+            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
+            Err(RoleError::ConfigInvalid { path, reason }) => Err(format!(
+                "the config file {path} could not be loaded ({reason})"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// [`ShaiConfig::primary`] from the two paths a config file may occupy.
+    pub fn primary_from_paths(
+        config_path: &std::path::Path,
+        legacy_path: &std::path::Path,
+    ) -> Result<ShaiConfig, String> {
+        Self::primary_from(Self::load_for_roles_from(config_path, legacy_path))
+    }
+
     /// Load the user's config for resolving secondary models.
     ///
     /// Unlike [`ShaiConfig::get_llm`] and [`ShaiConfig::load_or_default`], this
@@ -1039,6 +1078,43 @@ mod tests {
         assert!(message.contains("auth.config.json"), "{message}");
         assert!(message.contains("JSON syntax error at line 1"), "{message}");
         assert!(!message.contains("shai auth"), "{message}");
+    }
+
+    #[test]
+    fn the_primary_config_defaults_only_when_the_file_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.config.json");
+        let legacy = dir.path().join("auth.config");
+
+        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
+        assert_eq!(
+            primary.providers[0].provider,
+            ShaiConfig::default().providers[0].provider
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
+        assert_eq!(primary.providers[0].provider, "openai");
+        assert_eq!(primary.providers[0].model, "gpt-4o");
+
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let error = ShaiConfig::primary_from_paths(&path, &legacy).unwrap_err();
+        assert!(error.contains("auth.config.json"), "{error}");
+        assert!(error.contains("could not be loaded"), "{error}");
+        assert!(!error.to_lowercase().contains("ovh"), "{error}");
+
+        // A caller that already holds a good snapshot must not reread the
+        // now-broken file.
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"snapshot-model","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let loaded = ShaiConfig::from_snapshot_or_primary(Some(&snapshot)).unwrap();
+        assert_eq!(loaded.providers[0].model, "snapshot-model");
     }
 
     #[test]
