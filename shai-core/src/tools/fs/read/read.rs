@@ -16,6 +16,12 @@ const MAX_BYTES: usize = 50 * 1024;
 const MAX_LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
 const BINARY_SAMPLE_SIZE: usize = 4096;
 
+/// Bounds for the "did you mean" search run when a read path does not exist.
+const SUGGEST_MAX_DEPTH: usize = 6;
+const SUGGEST_MAX_ENTRIES: usize = 20_000;
+const SUGGEST_MAX_RESULTS: usize = 5;
+const SUGGEST_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
+
 const BINARY_EXTENSIONS: &[&str] = &[
     ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar", ".war", ".7z", ".doc", ".docx",
     ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp", ".bin", ".dat", ".obj", ".o", ".lib",
@@ -81,6 +87,72 @@ impl ReadTool {
             }
         }
         (non_printable as f64 / n as f64) > 0.3
+    }
+
+    /// Find files under `root` whose name equals the file name of `missing`.
+    /// Used to recover from a path the model has forgotten (ovh/shai issue 101: it
+    /// listed `.github/workflows/`, then read the bare `codecov-upload.yml`).
+    /// Bounded in depth and entries so a huge tree cannot stall a failed read.
+    fn suggest_paths(root: &Path, missing: &Path) -> Vec<String> {
+        Self::suggest_paths_bounded(root, missing, SUGGEST_MAX_ENTRIES)
+    }
+
+    fn suggest_paths_bounded(root: &Path, missing: &Path, max_entries: usize) -> Vec<String> {
+        let Some(wanted) = missing.file_name() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut visited = 0usize;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((root.to_path_buf(), 0usize));
+        while let Some((dir, depth)) = queue.pop_front() {
+            if visited >= max_entries {
+                break;
+            }
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            // Never hold more than the remaining entry budget in memory, so a
+            // single huge directory cannot defeat SUGGEST_MAX_ENTRIES.
+            let mut entries: Vec<_> = entries
+                .flatten()
+                .take(max_entries.saturating_sub(visited))
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                visited += 1;
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    let name = entry.file_name();
+                    let skip = SUGGEST_SKIP_DIRS.iter().any(|d| name == *d);
+                    if !skip && depth < SUGGEST_MAX_DEPTH {
+                        queue.push_back((path, depth + 1));
+                    }
+                } else if file_type.is_file() && entry.file_name() == wanted {
+                    let shown = path.strip_prefix(".").unwrap_or(&path);
+                    found.push(shown.to_string_lossy().to_string());
+                    if found.len() >= SUGGEST_MAX_RESULTS {
+                        return found;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn missing_file_message(path: &Path) -> String {
+        let suggestions = Self::suggest_paths(Path::new("."), path);
+        if suggestions.is_empty() {
+            "[Error: File does not exist]".to_string()
+        } else {
+            format!(
+                "[Error: File does not exist. A file with that name exists at: {}. Use the full path.]",
+                suggestions.join(", ")
+            )
+        }
     }
 
     fn read_file_content(&self, params: &ReadFileSpec) -> io::Result<String> {
@@ -241,8 +313,9 @@ impl ReadTool {
 
             if !path.exists() {
                 outputs.push(format!(
-                    "=== {} ===\n[Error: File does not exist]",
-                    file_spec.path
+                    "=== {} ===\n{}",
+                    file_spec.path,
+                    Self::missing_file_message(path)
                 ));
                 continue;
             }
@@ -276,6 +349,12 @@ impl ReadTool {
                     outputs.push(format!("=== {} ===\n[Error: {}]", file_spec.path, e));
                 }
             }
+        }
+
+        // Nothing was read: report a tool error, so a failed read is not cached
+        // as a success and the model sees that the call did not work.
+        if file_count == 0 {
+            return ToolResult::error(outputs.join("\n\n"));
         }
 
         let mut meta = HashMap::new();
@@ -357,5 +436,71 @@ mod tests {
             .read_file_content(&spec(&small, None, Some(0)))
             .unwrap();
         assert!(out.contains("limit is 0"));
+    }
+
+    #[test]
+    fn test_suggest_paths_finds_forgotten_directory() {
+        // ovh/shai issue 101: model listed .github/workflows, then read the bare name.
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(wf.join("codecov-upload.yml"), "name: codecov\n").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        fs::write(dir.path().join("node_modules/pkg/codecov-upload.yml"), "x").unwrap();
+
+        let found = ReadTool::suggest_paths(dir.path(), Path::new("codecov-upload.yml"));
+        assert_eq!(found.len(), 1, "node_modules must be skipped: {found:?}");
+        assert!(
+            found[0].ends_with(".github/workflows/codecov-upload.yml"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn test_suggest_paths_is_bounded_and_empty_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..(SUGGEST_MAX_RESULTS + 3) {
+            let d = dir.path().join(format!("d{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("dup.txt"), "x").unwrap();
+        }
+        let found = ReadTool::suggest_paths(dir.path(), Path::new("dup.txt"));
+        assert_eq!(found.len(), SUGGEST_MAX_RESULTS);
+        assert!(ReadTool::suggest_paths(dir.path(), Path::new("nope.txt")).is_empty());
+        assert!(ReadTool::suggest_paths(dir.path(), Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn test_suggest_paths_enforces_entry_budget_inside_one_directory() {
+        // The match sorts after 50 decoys; a budget of 10 must stop before reaching it.
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..50 {
+            fs::write(dir.path().join(format!("a{i:02}.txt")), "x").unwrap();
+        }
+        fs::write(dir.path().join("zz-target.txt"), "x").unwrap();
+        let tight = ReadTool::suggest_paths_bounded(dir.path(), Path::new("zz-target.txt"), 10);
+        assert!(tight.is_empty(), "budget ignored: {tight:?}");
+        let roomy = ReadTool::suggest_paths_bounded(dir.path(), Path::new("zz-target.txt"), 1000);
+        assert_eq!(roomy.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_all_missing_is_tool_error_not_success() {
+        // A read that read nothing must not look successful (and so must not be cached).
+        let tool = ReadTool::new(Arc::new(FsOperationLog::new()));
+        let result = tool
+            .execute(ReadToolParams {
+                files: vec![ReadFileSpec {
+                    path: "/nonexistent-dir-101/codecov-upload.yml".to_string(),
+                    offset: None,
+                    limit: None,
+                    outline: false,
+                }],
+            })
+            .await;
+        match result {
+            ToolResult::Error { error, .. } => assert!(error.contains("does not exist")),
+            other => panic!("expected tool error, got {other:?}"),
+        }
     }
 }
