@@ -213,13 +213,15 @@ impl Reviewer {
     /// the note is cut to size as the text the agent and the user will read.
     fn note_in(&self, reply: &str) -> Option<AdvisorNote> {
         let line = verdict_line(reply)?;
-        // The severity is taken from the line as the model wrote it. The
-        // text is normalized in full, checked for known values, and only
-        // then cut to size: clipping first could hide a value that
-        // normalization puts back together across the limit.
-        let (severity, raw_text) = verdict_parts(line)?;
-        let redacted = self.redactor.redact(raw_text);
-        let normalized = sanitize_line(&redacted, usize::MAX);
+        // Redact the verdict line as written, including the severity
+        // prefix, so assignment rules see the advisor's prose in context
+        // and do not treat a word like "password:" in the note body as a
+        // fresh assignment. Then normalize in full, check known values,
+        // and only then cut to size: clipping first could hide a value
+        // that normalization puts back together across the limit.
+        let redacted = self.redactor.redact(line);
+        let (severity, raw_text) = verdict_parts(&redacted)?;
+        let normalized = sanitize_line(raw_text, usize::MAX);
         let checked = self.redactor.redact_known(&normalized);
         let text = sanitize_note(&checked);
         (!text.is_empty()).then_some(AdvisorNote { severity, text })
@@ -647,8 +649,11 @@ mod tests {
         let reply = format!("nit: {prefix}S3\u{200b}CR3TK3Y and more words after the secret");
         let parsed = reviewer.note_in(&reply).unwrap();
         assert_eq!(parsed.severity, Severity::Nit);
+        // Square brackets become parentheses in a note. The marker may
+        // itself be cut, but the secret must not remain even as a prefix.
         assert!(!parsed.text.contains(secret), "{}", parsed.text);
-        assert!(parsed.text.contains("[redacted]"), "{}", parsed.text);
+        assert!(!parsed.text.contains("S3C"), "{}", parsed.text);
+        assert!(parsed.text.contains("(red"), "{}", parsed.text);
         assert!(parsed.text.chars().count() <= MAX_NOTE_CHARS);
     }
 

@@ -362,7 +362,7 @@ mod tests {
     fn a_request_of_many_messages_is_clipped_as_a_whole() {
         let list = call("ls", json!({"directory": "."}));
         let mut trace: Vec<ChatMessage> = (0..50)
-            .map(|i| user(&format!("{i:02} {}", "x".repeat(1_900))))
+            .map(|i| user(&format!("{i:02} {}", "x".repeat(MAX_REQUEST_CHARS))))
             .collect();
         trace.push(list.clone());
         trace.push(result_of(&list, "a.txt"));

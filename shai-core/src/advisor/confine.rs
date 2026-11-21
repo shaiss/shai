@@ -1598,9 +1598,10 @@ mod tests {
         // again at every link, this takes minutes.
         let sb = sandbox();
         // Each symlink target must stay within macOS pathname limits
-        // (1024 bytes). The budget is exceeded by walking many short links,
+        // (1024 bytes). 200 * 5 stays under that; 39 such detours exceed
+        // MAX_LOOKUPS, so the budget is hit by walking many short links,
         // not by one over-long target.
-        let detour = "x/../".repeat(80);
+        let detour = "x/../".repeat(200);
         fs::create_dir_all(sb.root.join("x")).unwrap();
         for index in 0..40 {
             let target = if index == 39 {
