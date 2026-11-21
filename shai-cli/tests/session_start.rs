@@ -235,7 +235,12 @@ fn shai_with_env(
     if let Some((name, body)) = agent {
         let agents_dir = shai_dir.join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(agents_dir.join(format!("{name}.json")), body).unwrap();
+        let agent_path = agents_dir.join(format!("{name}.config.json"));
+        std::fs::write(&agent_path, body).unwrap();
+        assert!(
+            agent_path.is_file(),
+            "the fixture must use the loader's {name}.config.json path"
+        );
     }
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -342,6 +347,23 @@ fn anonymous_fallback_deny_stops_missing_config_and_headless_agent_without_provi
     let (outcome, has_file) = shai_with_env(
         None,
         Some(("helper", agent_no_provider)),
+        &[("SHAI_ANONYMOUS_FALLBACK", "deny")],
+        &["-p", "hello", "--agent", "helper"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(!has_file, "deny must not write auth.config.json");
+    assert!(
+        outcome.stderr.contains("Anonymous fallback is disabled"),
+        "stderr={}",
+        outcome.stderr
+    );
+
+    // 5) A named agent that declares keyless ovhcloud is not "configured":
+    // deny must still refuse, even though llm_provider is present.
+    let agent_anon_ovh = r#"{"name":"helper","description":"anon","llm_provider":{"provider":"ovhcloud","env_vars":{},"model":"qwen3-32b","tool_method":"FunctionCall"}}"#;
+    let (outcome, has_file) = shai_with_env(
+        None,
+        Some(("helper", agent_anon_ovh)),
         &[("SHAI_ANONYMOUS_FALLBACK", "deny")],
         &["-p", "hello", "--agent", "helper"],
     );

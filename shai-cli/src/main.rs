@@ -229,20 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_starts = starts_session(&cli);
     let default_url = cli.default_shai_config_url.clone();
 
-    // Session options are resolved only for the commands that start a
-    // session, so that the others (auth, list, ...) keep working when an
-    // option cannot be resolved, and before anything else those commands do,
-    // so that none of their paths runs without them. Asking for one where it
-    // cannot apply is an error.
-    let session_options = if session_starts {
-        SessionOptions::resolve_or_exit(cli.prewalk_into.as_deref())
-    } else {
-        if cli.prewalk_into.is_some() {
-            eprintln!("error: --prewalk-into only applies to commands that start an agent session");
-            std::process::exit(2);
-        }
-        SessionOptions::default()
-    };
+    // Asking for session options where they cannot apply is an error.
+    // Resolution itself waits until after the fallback gate (and any
+    // allowed starter config), so `--prewalk-into` can see a just-provisioned
+    // config on a fresh profile.
+    if !session_starts && cli.prewalk_into.is_some() {
+        eprintln!("error: --prewalk-into only applies to commands that start an agent session");
+        std::process::exit(2);
+    }
 
     match cli.command {
         #[cfg(unix)]
@@ -270,17 +264,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 list_agents();
             }
             Some(name) => {
-                prepare_session_or_exit(interactive_session_interaction(), Some(name), default_url)
-                    .await;
-                handle_main(Some(name.to_string()), None, None, session_options.clone()).await?;
+                let session_options = prepare_and_resolve_or_exit(
+                    interactive_session_interaction(),
+                    Some(name),
+                    default_url,
+                    cli.prewalk_into.as_deref(),
+                )
+                .await;
+                handle_main(Some(name.to_string()), None, None, session_options).await?;
             }
             None => {
-                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
+                let session_options = prepare_and_resolve_or_exit(
+                    interactive_session_interaction(),
+                    None,
+                    default_url,
+                    cli.prewalk_into.as_deref(),
+                )
+                .await;
                 handle_main(
                     None,
                     None,
                     Some(tui::app::InitialModal::AgentPicker),
-                    session_options.clone(),
+                    session_options,
                 )
                 .await?;
             }
@@ -294,20 +299,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                 };
-                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
-                handle_main(None, restore_id, None, session_options.clone()).await?;
+                let session_options = prepare_and_resolve_or_exit(
+                    interactive_session_interaction(),
+                    None,
+                    default_url,
+                    cli.prewalk_into.as_deref(),
+                )
+                .await;
+                handle_main(None, restore_id, None, session_options).await?;
             }
             Some(id) => {
-                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
-                handle_main(None, Some(id.to_string()), None, session_options.clone()).await?;
+                let session_options = prepare_and_resolve_or_exit(
+                    interactive_session_interaction(),
+                    None,
+                    default_url,
+                    cli.prewalk_into.as_deref(),
+                )
+                .await;
+                handle_main(None, Some(id.to_string()), None, session_options).await?;
             }
             None => {
-                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
+                let session_options = prepare_and_resolve_or_exit(
+                    interactive_session_interaction(),
+                    None,
+                    default_url,
+                    cli.prewalk_into.as_deref(),
+                )
+                .await;
                 handle_main(
                     None,
                     None,
                     Some(tui::app::InitialModal::SessionPicker),
-                    session_options.clone(),
+                    session_options,
                 )
                 .await?;
             }
@@ -346,12 +369,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_sessions,
             yes,
         }) => {
-            prepare_session_or_exit(
-                FallbackInteraction::NonInteractive,
-                agent.as_deref(),
-                default_url,
-            )
-            .await;
+            // The HTTP server does not yet use `--agent`, so the gate must
+            // not treat a named agent as the provider the server will run.
+            prepare_session_or_exit(FallbackInteraction::NonInteractive, None, default_url).await;
             handle_serve(host, port, agent, ephemeral, max_sessions, yes).await?;
         }
         Some(Commands::Import { overwrite }) => {
@@ -395,10 +415,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref stdin_content) = stdin_input {
                     messages.push(stdin_content.clone());
                 }
-                prepare_session_or_exit(
+                let session_options = prepare_and_resolve_or_exit(
                     FallbackInteraction::NonInteractive,
                     cli.agent.as_deref(),
                     default_url,
+                    cli.prewalk_into.as_deref(),
                 )
                 .await;
                 if let Err(err) = handle_fix(HeadlessRun {
@@ -409,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     agent_name: cli.agent,
                     temperature: cli.temperature,
                     yes: cli.yes,
-                    session_options: session_options.clone(),
+                    session_options,
                 })
                 .await
                 {
@@ -430,25 +451,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cli.interactive {
                     // Interactive mode: show TUI with piped content as initial prompt.
                     // Stdin is not a TTY here, so the gate warns instead of prompting.
-                    prepare_session_or_exit(
+                    let session_options = prepare_and_resolve_or_exit(
                         FallbackInteraction::NonInteractive,
                         cli.agent.as_deref(),
                         default_url,
+                        cli.prewalk_into.as_deref(),
                     )
                     .await;
-                    handle_main_with_prompt(
-                        cli.agent.clone(),
-                        stdin_content,
-                        session_options.clone(),
-                    )
-                    .await?;
+                    handle_main_with_prompt(cli.agent.clone(), stdin_content, session_options)
+                        .await?;
                     return Ok(());
                 } else {
                     // Headless mode from pipe
-                    prepare_session_or_exit(
+                    let session_options = prepare_and_resolve_or_exit(
                         FallbackInteraction::NonInteractive,
                         cli.agent.as_deref(),
                         default_url,
+                        cli.prewalk_into.as_deref(),
                     )
                     .await;
                     if let Err(err) = handle_fix(HeadlessRun {
@@ -459,7 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         agent_name: cli.agent,
                         temperature: cli.temperature,
                         yes: cli.yes,
-                        session_options: session_options.clone(),
+                        session_options,
                     })
                     .await
                     {
@@ -472,17 +491,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // No input, show TUI
             if cli.restore.as_deref() == Some(RESTORE_PICKER_SENTINEL) {
                 // Bare `--restore`: open the session picker
-                prepare_session_or_exit(
+                let session_options = prepare_and_resolve_or_exit(
                     interactive_session_interaction(),
                     cli.agent.as_deref(),
                     default_url,
+                    cli.prewalk_into.as_deref(),
                 )
                 .await;
                 handle_main(
                     cli.agent.clone(),
                     None,
                     Some(tui::app::InitialModal::SessionPicker),
-                    session_options.clone(),
+                    session_options,
                 )
                 .await?;
                 return Ok(());
@@ -498,13 +518,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 cli.restore.clone()
             };
-            prepare_session_or_exit(
+            let session_options = prepare_and_resolve_or_exit(
                 interactive_session_interaction(),
                 cli.agent.as_deref(),
                 default_url,
+                cli.prewalk_into.as_deref(),
             )
             .await;
-            handle_main(cli.agent.clone(), restore_id, None, session_options.clone()).await?;
+            handle_main(cli.agent.clone(), restore_id, None, session_options).await?;
         }
     }
 
@@ -564,8 +585,12 @@ fn interactive_session_interaction() -> FallbackInteraction {
 
 fn fallback_situation(loaded: Option<&ShaiConfig>, agent_name: Option<&str>) -> FallbackSituation {
     if let Some(name) = agent_name {
-        if AgentConfig::has_explicit_llm_provider(name) {
-            return FallbackSituation::Configured;
+        if let Some(anonymous) = AgentConfig::explicit_provider_is_anonymous_ovh(name) {
+            return if anonymous {
+                FallbackSituation::AnonymousOvh
+            } else {
+                FallbackSituation::Configured
+            };
         }
     }
     match loaded {
@@ -641,6 +666,18 @@ async fn prepare_session_or_exit(
     if let Err(error) = prepare_session(interaction, agent_name, default_config_url).await {
         exit_session_error(error);
     }
+}
+
+/// Apply the fallback gate, provision a starter config if allowed, then
+/// resolve session options against the resulting config.
+async fn prepare_and_resolve_or_exit(
+    interaction: FallbackInteraction,
+    agent_name: Option<&str>,
+    default_config_url: Option<String>,
+    prewalk_into: Option<&str>,
+) -> SessionOptions {
+    prepare_session_or_exit(interaction, agent_name, default_config_url).await;
+    SessionOptions::resolve_or_exit(prewalk_into)
 }
 
 async fn handle_main(

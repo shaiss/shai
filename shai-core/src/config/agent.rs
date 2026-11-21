@@ -309,8 +309,8 @@ impl Default for AgentTools {
 }
 
 impl AgentConfig {
-    /// Get the agents directory path
-    pub fn agents_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    /// The agents directory, without creating it.
+    fn agents_dir_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|_| {
@@ -318,22 +318,24 @@ impl AgentConfig {
                     .map(|home| home.join(".config"))
                     .ok_or("Could not find home directory")
             })?;
+        Ok(config_dir.join("shai").join("agents"))
+    }
 
-        let agents_dir = config_dir.join("shai").join("agents");
+    /// Get the agents directory path, creating it if needed for a write.
+    pub fn agents_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let agents_dir = Self::agents_dir_path()?;
         std::fs::create_dir_all(&agents_dir)?;
         Ok(agents_dir)
     }
 
     /// Get the path for a specific agent config file
     pub fn agent_config_path(agent_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let agents_dir = Self::agents_dir()?;
-        Ok(agents_dir.join(format!("{}.config.json", agent_name)))
+        Ok(Self::agents_dir_path()?.join(format!("{}.config.json", agent_name)))
     }
 
     /// Get the legacy path for a specific agent config file
     fn legacy_agent_config_path(agent_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let agents_dir = Self::agents_dir()?;
-        Ok(agents_dir.join(format!("{}.config", agent_name)))
+        Ok(Self::agents_dir_path()?.join(format!("{}.config", agent_name)))
     }
 
     /// Load an agent config from file
@@ -380,6 +382,9 @@ impl AgentConfig {
     /// Save the agent config to file
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::agent_config_path(&self.name)?;
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(&config_path, content)?;
         Ok(())
@@ -387,7 +392,7 @@ impl AgentConfig {
 
     /// List all available agents
     pub fn list_agents() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let agents_dir = Self::agents_dir()?;
+        let agents_dir = Self::agents_dir_path()?;
         let mut agents = Vec::new();
 
         if agents_dir.exists() {
@@ -414,21 +419,36 @@ impl AgentConfig {
     /// True when the named agent's config file includes an `llm_provider`
     /// field. An omitted field falls back to the global auth config.
     pub fn has_explicit_llm_provider(agent_name: &str) -> bool {
+        Self::explicit_llm_provider(agent_name).is_some()
+    }
+
+    /// The explicit `llm_provider` object from the named agent's file, if any.
+    /// Does not fill an omitted field from the global auth config.
+    fn explicit_llm_provider(agent_name: &str) -> Option<serde_json::Value> {
         let path = match Self::agent_config_path(agent_name) {
             Ok(path) if path.exists() => path,
             _ => match Self::legacy_agent_config_path(agent_name) {
                 Ok(path) if path.exists() => path,
-                _ => return false,
+                _ => return None,
             },
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
-        };
+        let bytes = std::fs::read(&path).ok()?;
         let stripped = StripComments::new(&bytes[..]);
-        let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(stripped) else {
-            return false;
-        };
-        value.get("llm_provider").is_some()
+        let value = serde_json::from_reader::<_, serde_json::Value>(stripped).ok()?;
+        value.get("llm_provider").cloned()
+    }
+
+    /// `Some(true)` when the agent's own provider would be anonymous OVH,
+    /// `Some(false)` when it has a non-anonymous explicit provider, and
+    /// `None` when the file omits `llm_provider` or cannot be read.
+    pub fn explicit_provider_is_anonymous_ovh(agent_name: &str) -> Option<bool> {
+        let provider = Self::explicit_llm_provider(agent_name)?;
+        let name = provider.get("provider")?.as_str()?;
+        let env_vars = provider
+            .get("env_vars")
+            .and_then(|value| serde_json::from_value::<HashMap<String, String>>(value.clone()).ok())
+            .unwrap_or_default();
+        Some(ShaiConfig::provider_is_anonymous_ovh(name, &env_vars))
     }
 
     /// Check if an agent config exists
@@ -666,5 +686,56 @@ mod broken_config_fallback_tests {
         let loaded = AgentConfig::load_with_primary("reviewer", Some(&snapshot)).unwrap();
         assert_eq!(loaded.llm_provider.provider, "openai");
         assert_eq!(loaded.llm_provider.model, "snapshot-model");
+    }
+
+    #[test]
+    fn explicit_provider_is_anonymous_ovh_uses_the_effective_key() {
+        let _xdg = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = crate::config::test_env::ENV_TEST_LOCK.blocking_lock();
+        let previous = std::env::var_os("OVH_API_KEY");
+        std::env::remove_var("OVH_API_KEY");
+        let dir = tempfile::TempDir::new().unwrap();
+        let agents = dir.path().join("shai").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        std::fs::write(
+            agents.join("none.config.json"),
+            r#"{"name":"none","description":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::explicit_provider_is_anonymous_ovh("none"),
+            None
+        );
+        assert!(!AgentConfig::has_explicit_llm_provider("none"));
+
+        std::fs::write(
+            agents.join("keyed.config.json"),
+            r#"{"name":"keyed","description":"x","llm_provider":{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::explicit_provider_is_anonymous_ovh("keyed"),
+            Some(false)
+        );
+        assert!(AgentConfig::has_explicit_llm_provider("keyed"));
+
+        std::fs::write(
+            agents.join("anon.config.json"),
+            r#"{"name":"anon","description":"x","llm_provider":{"provider":"ovhcloud","env_vars":{},"model":"qwen","tool_method":"FunctionCall"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::explicit_provider_is_anonymous_ovh("anon"),
+            Some(true)
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("OVH_API_KEY", value),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
     }
 }

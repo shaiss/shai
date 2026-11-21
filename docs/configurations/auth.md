@@ -53,7 +53,7 @@ Previous versions of Shai used `auth.config` (without `.json` extension). If `au
 | `mcp_configs` | object&lt;string, object&gt; | MCP server configurations |
 | `roles` | object&lt;string, string&gt; | Optional. Named secondary models, see [Roles](#roles) |
 | `prewalk` | object | Optional. One-shot handoff to another model, see [Prewalk](#prewalk) |
-| `anonymous_fallback` | string | Optional. How to handle a missing config or an anonymous OVH provider. `"prompt"` (the default) asks for confirmation in the TUI, or prints a warning and continues in headless, serve, and other non-interactive runs. `"deny"` refuses to start and exits 2, with no anonymous session and no network request. An unrecognized value is treated as `"deny"` and reported as an error. The `SHAI_ANONYMOUS_FALLBACK` environment variable overrides this key, but only to tighten: it can change `"prompt"` to `"deny"`, not the other way around. |
+| `anonymous_fallback` | string | Optional. How to handle a missing config or an anonymous OVH provider. `"prompt"` (the default) asks for confirmation in the TUI, or prints a warning and continues in headless, serve, and other non-interactive runs, but only when no config file is present. A saved anonymous OVH configuration proceeds without that confirmation or warning. `"deny"` refuses to start in either case and exits 2, with no anonymous session and no network request. An unrecognized value, including JSON `null`, is treated as `"deny"` and reported as an error without echoing the supplied value. The `SHAI_ANONYMOUS_FALLBACK` environment variable overrides this key, but only to tighten: it can change `"prompt"` to `"deny"`, not the other way around. |
 
 ### ProviderConfig
 

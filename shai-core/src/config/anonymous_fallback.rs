@@ -92,8 +92,8 @@ fn parse_mode(raw: &str) -> Option<AnonymousFallbackMode> {
     }
 }
 
-fn invalid_value_message(which: &str, raw: &str) -> String {
-    format!("Invalid {which} value \"{raw}\"; expected \"prompt\" or \"deny\".")
+fn invalid_value_message(which: &str, _raw: &str) -> String {
+    format!("Invalid {which} value; expected \"prompt\" or \"deny\".")
 }
 
 /// Resolve the mode from optional raw config and env values.

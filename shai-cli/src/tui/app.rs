@@ -734,6 +734,7 @@ impl App<'_> {
         // before raw mode is enabled: these calls are then no-ops.
         let _ = execute!(
             std::io::stdout(),
+            crossterm::cursor::Show,
             crossterm::event::DisableMouseCapture,
             crossterm::event::PopKeyboardEnhancementFlags,
         );
