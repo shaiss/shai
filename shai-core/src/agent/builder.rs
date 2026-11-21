@@ -551,6 +551,22 @@ impl AgentBuilder {
     }
 }
 
+/// Provider and MCP values an advisor should keep out of what it is sent.
+fn agent_redaction_secrets(config: &AgentConfig) -> Vec<(String, String)> {
+    let mut secrets: Vec<(String, String)> = config
+        .llm_provider
+        .env_vars
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for mcp in config.tools.mcp.values() {
+        for (name, value) in crate::advisor::mcp_settings(&mcp.config) {
+            secrets.push((name.to_string(), value));
+        }
+    }
+    secrets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,20 +641,4 @@ mod tests {
 
         kept.expect("a named replacement must keep a key the user exported");
     }
-}
-
-/// Provider and MCP values an advisor should keep out of what it is sent.
-fn agent_redaction_secrets(config: &AgentConfig) -> Vec<(String, String)> {
-    let mut secrets: Vec<(String, String)> = config
-        .llm_provider
-        .env_vars
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    for mcp in config.tools.mcp.values() {
-        for (name, value) in crate::advisor::mcp_settings(&mcp.config) {
-            secrets.push((name.to_string(), value));
-        }
-    }
-    secrets
 }

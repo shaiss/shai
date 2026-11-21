@@ -330,7 +330,8 @@ fn verdict_line(reply: &str) -> Option<&str> {
 ///
 /// The contract is strict. The line must be `NONE` or `<severity>: <text>`;
 /// anything else yields no note. Nothing the model wrote is passed through
-/// unless it fits.
+/// unless it fits. Production redacts the line first; tests parse it raw.
+#[cfg(test)]
 fn parse_verdict(line: &str) -> Option<AdvisorNote> {
     let (severity, text) = verdict_parts(line)?;
     let text = sanitize_note(text);
