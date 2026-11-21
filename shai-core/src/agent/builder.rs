@@ -76,7 +76,7 @@ impl AgentBuilder {
         // used only when there is no config file. A file that is there and
         // cannot be read is an error, never a silent fallback.
         let config = ShaiConfig::from_snapshot_or_primary(primary)
-            .map_err(AgentError::ConfigurationError)?;
+            .map_err(|e| AgentError::ConfigurationError(e.to_string()))?;
         let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;

@@ -215,3 +215,141 @@ fn the_flag_is_refused_where_no_session_starts() {
         outcome.stdout
     );
 }
+
+/// Run `shai` with optional `auth.config.json`, optional named agent JSON,
+/// and extra env vars, returning exit status, stdout, stderr, and whether
+/// `auth.config.json` exists afterward.
+fn shai_with_env(
+    auth_config: Option<&str>,
+    agent: Option<(&str, &str)>,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (Outcome, bool) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_home = dir.path().join("config");
+    let shai_dir = config_home.join("shai");
+    std::fs::create_dir_all(&shai_dir).unwrap();
+    if let Some(cfg) = auth_config {
+        std::fs::write(shai_dir.join("auth.config.json"), cfg).unwrap();
+    }
+    if let Some((name, body)) = agent {
+        let agents_dir = shai_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join(format!("{name}.json")), body).unwrap();
+    }
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shai"));
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("NO_COLOR", "1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().expect("the shai binary should start");
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("shai {args:?} did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let has_auth_file = shai_dir.join("auth.config.json").exists();
+    (
+        Outcome {
+            status: output.status.code().expect("an exit status"),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        has_auth_file,
+    )
+}
+
+#[test]
+fn anonymous_fallback_deny_stops_missing_config_and_headless_agent_without_provider() {
+    // 1) No config + SHAI_ANONYMOUS_FALLBACK=deny -> exit 2, log deny, no auth file written.
+    let (outcome, has_file) = shai_with_env(
+        None,
+        None,
+        &[
+            ("SHAI_ANONYMOUS_FALLBACK", "deny"),
+            ("SHAI_LOG_LEVEL", "info"),
+        ],
+        &["-p", "hello"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(!has_file, "deny must not write auth.config.json");
+    assert!(
+        outcome.stderr.contains("Anonymous fallback is disabled"),
+        "stderr={}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stdout.contains("anonymous fallback: deny"),
+        "stdout={}",
+        outcome.stdout
+    );
+
+    // 2) Tighten-only: config deny + env prompt -> still deny (exit 2).
+    let anon_deny_cfg = r#"{"providers":[{"provider":"ovhcloud","env_vars":{},"model":"qwen3-32b","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#;
+    let (outcome, _) = shai_with_env(
+        Some(anon_deny_cfg),
+        None,
+        &[
+            ("SHAI_ANONYMOUS_FALLBACK", "prompt"),
+            ("SHAI_LOG_LEVEL", "info"),
+        ],
+        &["-p", "hello"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("anonymous fallback: deny"),
+        "stdout={}",
+        outcome.stdout
+    );
+
+    // 3) Invalid setting fails closed (exit 2) even with a configured provider.
+    let (outcome, _) = shai_with_env(
+        Some(&config("")),
+        None,
+        &[("SHAI_ANONYMOUS_FALLBACK", "bogus")],
+        &["-p", "hello"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains(r#"expected "prompt" or "deny""#),
+        "stderr={}",
+        outcome.stderr
+    );
+
+    // 4) Issue #67: headless `--agent` omitting `llm_provider` with deny and no
+    // primary config must refuse with exit 2 (not exit 0 or 1).
+    let agent_no_provider = r#"{"name":"helper","description":"no provider"}"#;
+    let (outcome, has_file) = shai_with_env(
+        None,
+        Some(("helper", agent_no_provider)),
+        &[("SHAI_ANONYMOUS_FALLBACK", "deny")],
+        &["-p", "hello", "--agent", "helper"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(!has_file, "deny must not write auth.config.json");
+    assert!(
+        outcome.stderr.contains("Anonymous fallback is disabled"),
+        "stderr={}",
+        outcome.stderr
+    );
+}

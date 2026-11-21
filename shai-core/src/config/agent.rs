@@ -246,7 +246,7 @@ fn default_llm_provider() -> AgentProviderConfig {
 /// broken auth config is ignored.
 pub(crate) fn agent_config_from_value(
     mut value: serde_json::Value,
-    primary: Result<ShaiConfig, String>,
+    primary: Result<ShaiConfig, crate::config::roles::PrimaryConfigError>,
     path: Option<&Path>,
 ) -> Result<AgentConfig, Box<dyn std::error::Error>> {
     if !value.is_object() {
@@ -411,6 +411,26 @@ impl AgentConfig {
         Ok(agents)
     }
 
+    /// True when the named agent's config file includes an `llm_provider`
+    /// field. An omitted field falls back to the global auth config.
+    pub fn has_explicit_llm_provider(agent_name: &str) -> bool {
+        let path = match Self::agent_config_path(agent_name) {
+            Ok(path) if path.exists() => path,
+            _ => match Self::legacy_agent_config_path(agent_name) {
+                Ok(path) if path.exists() => path,
+                _ => return false,
+            },
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        let stripped = StripComments::new(&bytes[..]);
+        let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(stripped) else {
+            return false;
+        };
+        value.get("llm_provider").is_some()
+    }
+
     /// Check if an agent config exists
     pub fn exists(agent_name: &str) -> bool {
         Self::agent_config_path(agent_name)
@@ -529,11 +549,14 @@ mod broken_config_fallback_tests {
         .unwrap()
     }
 
-    fn broken() -> Result<ShaiConfig, String> {
-        ShaiConfig::primary_from(Err(RoleError::ConfigInvalid {
-            path: "/home/me/.config/shai/auth.config.json".to_string(),
-            reason: "JSON syntax error at line 3 column 7".to_string(),
-        }))
+    fn broken() -> Result<ShaiConfig, crate::config::roles::PrimaryConfigError> {
+        ShaiConfig::primary_from_with_env(
+            Err(RoleError::ConfigInvalid {
+                path: "/home/me/.config/shai/auth.config.json".to_string(),
+                reason: "JSON syntax error at line 3 column 7".to_string(),
+            }),
+            None,
+        )
     }
 
     #[test]
@@ -560,13 +583,25 @@ mod broken_config_fallback_tests {
 
         let loaded = agent_config_from_value(
             agent_json(false),
-            ShaiConfig::primary_from(Err(RoleError::ConfigMissing)),
+            ShaiConfig::primary_from_with_env(Err(RoleError::ConfigMissing), None),
             None,
         )
         .unwrap();
         assert_eq!(
             loaded.llm_provider.provider,
             ShaiConfig::default().providers[0].provider
+        );
+
+        let err = agent_config_from_value(
+            agent_json(false),
+            ShaiConfig::primary_from_with_env(Err(RoleError::ConfigMissing), Some("deny")),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::config::roles::PrimaryConfigError>()
+                .is_some_and(|e| e.is_refused_start()),
+            "expected PrimaryConfigError, got: {err}"
         );
     }
 
