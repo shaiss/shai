@@ -85,31 +85,65 @@ fn standard_api_key_var(provider: &str) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
-fn env_value<'a>(env_vars: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    env_vars.iter().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case(key)
-            .then_some(value.as_str())
-            .filter(|value| !value.trim().is_empty())
-    })
+/// If the entry holds a non-blank value for `key` under any ASCII case,
+/// make sure the canonical name is present and return that value.
+///
+/// `LlmClient::isolated_settings` looks up the canonical name exactly, so a
+/// differently cased configured key would otherwise be treated as present
+/// here and then missed at lookup, blocking env fallback without being used.
+/// A non-blank canonical key keeps precedence. If several case variants
+/// carry non-blank values, the one whose name sorts first is copied under
+/// the canonical name.
+fn canonicalize_configured_key(
+    env_vars: &mut HashMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    if let Some(value) = env_vars.get(key).filter(|value| !value.trim().is_empty()) {
+        return Some(value.clone());
+    }
+    let mut variants: Vec<(String, String)> = env_vars
+        .iter()
+        .filter(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if variants.is_empty() {
+        return None;
+    }
+    variants.sort_by(|a, b| a.0.cmp(&b.0));
+    let value = variants[0].1.clone();
+    env_vars.insert(key.to_string(), value.clone());
+    Some(value)
 }
 
-/// True when the entry names a base URL or endpoint of its own.
+/// True when the entry names a base URL, host, or endpoint of its own.
 ///
-/// Official-endpoint providers do not currently honour these keys, but a
-/// non-blank value still counts as an override: the key must not be taken
+/// Official-endpoint providers do not currently honour these keys, but any
+/// present name that looks like a URL or host still counts as an override,
+/// including a blank or whitespace-only value: the key must not be taken
 /// from the environment and sent at an endpoint the entry appears to name.
+/// The match is fail-closed, so unrecognized forms such as `URL`, `HOST`,
+/// `BASEURL`, `OPENROUTER_URL`, and `OPENROUTER_HOST` also refuse fallback.
 fn entry_overrides_endpoint(env_vars: &HashMap<String, String>) -> bool {
-    env_vars
-        .iter()
-        .any(|(name, value)| !value.trim().is_empty() && is_endpoint_override_key(name))
+    env_vars.keys().any(|name| is_endpoint_override_key(name))
 }
 
 fn is_endpoint_override_key(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     matches!(
         name.as_str(),
-        "BASE_URL" | "API_BASE" | "API_BASE_URL" | "API_URL" | "ENDPOINT" | "API_ENDPOINT"
-    ) || name.ends_with("_BASE_URL")
+        "URL"
+            | "HOST"
+            | "BASEURL"
+            | "BASE_URL"
+            | "API_BASE"
+            | "API_BASE_URL"
+            | "API_URL"
+            | "ENDPOINT"
+            | "API_ENDPOINT"
+    ) || name.ends_with("_URL")
+        || name.ends_with("_HOST")
+        || name.ends_with("_BASEURL")
+        || name.ends_with("_BASE_URL")
         || name.ends_with("_API_BASE")
         || name.ends_with("_API_BASE_URL")
         || name.ends_with("_API_URL")
@@ -126,8 +160,10 @@ fn env_fallback_applies(provider: &str, env_vars: &HashMap<String, String>) -> b
 
 /// Copy of `env_vars`, with the provider's standard API key filled from the
 /// pre-export snapshot when the rules allow it. A non-blank value in the
-/// entry always wins. The second value is the key source for logging
-/// (`"config"` or `"env"`), or `None` when this path did not supply a key.
+/// entry always wins, including a differently cased key name, which is
+/// copied under the canonical name so the settings lookup can see it. The
+/// second value is the key source for logging (`"config"` or `"env"`), or
+/// `None` when this path did not supply a key.
 fn complete_role_env(
     provider: &str,
     env_vars: &HashMap<String, String>,
@@ -136,7 +172,7 @@ fn complete_role_env(
     let Some(key) = standard_api_key_var(provider) else {
         return (completed, None);
     };
-    if env_value(&completed, key).is_some() {
+    if canonicalize_configured_key(&mut completed, key).is_some() {
         tracing::debug!(provider, source = "config", "role provider key source");
         return (completed, Some("config"));
     }
@@ -2321,5 +2357,199 @@ mod tests {
         .unwrap();
         assert_eq!(from_role, from_config);
         assert_ne!(from_role, from_env);
+    }
+
+    #[tokio::test]
+    async fn a_cased_config_key_is_used_under_the_canonical_name() {
+        let _lock = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+        let _guard = UserEnvGuard::enter(&[("OPENROUTER_API_KEY", Some(USER_KEY))]);
+        user_env::capture_user_env();
+
+        let cfg = config(
+            vec![provider(
+                "openrouter",
+                "openai/gpt-4o-mini",
+                &[("openrouter_api_key", CONFIG_KEY)],
+            )],
+            &[("cheap", "openrouter/openai/gpt-4o-mini")],
+        );
+        let resolved = cfg.resolve_role("cheap").unwrap().expect("configured");
+        resolved
+            .bind()
+            .expect("a differently cased config key must be used");
+
+        let from_role = role_isolated_settings("openrouter", &resolved.provider.env_vars).unwrap();
+        let from_config = LlmClient::isolated_settings(
+            "openrouter",
+            &HashMap::from([("OPENROUTER_API_KEY".into(), CONFIG_KEY.into())]),
+        )
+        .unwrap();
+        let from_env = LlmClient::isolated_settings(
+            "openrouter",
+            &HashMap::from([("OPENROUTER_API_KEY".into(), USER_KEY.into())]),
+        )
+        .unwrap();
+        assert_eq!(from_role, from_config);
+        assert_ne!(from_role, from_env);
+    }
+
+    fn assert_override_stays_config_only(error: RoleError) {
+        assert!(
+            matches!(error, RoleError::UnusableProvider { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("OPENROUTER_API_KEY"), "{message}");
+        assert!(
+            message.contains("not found in the provider's config entry"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("environment variable"),
+            "URL or host override must stay ConfigOnly: {message}"
+        );
+        assert!(!message.contains(USER_KEY), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unrecognized_url_or_host_keys_refuse_env_fallback() {
+        let _lock = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+        let _guard = UserEnvGuard::enter(&[("OPENROUTER_API_KEY", Some(USER_KEY))]);
+        user_env::capture_user_env();
+
+        for (name, value) in [
+            ("OPENROUTER_URL", "https://example.invalid/v1"),
+            ("URL", "https://example.invalid/v1"),
+            ("BASEURL", "https://example.invalid/v1"),
+            ("HOST", "example.invalid"),
+            ("OPENROUTER_HOST", "example.invalid"),
+        ] {
+            let cfg = config(
+                vec![provider(
+                    "openrouter",
+                    "openai/gpt-4o-mini",
+                    &[(name, value)],
+                )],
+                &[("cheap", "openrouter/openai/gpt-4o-mini")],
+            );
+            assert_override_stays_config_only(cfg.resolve_role("cheap").unwrap_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_only_base_url_refuses_env_fallback() {
+        let _lock = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+        let _guard = UserEnvGuard::enter(&[("OPENROUTER_API_KEY", Some(USER_KEY))]);
+        user_env::capture_user_env();
+
+        let cfg = config(
+            vec![provider(
+                "openrouter",
+                "openai/gpt-4o-mini",
+                &[("OPENROUTER_BASE_URL", "   ")],
+            )],
+            &[("cheap", "openrouter/openai/gpt-4o-mini")],
+        );
+        assert_override_stays_config_only(cfg.resolve_role("cheap").unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn each_official_provider_uses_only_its_own_env_var() {
+        let _lock = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+        const OFFICIAL: &[(&str, &str, &str)] = &[
+            ("openai", "gpt-4o-mini", "OPENAI_API_KEY"),
+            ("anthropic", "claude-sonnet-4-5", "ANTHROPIC_API_KEY"),
+            ("mistral", "mistral-small-latest", "MISTRAL_API_KEY"),
+            ("openrouter", "openai/gpt-4o-mini", "OPENROUTER_API_KEY"),
+        ];
+        for &(provider_name, model, own_key) in OFFICIAL {
+            for &(_, _, other_key) in OFFICIAL {
+                if other_key == own_key {
+                    continue;
+                }
+                let _guard = UserEnvGuard::enter(&[(other_key, Some(USER_KEY))]);
+                user_env::capture_user_env();
+                let cfg = config(
+                    vec![provider(provider_name, model, &[])],
+                    &[("cheap", &format!("{provider_name}/{model}"))],
+                );
+                let error = cfg.resolve_role("cheap").unwrap_err();
+                assert!(
+                    matches!(error, RoleError::UnusableProvider { .. }),
+                    "{provider_name} vs {other_key}: {error:?}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains(own_key),
+                    "{provider_name} vs {other_key}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("or the {own_key} environment variable")),
+                    "{provider_name} vs {other_key}: {message}"
+                );
+                assert!(
+                    !message.contains(other_key),
+                    "{provider_name} vs {other_key}: {message}"
+                );
+                assert!(!message.contains(USER_KEY), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_never_uses_env_fallback() {
+        let _lock = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+
+        // Key and URL in the process environment, empty entry.
+        struct RestoreCompat(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for RestoreCompat {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OPENAI_COMPATIBLE_API_KEY", value),
+                    None => std::env::remove_var("OPENAI_COMPATIBLE_API_KEY"),
+                }
+                match self.1.take() {
+                    Some(value) => std::env::set_var("OPENAI_COMPATIBLE_BASE_URL", value),
+                    None => std::env::remove_var("OPENAI_COMPATIBLE_BASE_URL"),
+                }
+            }
+        }
+        let _restore_compat = RestoreCompat(
+            std::env::var_os("OPENAI_COMPATIBLE_API_KEY"),
+            std::env::var_os("OPENAI_COMPATIBLE_BASE_URL"),
+        );
+        std::env::set_var("OPENAI_COMPATIBLE_API_KEY", USER_KEY);
+        std::env::set_var("OPENAI_COMPATIBLE_BASE_URL", "http://127.0.0.1:9/v1");
+        let _guard = UserEnvGuard::enter(&[("OPENAI_API_KEY", Some(USER_KEY))]);
+        user_env::capture_user_env();
+
+        let empty = config(
+            vec![provider("openai_compatible", "local-llm", &[])],
+            &[("cheap", "openai_compatible/local-llm")],
+        );
+        let error = empty.resolve_role("cheap").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains("environment variable"),
+            "openai_compatible must stay ConfigOnly: {message}"
+        );
+        assert!(!message.contains(USER_KEY), "{message}");
+
+        // URL in the entry, compatible key only in the environment.
+        let url_only = config(
+            vec![provider(
+                "openai_compatible",
+                "local-llm",
+                &[("OPENAI_COMPATIBLE_BASE_URL", "http://127.0.0.1:9/v1")],
+            )],
+            &[("cheap", "openai_compatible/local-llm")],
+        );
+        let error = url_only.resolve_role("cheap").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains("environment variable"),
+            "openai_compatible must stay ConfigOnly: {message}"
+        );
+        assert!(!message.contains(USER_KEY), "{message}");
     }
 }
