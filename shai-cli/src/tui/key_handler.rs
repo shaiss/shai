@@ -80,21 +80,20 @@ impl App<'_> {
                         let trace = session.trace.clone();
 
                         let agent_name = self.agent_meta.name().map(|s| s.to_string());
-                        if !self.may_replace_agent(agent_name.as_deref()) {
+                        let Some(prepared) = self.prepared_replacement(agent_name.as_deref())
+                        else {
                             return Ok(());
-                        }
+                        };
                         self.input.alert_msg(
                             &format!("Restoring session {}...", &session_id[..8]),
                             Duration::from_secs(2),
                         );
 
-                        if let Some(agent) = self.agent.take() {
-                            let _ = agent.controller.terminate().await;
-                        }
-
-                        self.start_agent(agent_name.as_deref()).await.map_err(|e| {
+                        if !self.install_restored_agent(prepared).await.map_err(|e| {
                             io::Error::other(format!("Failed to start agent: {}", e))
-                        })?;
+                        })? {
+                            return Ok(());
+                        }
 
                         if let Some(ref agent) = self.agent {
                             let _ = agent.controller.load_trace(trace.clone()).await;
@@ -138,13 +137,16 @@ impl App<'_> {
                     &format!("Switching to agent '{}'...", name),
                     Duration::from_secs(2),
                 );
-                self.swap_agent(Some(&name))
+                let replaced = self
+                    .swap_agent(Some(&name))
                     .await
                     .map_err(|e| io::Error::other(format!("Failed to switch agent: {}", e)))?;
-                self.input.alert_msg(
-                    &format!("Switched to agent '{}'", name),
-                    Duration::from_secs(2),
-                );
+                if replaced {
+                    self.input.alert_msg(
+                        &format!("Switched to agent '{}'", name),
+                        Duration::from_secs(2),
+                    );
+                }
             }
             Some(AgentPickerAction::Cancelled) => {
                 self.ui_state.agent_picker = None;

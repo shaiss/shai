@@ -41,9 +41,18 @@ impl AgentBuilder {
     /// If None, creates a default agent with LLM from ShaiConfig
     /// If Some(name), loads agent from config file
     pub async fn create(config_name: Option<String>) -> Result<Self, AgentError> {
+        Self::create_with_primary(config_name, None).await
+    }
+
+    /// [`AgentBuilder::create`], using an already-loaded auth config so the
+    /// file is not read again (the HTTP server passes the startup snapshot).
+    pub async fn create_with_primary(
+        config_name: Option<String>,
+        primary: Option<&ShaiConfig>,
+    ) -> Result<Self, AgentError> {
         match config_name {
             Some(name) => {
-                let config = AgentConfig::load(&name).map_err(|e| {
+                let config = AgentConfig::load_with_primary(&name, primary).map_err(|e| {
                     AgentError::ConfigurationError(format!(
                         "Failed to load agent '{}': {}",
                         name, e
@@ -51,14 +60,24 @@ impl AgentBuilder {
                 })?;
                 Self::from_config(config).await
             }
-            None => Self::default().await,
+            None => Self::default_from(primary).await,
         }
     }
 
     /// Create a default AgentBuilder using ShaiConfig LLM and default tools
     pub async fn default() -> Result<Self, AgentError> {
-        // Get LLM from ShaiConfig
-        let (llm_client, model) = ShaiConfig::get_llm().await.map_err(|e| {
+        Self::default_from(None).await
+    }
+
+    /// [`AgentBuilder::default`] from an already-loaded config, or a fresh
+    /// [`ShaiConfig::primary`] load if none is passed.
+    pub async fn default_from(primary: Option<&ShaiConfig>) -> Result<Self, AgentError> {
+        // Same rule as the TUI and headless mode: the built-in default is
+        // used only when there is no config file. A file that is there and
+        // cannot be read is an error, never a silent fallback.
+        let config = ShaiConfig::from_snapshot_or_primary(primary)
+            .map_err(AgentError::ConfigurationError)?;
+        let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;
 
@@ -235,19 +254,21 @@ impl AgentBuilder {
 
     /// Create an AgentBuilder from an AgentConfig
     pub async fn from_config(mut config: AgentConfig) -> Result<Self, AgentError> {
-        // Create LLM client from provider config using the utility method
-        let llm_client = Arc::new(
-            LlmClient::create_provider(
-                &config.llm_provider.provider,
-                &config.llm_provider.env_vars,
-            )
-            .map_err(|e| AgentError::LlmError(e.to_string()))?,
-        );
+        // Same resolution as a primary replacement: original user env, then
+        // this agent's env_vars, and the model from the agent file. Do not
+        // use create_provider, which would inherit a live primary's export.
+        let (llm_client, model) = ShaiConfig::llm_from_provider_env(
+            &config.llm_provider.provider,
+            &config.llm_provider.env_vars,
+            &config.llm_provider.model,
+        )
+        .map_err(|e| AgentError::LlmError(e.to_string()))?;
+        let llm_client = Arc::new(llm_client);
 
         // Create brain with custom system prompt and temperature
         let brain = Box::new(CoderBrain::with_custom_prompt(
             llm_client.clone(),
-            config.llm_provider.model.clone(),
+            model,
             config.system_prompt.clone(),
             config.temperature,
         ));
@@ -521,5 +542,81 @@ impl AgentBuilder {
         // SSE and Stdio don't need OAuth handling for now
 
         Ok(config_changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config::ShaiConfig;
+    use crate::config::test_env::ENV_TEST_LOCK;
+
+    fn openai_primary(key: &str) -> ShaiConfig {
+        serde_json::from_str(&format!(
+            r#"{{"providers":[{{"provider":"openai","env_vars":{{"OPENAI_API_KEY":"{key}"}},"model":"gpt-4o","tool_method":"FunctionCall"}}],"selected_provider":0}}"#
+        ))
+        .expect("openai primary config should deserialize")
+    }
+
+    fn named_openai(env_vars: serde_json::Value) -> AgentConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "reviewer",
+            "description": "has its own provider",
+            "llm_provider": {
+                "provider": "openai",
+                "env_vars": env_vars,
+                "model": "gpt-4o",
+                "tool_method": "FunctionCall"
+            }
+        }))
+        .expect("named openai agent should deserialize")
+    }
+
+    #[tokio::test]
+    async fn a_named_agent_uses_the_user_environment_on_first_start() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        const KEY: &str = "OPENAI_API_KEY";
+        let previous = std::env::var(KEY).ok();
+        std::env::set_var(KEY, "user-key");
+
+        let result = AgentBuilder::from_config(named_openai(serde_json::json!({}))).await;
+
+        match previous {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+
+        result.expect("a named agent that omits a key must still use a value the user exported");
+    }
+
+    #[tokio::test]
+    async fn a_named_replacement_does_not_inherit_a_live_provider_key() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        const KEY: &str = "OPENAI_API_KEY";
+        let previous = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+        let snapshot = ShaiConfig::snapshot_applied_env();
+
+        let live = openai_primary("live-key");
+        live.set_env_vars();
+        let inherited = AgentBuilder::from_config(named_openai(serde_json::json!({}))).await;
+        ShaiConfig::restore_applied_env(&snapshot);
+
+        assert!(
+            inherited.is_err(),
+            "a named replacement must not inherit a key only the live primary exported"
+        );
+
+        std::env::set_var(KEY, "user-key");
+        live.set_env_vars();
+        let kept = AgentBuilder::from_config(named_openai(serde_json::json!({}))).await;
+        ShaiConfig::restore_applied_env(&snapshot);
+
+        match previous {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+
+        kept.expect("a named replacement must keep a key the user exported");
     }
 }

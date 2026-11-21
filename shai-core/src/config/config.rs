@@ -31,6 +31,16 @@ fn restore_env_vars(applied: &mut Vec<(String, Option<OsString>)>) {
     }
 }
 
+/// The process environment as [`ShaiConfig::set_env_vars`] last left it.
+///
+/// Used to put the live agent's variables back if a later
+/// [`ShaiConfig::set_env_vars`] should not stick (for example, an `/auth`
+/// reload that could not start).
+pub struct AppliedEnvSnapshot {
+    applied: Vec<(String, Option<OsString>)>,
+    current: Vec<(String, Option<OsString>)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub provider: String,
@@ -327,6 +337,36 @@ impl ShaiConfig {
         }
     }
 
+    /// Capture the provider variables currently exported to the process.
+    pub fn snapshot_applied_env() -> AppliedEnvSnapshot {
+        let applied = APPLIED_ENV_VARS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let current = applied
+            .iter()
+            .map(|(name, _)| (name.clone(), std::env::var_os(name)))
+            .collect();
+        AppliedEnvSnapshot { applied, current }
+    }
+
+    /// Restore the process environment to a previous [`Self::snapshot_applied_env`].
+    ///
+    /// Any variables written by a later [`Self::set_env_vars`] are undone first.
+    pub fn restore_applied_env(snapshot: &AppliedEnvSnapshot) {
+        let mut applied = APPLIED_ENV_VARS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        restore_env_vars(&mut applied);
+        for (name, value) in &snapshot.current {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        *applied = snapshot.applied.clone();
+    }
+
     pub fn remove_provider(&mut self, index: usize) -> Result<ProviderConfig, String> {
         if index >= self.providers.len() {
             return Err(format!(
@@ -447,28 +487,111 @@ impl ShaiConfig {
     /// Build the LLM client and default model from this already-loaded config.
     /// Unlike [`ShaiConfig::get_llm`], this never loads the file again and never
     /// falls back to [`ShaiConfig::default`].
+    ///
+    /// This exports the selected provider's variables into the process
+    /// environment, so child tools can see them. When a replacement is being
+    /// built while a live agent is still running, use [`Self::llm_from_config`]
+    /// instead and call [`Self::set_env_vars`] only after that agent is
+    /// installed.
     pub async fn get_llm_from_config(
         &self,
     ) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
         self.set_env_vars();
+        self.llm_from_config().await
+    }
 
-        let llm = if let Some(provider_config) = self.get_selected_provider() {
-            LlmClient::create_provider(&provider_config.provider, &provider_config.env_vars)
-                .map_err(|e| {
-                    format!(
-                        "Failed to create {} client: {}",
-                        provider_config.provider, e
-                    )
-                })?
-        } else {
+    /// Build the LLM client and configured model without writing provider
+    /// variables into the process environment.
+    ///
+    /// Omitted settings are resolved against the original user environment
+    /// (process env with [`Self::set_env_vars`] writes undone), then the
+    /// selected provider's `env_vars` are applied. The live agent's exported
+    /// overrides are therefore not inherited. The model is the one in the
+    /// config, not `SHAI_MODEL`. Call [`Self::set_env_vars`] once this
+    /// provider should actually be the one the process exports.
+    pub async fn llm_from_config(&self) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
+        let Some(provider_config) = self.get_selected_provider() else {
             return Err("No provider configured".into());
         };
+        Self::llm_from_provider_env(
+            &provider_config.provider,
+            &provider_config.env_vars,
+            &provider_config.model,
+        )
+    }
 
-        let model = llm
-            .default_model()
-            .await
-            .map_err(|_| "no Model available")?;
-        Ok((llm, model))
+    /// Build an LLM client from a provider entry without writing process env.
+    ///
+    /// Omitted settings are resolved against the original user environment,
+    /// then `env_vars` are applied. The model is `model`, not `SHAI_MODEL`.
+    /// Used by [`Self::llm_from_config`] and by named-agent construction.
+    pub(crate) fn llm_from_provider_env(
+        provider: &str,
+        env_vars: &HashMap<String, String>,
+        model: &str,
+    ) -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
+        let env = Self::env_vars_for_llm(env_vars);
+        let llm = LlmClient::create_provider_from_map(provider, &env)
+            .map_err(|e| format!("Failed to create {provider} client: {e}"))?;
+        Ok((llm, model.to_string()))
+    }
+
+    /// Process environment with live-provider exports removed, then `overlay`
+    /// applied. On first start, before any [`Self::set_env_vars`], this is
+    /// the process environment plus the entry's own values.
+    ///
+    /// Only UTF-8 names and values are kept, so an unrelated non-Unicode
+    /// variable cannot panic the start. [`APPLIED_ENV_VARS`] is walked newest
+    /// first, matching [`restore_env_vars`], so a name written twice is
+    /// restored to its original value. Keys are stored in the same form
+    /// [`LlmClient::create_provider_from_map`] uses when looking them up.
+    pub(crate) fn env_vars_for_llm(overlay: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(name, value)| {
+                let name = name.into_string().ok()?;
+                let value = value.into_string().ok()?;
+                Some((env_map_key(&name).into_owned(), value))
+            })
+            .collect();
+        {
+            let applied = APPLIED_ENV_VARS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, previous) in applied.iter().rev() {
+                let name = env_map_key(name);
+                match previous {
+                    Some(value) => match value.to_str() {
+                        Some(value) => {
+                            env.insert(name.into_owned(), value.to_string());
+                        }
+                        None => {
+                            env.remove(name.as_ref());
+                        }
+                    },
+                    None => {
+                        env.remove(name.as_ref());
+                    }
+                }
+            }
+        }
+        for (name, value) in overlay {
+            env.insert(env_map_key(name).into_owned(), value.clone());
+        }
+        env
+    }
+}
+
+/// Key used to store an environment variable in the map
+/// [`LlmClient::create_provider_from_map`] reads. On Windows, names are
+/// case-insensitive, matching [`std::env::var`].
+fn env_map_key(name: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        std::borrow::Cow::Owned(name.to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(name)
     }
 }
 
@@ -606,9 +729,23 @@ mod tests {
         assert!(pulled.resolve_role("planner").unwrap().is_none());
     }
 
+    // Serializes tests that read or write APPLIED_ENV_VARS / set_env_vars.
+    // Unique variable names are not enough: undo_set_env_vars drains the
+    // whole tracked list, which would drop another test's writes.
+    use crate::config::test_env::ENV_TEST_LOCK;
+
+    fn config_with_model(provider: &str, env: &[(&str, &str)], model: &str) -> ShaiConfig {
+        let mut config = config_with(provider, env);
+        if let Some(provider) = config.get_selected_provider_mut() {
+            provider.model = model.to_string();
+        }
+        config
+    }
+
     // One test owns these variable names so parallel tests cannot race on them.
     #[test]
     fn switching_provider_does_not_keep_previous_provider_vars() {
+        let _guard = ENV_TEST_LOCK.blocking_lock();
         const KEY: &str = "SHAI_TEST_STALE_PROVIDER_API_KEY";
         const URL: &str = "SHAI_TEST_STALE_PROVIDER_BASE_URL";
         std::env::remove_var(KEY);
@@ -644,5 +781,191 @@ mod tests {
             Ok("http://exported.example.com/v1")
         );
         std::env::remove_var(URL);
+    }
+
+    #[tokio::test]
+    async fn llm_from_config_does_not_export_provider_env() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        const KEY: &str = "SHAI_TEST_LLM_FROM_CONFIG_ENV";
+        std::env::remove_var(KEY);
+        let config = config_with("not-a-real-provider", &[(KEY, "must-not-be-exported")]);
+        let error = config
+            .llm_from_config()
+            .await
+            .expect_err("an unknown provider must fail to build");
+        assert!(error.to_string().contains("not-a-real-provider"), "{error}");
+        assert!(
+            std::env::var_os(KEY).is_none(),
+            "llm_from_config must not write provider variables"
+        );
+    }
+
+    #[test]
+    fn restore_applied_env_puts_back_a_snapshot() {
+        let _guard = ENV_TEST_LOCK.blocking_lock();
+        const KEY: &str = "SHAI_TEST_ENV_SNAPSHOT_KEY";
+        std::env::remove_var(KEY);
+
+        let first = config_with("openai", &[(KEY, "live-agent-value")]);
+        first.set_env_vars();
+        let snapshot = ShaiConfig::snapshot_applied_env();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-agent-value"));
+
+        let second = config_with("openai", &[(KEY, "replacement-value")]);
+        second.set_env_vars();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("replacement-value"));
+
+        ShaiConfig::restore_applied_env(&snapshot);
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-agent-value"));
+
+        undo_set_env_vars();
+        assert!(std::env::var_os(KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn llm_from_config_uses_the_configured_model_not_shai_model() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let previous_model = std::env::var("SHAI_MODEL").ok();
+        std::env::remove_var("SHAI_MODEL");
+
+        let first = config_with_model(
+            "openai",
+            &[("OPENAI_API_KEY", "first-key")],
+            "configured-model",
+        );
+        let (_, model) = first
+            .llm_from_config()
+            .await
+            .expect("openai client builds from the config key");
+        assert_eq!(model, "configured-model");
+        assert!(
+            std::env::var_os("SHAI_MODEL").is_none(),
+            "first start must not read or write SHAI_MODEL"
+        );
+
+        first.set_env_vars();
+        assert_eq!(
+            std::env::var("SHAI_MODEL").as_deref(),
+            Ok("configured-model")
+        );
+
+        let replacement = config_with_model(
+            "openai",
+            &[("OPENAI_API_KEY", "replacement-key")],
+            "replacement-model",
+        );
+        let (_, model) = replacement
+            .llm_from_config()
+            .await
+            .expect("replacement client builds from its own key");
+        assert_eq!(model, "replacement-model");
+        assert_eq!(
+            std::env::var("SHAI_MODEL").as_deref(),
+            Ok("configured-model"),
+            "llm_from_config must not export the replacement model"
+        );
+
+        undo_set_env_vars();
+        match previous_model {
+            Some(value) => std::env::set_var("SHAI_MODEL", value),
+            None => std::env::remove_var("SHAI_MODEL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_from_config_does_not_inherit_a_live_provider_key() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        const KEY: &str = "OLLAMA_API_KEY";
+        const URL: &str = "OLLAMA_BASE_URL";
+        let previous_key = std::env::var(KEY).ok();
+        let previous_url = std::env::var(URL).ok();
+        std::env::remove_var(KEY);
+        std::env::remove_var(URL);
+
+        let live = config_with(
+            "ollama",
+            &[(KEY, "live-key"), (URL, "http://live.example/v1")],
+        );
+        live.set_env_vars();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-key"));
+
+        let replacement = config_with("ollama", &[(URL, "http://replacement.example/v1")]);
+        let env =
+            ShaiConfig::env_vars_for_llm(&replacement.get_selected_provider().unwrap().env_vars);
+        assert_eq!(
+            env.get(KEY),
+            None,
+            "a live-provider key the user did not export must not be inherited"
+        );
+        assert_eq!(
+            env.get(URL).map(String::as_str),
+            Some("http://replacement.example/v1")
+        );
+        replacement
+            .llm_from_config()
+            .await
+            .expect("replacement ollama client builds from its own URL");
+
+        // A value the user exported themselves is still used when the
+        // replacement omits that setting.
+        undo_set_env_vars();
+        std::env::set_var(KEY, "user-key");
+        live.set_env_vars();
+        assert_eq!(std::env::var(KEY).as_deref(), Ok("live-key"));
+        let env =
+            ShaiConfig::env_vars_for_llm(&replacement.get_selected_provider().unwrap().env_vars);
+        assert_eq!(env.get(KEY).map(String::as_str), Some("user-key"));
+
+        undo_set_env_vars();
+        match previous_key {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+        match previous_url {
+            Some(value) => std::env::set_var(URL, value),
+            None => std::env::remove_var(URL),
+        }
+    }
+
+    // An unrelated non-Unicode variable must not panic provider construction.
+    // vars() would; vars_os() plus a UTF-8 filter does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn env_vars_for_llm_skips_a_non_utf8_process_variable() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        const JUNK: &str = "SHAI_TEST_NON_UTF8_ENV";
+        struct RestoreOsVar {
+            name: &'static str,
+            previous: Option<OsString>,
+        }
+        impl Drop for RestoreOsVar {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+
+        let _restore = RestoreOsVar {
+            name: JUNK,
+            previous: std::env::var_os(JUNK),
+        };
+        std::env::set_var(JUNK, OsStr::from_bytes(&[0xff]));
+
+        let config = config_with("openai", &[("OPENAI_API_KEY", "test-key")]);
+        let env = ShaiConfig::env_vars_for_llm(&config.get_selected_provider().unwrap().env_vars);
+        let built = config.llm_from_config().await;
+
+        assert!(
+            !env.contains_key(JUNK),
+            "a non-UTF-8 process variable must not be collected"
+        );
+        let (_, model) =
+            built.expect("llm_from_config must not panic on an unrelated non-UTF-8 variable");
+        assert_eq!(model, "test-model");
     }
 }

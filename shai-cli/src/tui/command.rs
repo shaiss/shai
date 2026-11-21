@@ -266,21 +266,21 @@ impl CommandRegistry {
 
                             if let Some(session) = selected {
                                 let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                                if !app.may_replace_agent(agent_name.as_deref()) {
+                                let Some(prepared) =
+                                    app.prepared_replacement(agent_name.as_deref())
+                                else {
                                     return Ok(());
-                                }
+                                };
                                 app.notify(
                                     &format!("Restoring session {}...", &session.session_id[..8]),
                                     Duration::from_secs(2),
                                 );
 
-                                if let Some(agent) = app.agent.take() {
-                                    let _ = agent.controller.terminate().await;
-                                }
-
-                                app.start_agent(agent_name.as_deref()).await.map_err(|e| {
+                                if !app.install_restored_agent(prepared).await.map_err(|e| {
                                     io::Error::other(format!("Failed to start agent: {}", e))
-                                })?;
+                                })? {
+                                    return Ok(());
+                                }
 
                                 if let Some(ref agent) = app.agent {
                                     let _ =
@@ -344,50 +344,50 @@ impl CommandRegistry {
                     app.notify("Failed to get current directory", Duration::from_secs(3));
                 }
             },
-            "/latest" => match shai_core::session::SessionPersist::list_sessions() {
-                Ok(sessions) if !sessions.is_empty() => {
-                    let session = &sessions[0];
-                    let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                    if !app.may_replace_agent(agent_name.as_deref()) {
-                        return Ok(());
+            "/latest" => {
+                match shai_core::session::SessionPersist::list_sessions() {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        let session = &sessions[0];
+                        let agent_name = app.agent_meta.name().map(|s| s.to_string());
+                        let Some(prepared) = app.prepared_replacement(agent_name.as_deref()) else {
+                            return Ok(());
+                        };
+                        app.notify(
+                            &format!("Restoring session {}...", &session.session_id[..8]),
+                            Duration::from_secs(2),
+                        );
+
+                        if !app.install_restored_agent(prepared).await.map_err(|e| {
+                            io::Error::other(format!("Failed to start agent: {}", e))
+                        })? {
+                            return Ok(());
+                        }
+
+                        if let Some(ref agent) = app.agent {
+                            let _ = agent.controller.load_trace(session.trace.clone()).await;
+                        }
+
+                        app.agent_state
+                            .session_manager_mut()
+                            .set_session_id(&session.session_id);
+                        app.render_restored_trace(&session.trace);
+
+                        app.notify(
+                            &format!("Session {} restored", &session.session_id[..8]),
+                            Duration::from_secs(2),
+                        );
                     }
-                    app.notify(
-                        &format!("Restoring session {}...", &session.session_id[..8]),
-                        Duration::from_secs(2),
-                    );
-
-                    if let Some(agent) = app.agent.take() {
-                        let _ = agent.controller.terminate().await;
+                    Ok(_) => {
+                        app.notify("No saved sessions found", Duration::from_secs(2));
                     }
-
-                    app.start_agent(agent_name.as_deref())
-                        .await
-                        .map_err(|e| io::Error::other(format!("Failed to start agent: {}", e)))?;
-
-                    if let Some(ref agent) = app.agent {
-                        let _ = agent.controller.load_trace(session.trace.clone()).await;
+                    Err(e) => {
+                        app.notify(
+                            &format!("Failed to list sessions: {}", e),
+                            Duration::from_secs(3),
+                        );
                     }
-
-                    app.agent_state
-                        .session_manager_mut()
-                        .set_session_id(&session.session_id);
-                    app.render_restored_trace(&session.trace);
-
-                    app.notify(
-                        &format!("Session {} restored", &session.session_id[..8]),
-                        Duration::from_secs(2),
-                    );
                 }
-                Ok(_) => {
-                    app.notify("No saved sessions found", Duration::from_secs(2));
-                }
-                Err(e) => {
-                    app.notify(
-                        &format!("Failed to list sessions: {}", e),
-                        Duration::from_secs(3),
-                    );
-                }
-            },
+            }
             "/skills" => {
                 let skills = shai_core::tools::skills::discovery::discover_skills();
                 if skills.is_empty() {
@@ -442,45 +442,48 @@ impl CommandRegistry {
                 }
             }
             "/auth" => {
-                // Save agent name and trace before reconfiguring
                 let agent_name = app.agent_meta.name().map(|s| s.to_string());
-                let trace = if let Some(ref agent) = app.agent {
-                    agent.controller.get_trace().await.ok()
-                } else {
-                    None
-                };
 
-                // Terminate current agent
-                if let Some(agent) = app.agent.take() {
-                    let _ = agent.controller.terminate().await;
-                    let _ = agent.handle.await;
-                }
-
-                // Run auth TUI. Suspend the main event reader first: crossterm
-                // only supports one event reader at a time, and the idle main
-                // reader would keep its lock held, deadlocking the auth view's
-                // own EventStream (black screen until a key press).
+                // Run auth TUI without tearing the agent down first. Suspend
+                // the main event reader: crossterm only supports one event
+                // reader at a time, and the idle main reader would keep its
+                // lock held, deadlocking the auth view's own EventStream
+                // (black screen until a key press). The live agent stays
+                // until the new config is known to be usable.
+                //
+                // Drain its events while the loop is blocked, and remember
+                // the process env the live agent was using. The auth view
+                // may export a newly saved provider; if the replacement
+                // then cannot start, put the previous env back and replay
+                // any prompts that arrived in the meantime.
+                let env_snapshot = shai_core::config::config::ShaiConfig::snapshot_applied_env();
+                let hold = app.start_holding_events().await;
                 app.suspend_event_reader();
                 let mut auth = crate::tui::auth::auth::AppAuth::new();
                 auth.run().await;
                 app.resume_event_reader();
 
-                // Recreate agent. `start_agent` resolves what the session was
-                // asked for against the config as it is now.
-                match app.start_agent(agent_name.as_deref()).await {
-                    Ok(_) => {
-                        if let Some(trace) = trace {
-                            if let Some(ref agent) = app.agent {
-                                let _ = agent.controller.load_trace(trace).await;
-                            }
-                        }
+                // Recreate the agent from a snapshot taken after the auth
+                // TUI, built before the live agent is torn down, so a later
+                // change on disk cannot leave the session without one.
+                let replaced = match app.swap_agent(agent_name.as_deref()).await {
+                    Ok(true) => {
                         app.notify("Provider configuration updated", Duration::from_secs(2));
+                        true
                     }
+                    Ok(false) => false,
                     // Say why there is no agent, instead of reporting an
                     // update that started nothing.
-                    Err(error) => app
-                        .session_notices
-                        .push(format!("no agent was started: {error}")),
+                    Err(error) => {
+                        app.session_notices
+                            .push(format!("no agent was started: {error}"));
+                        false
+                    }
+                };
+                let held = app.stop_holding_events(hold).await;
+                if !replaced {
+                    shai_core::config::config::ShaiConfig::restore_applied_env(&env_snapshot);
+                    app.replay_held_events(held).await?;
                 }
             }
             "/agent" => {

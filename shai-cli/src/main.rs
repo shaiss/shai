@@ -646,6 +646,22 @@ pub async fn handle_postcmd(
             return Ok(());
         }
         _ => {
+            // A failed command must not start a fix on the built-in default
+            // model when the auth config is there and cannot be read. Load
+            // once as soon as this hook might suggest a fix, so the user is
+            // told even if the session history is empty.
+            let primary = if env::var("SHAI_SESSION_ID").is_ok() {
+                match SessionOptions::primary_config() {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        eprintln!("error: {}", error);
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
+            };
+
             let last_terminal_output = env::var("SHAI_SESSION_ID").ok().and_then(|session_id| {
                 let client = ShaiSessionClient::new(&session_id);
                 client.session_exists().then(|| {
@@ -661,7 +677,8 @@ pub async fn handle_postcmd(
                     name: None,
                 }];
 
-                let (llm, model) = ShaiConfig::get_llm().await?;
+                let config = primary.expect("SHAI_SESSION_ID was set above");
+                let (llm, model) = config.get_llm_from_config().await?;
 
                 enable_raw_mode().unwrap();
                 let mut events = EventStream::new();
@@ -788,6 +805,17 @@ async fn handle_serve(
     max_sessions: Option<usize>,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Load the auth config once: refuse to start if the file is there and
+    // cannot be read, and pass the same snapshot to every HTTP session so
+    // a later edit cannot change credentials or silently fall back.
+    let primary = match SessionOptions::primary_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {}", error);
+            std::process::exit(2);
+        }
+    };
+
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
         .with_target(false)
@@ -801,7 +829,8 @@ async fn handle_serve(
     let config = shai_http::ServerConfig::new(addr)
         .with_ephemeral(ephemeral)
         .with_max_sessions(max_sessions)
-        .with_allow_all_tools(yes);
+        .with_allow_all_tools(yes)
+        .with_primary_config(primary);
 
     shai_http::start_server(config).await?;
 

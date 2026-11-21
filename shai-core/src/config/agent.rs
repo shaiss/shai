@@ -5,7 +5,7 @@ use json_comments::StripComments;
 use serde::{Deserialize, Serialize};
 use shai_llm::ToolCallMethod;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentProviderConfig {
@@ -211,12 +211,7 @@ fn default_max_trace_chars() -> usize {
     85000
 }
 
-fn default_llm_provider() -> AgentProviderConfig {
-    let shai_config = ShaiConfig::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config, using default: {}", e);
-        ShaiConfig::default()
-    });
-
+fn llm_provider_from_config(shai_config: &ShaiConfig) -> AgentProviderConfig {
     let provider_config = shai_config
         .get_selected_provider()
         .expect("No provider configured in default config");
@@ -226,6 +221,63 @@ fn default_llm_provider() -> AgentProviderConfig {
         env_vars: provider_config.env_vars.clone(),
         model: provider_config.model.clone(),
         tool_method: provider_config.tool_method,
+    }
+}
+
+fn default_llm_provider() -> AgentProviderConfig {
+    // Used when an agent file omits `llm_provider` and is deserialized
+    // without going through [`AgentConfig::load`]. `load` refuses a broken
+    // auth config before this is called.
+    match ShaiConfig::primary() {
+        Ok(config) => llm_provider_from_config(&config),
+        Err(error) => {
+            tracing::error!(
+                "broken auth config while defaulting an agent's provider: {}",
+                error
+            );
+            llm_provider_from_config(&ShaiConfig::default())
+        }
+    }
+}
+
+/// Fill in `llm_provider` from the auth config when the agent file omits it.
+/// A broken auth config is an error; the built-in default is used only when
+/// there is no config file. If the agent file names its own provider, a
+/// broken auth config is ignored.
+pub(crate) fn agent_config_from_value(
+    mut value: serde_json::Value,
+    primary: Result<ShaiConfig, String>,
+    path: Option<&Path>,
+) -> Result<AgentConfig, Box<dyn std::error::Error>> {
+    if !value.is_object() {
+        return Err(unreadable_agent_config(path, json_kind(&value)).into());
+    }
+    if value.get("llm_provider").is_none() {
+        let config = primary?;
+        value["llm_provider"] = serde_json::to_value(llm_provider_from_config(&config))?;
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn unreadable_agent_config(path: Option<&Path>, kind: &str) -> String {
+    let reason = format!("expected an object, found {kind}");
+    match path {
+        Some(path) => format!(
+            "the config file {} could not be loaded ({reason})",
+            path.display()
+        ),
+        None => format!("the agent config could not be loaded ({reason})"),
     }
 }
 
@@ -286,24 +338,43 @@ impl AgentConfig {
 
     /// Load an agent config from file
     pub fn load(agent_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_primary(agent_name, None)
+    }
+
+    /// [`AgentConfig::load`], filling an omitted provider from `primary`
+    /// instead of reading the auth config again.
+    pub fn load_with_primary(
+        agent_name: &str,
+        primary: Option<&ShaiConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = Self::agent_config_path(agent_name)?;
 
         if config_path.exists() {
-            let content_bytes = std::fs::read(config_path)?;
-            let content_stripped = StripComments::new(&content_bytes[..]);
-            let config: AgentConfig = serde_json::from_reader(content_stripped)?;
-            return Ok(config);
+            let content_bytes = std::fs::read(&config_path)?;
+            return Self::from_bytes(&content_bytes, &config_path, primary);
         }
 
         let legacy_path = Self::legacy_agent_config_path(agent_name)?;
         if legacy_path.exists() {
-            let content_bytes = std::fs::read(legacy_path)?;
-            let content_stripped = StripComments::new(&content_bytes[..]);
-            let config: AgentConfig = serde_json::from_reader(content_stripped)?;
-            return Ok(config);
+            let content_bytes = std::fs::read(&legacy_path)?;
+            return Self::from_bytes(&content_bytes, &legacy_path, primary);
         }
 
         Err(format!("Agent config '{}' does not exist", agent_name).into())
+    }
+
+    fn from_bytes(
+        content_bytes: &[u8],
+        path: &Path,
+        primary: Option<&ShaiConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let content_stripped = StripComments::new(content_bytes);
+        let value: serde_json::Value = serde_json::from_reader(content_stripped)?;
+        let primary = match primary {
+            Some(config) => Ok(config.clone()),
+            None => ShaiConfig::primary(),
+        };
+        agent_config_from_value(value, primary, Some(path))
     }
 
     /// Save the agent config to file
@@ -426,5 +497,139 @@ mod verification_default_tests {
         assert_eq!(ts.first().map(|s| s.as_str()), Some("tsc"));
         assert!(ts.iter().any(|a| a == "--noEmit"));
         assert!(ts.iter().any(|a| a == "{files}"));
+    }
+}
+
+#[cfg(test)]
+mod broken_config_fallback_tests {
+    use super::{agent_config_from_value, AgentConfig};
+    use crate::config::config::ShaiConfig;
+    use crate::config::roles::RoleError;
+    use std::path::Path;
+
+    fn agent_json(with_provider: bool) -> serde_json::Value {
+        let provider = if with_provider {
+            r#",
+            "llm_provider": {
+                "provider": "openai",
+                "env_vars": {"OPENAI_API_KEY": "k"},
+                "model": "gpt-4o",
+                "tool_method": "FunctionCall"
+            }"#
+        } else {
+            ""
+        };
+        serde_json::from_str(&format!(
+            r#"{{
+                "name": "reviewer",
+                "description": "a named agent"
+                {provider}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn broken() -> Result<ShaiConfig, String> {
+        ShaiConfig::primary_from(Err(RoleError::ConfigInvalid {
+            path: "/home/me/.config/shai/auth.config.json".to_string(),
+            reason: "JSON syntax error at line 3 column 7".to_string(),
+        }))
+    }
+
+    #[test]
+    fn a_named_agent_without_its_own_provider_does_not_use_the_default_when_the_auth_config_is_broken(
+    ) {
+        let error = agent_config_from_value(agent_json(false), broken(), None)
+            .map(|_| ())
+            .expect_err("a broken auth config must not be replaced by the default");
+        let message = error.to_string();
+        assert!(message.contains("auth.config.json"), "{message}");
+        assert!(message.contains("line 3 column 7"), "{message}");
+    }
+
+    #[test]
+    fn a_named_agent_without_its_own_provider_uses_the_auth_config_or_the_default_if_it_is_missing()
+    {
+        let cfg: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let loaded = agent_config_from_value(agent_json(false), Ok(cfg), None).unwrap();
+        assert_eq!(loaded.llm_provider.provider, "openai");
+        assert_eq!(loaded.llm_provider.model, "gpt-4o");
+
+        let loaded = agent_config_from_value(
+            agent_json(false),
+            ShaiConfig::primary_from(Err(RoleError::ConfigMissing)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.llm_provider.provider,
+            ShaiConfig::default().providers[0].provider
+        );
+    }
+
+    #[test]
+    fn a_named_agent_that_names_its_own_provider_loads_even_if_the_auth_config_is_broken() {
+        let loaded = agent_config_from_value(agent_json(true), broken(), None).unwrap();
+        assert_eq!(loaded.llm_provider.provider, "openai");
+        assert_eq!(loaded.llm_provider.model, "gpt-4o");
+    }
+
+    #[test]
+    fn a_non_object_agent_config_is_an_error_not_a_panic() {
+        let path = Path::new("/home/me/.config/shai/agents/reviewer.config.json");
+        for (json, kind) in [
+            ("[]", "array"),
+            ("\"str\"", "string"),
+            ("123", "number"),
+            ("null", "null"),
+            ("true", "boolean"),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let error = agent_config_from_value(value, Ok(ShaiConfig::default()), Some(path))
+                .map(|_| ())
+                .expect_err("non-object agent JSON must not panic or load");
+            let message = error.to_string();
+            assert!(
+                message.contains("reviewer.config.json"),
+                "{json}: {message}"
+            );
+            assert!(message.contains("could not be loaded"), "{json}: {message}");
+            assert!(message.contains(kind), "{json}: {message}");
+            assert!(message.contains("expected an object"), "{json}: {message}");
+        }
+    }
+
+    #[test]
+    fn load_with_primary_uses_the_startup_snapshot_when_auth_is_broken() {
+        let _guard = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai = dir.path().join("shai");
+        std::fs::create_dir_all(shai.join("agents")).unwrap();
+        std::fs::write(shai.join("auth.config.json"), "{ this is not json").unwrap();
+        std::fs::write(
+            shai.join("agents").join("reviewer.config.json"),
+            r#"{"name": "reviewer", "description": "needs the auth config"}"#,
+        )
+        .unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        let load_error = AgentConfig::load("reviewer")
+            .map(|_| ())
+            .expect_err("a broken auth config must not load this agent");
+        let message = load_error.to_string();
+        assert!(message.contains("auth.config.json"), "{message}");
+
+        let snapshot: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"snapshot-model","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let loaded = AgentConfig::load_with_primary("reviewer", Some(&snapshot)).unwrap();
+        assert_eq!(loaded.llm_provider.provider, "openai");
+        assert_eq!(loaded.llm_provider.model, "snapshot-model");
     }
 }
