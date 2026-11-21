@@ -9,7 +9,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use headless::app::AppHeadless;
-use session_options::SessionOptions;
+use session_options::{SessionOptions, SessionStartError};
 
 use console::strip_ansi_codes;
 use futures::StreamExt;
@@ -18,11 +18,17 @@ use ringbuffer::RingBuffer;
 use shai_core::agent::builder::AgentBuilder;
 use shai_core::agent::LoggingConfig;
 use shai_core::config::agent::AgentConfig;
+use shai_core::config::anonymous_fallback::{
+    confirm_anonymous_fallback, env_anonymous_fallback, evaluate_anonymous_fallback_gate,
+    resolve_anonymous_fallback, AnonymousFallbackMode, FallbackGate, FallbackInteraction,
+    FallbackSituation, CANCEL_MESSAGE,
+};
 use shai_core::config::config::ShaiConfig;
+use shai_core::config::roles::{PrimaryConfigError, RoleError};
 use shai_core::runners::clifixer::fix::clifix;
 use shai_llm::LlmClient;
 use std::env;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -214,8 +220,14 @@ fn starts_session(cli: &Cli) -> bool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if !matches!(cli.command, Some(Commands::Serve { .. }))
+        && (env::var_os("SHAI_LOG_LEVEL").is_some() || env::var_os("SHAI_LOG_FILE").is_some())
+    {
+        let _ = LoggingConfig::from_env().init();
+    }
+
     let session_starts = starts_session(&cli);
-    default_config(cli.default_shai_config_url).await;
+    let default_url = cli.default_shai_config_url.clone();
 
     // Session options are resolved only for the commands that start a
     // session, so that the others (auth, list, ...) keep working when an
@@ -235,27 +247,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         #[cfg(unix)]
         Some(Commands::On { shell, quiet }) => {
+            default_config(default_url).await;
             run_pty(shell, quiet)?;
         }
         #[cfg(unix)]
         Some(Commands::Off) => {
+            default_config(default_url).await;
             kill_pty()?;
         }
         #[cfg(unix)]
         Some(Commands::Status) => {
+            default_config(default_url).await;
             pty_status()?;
         }
         Some(Commands::Auth) => {
+            default_config(default_url).await;
             handle_config().await?;
         }
         Some(Commands::Agent { name }) => match name.as_deref() {
             Some("list") => {
+                default_config(default_url).await;
                 list_agents();
             }
             Some(name) => {
+                prepare_session_or_exit(interactive_session_interaction(), Some(name), default_url)
+                    .await;
                 handle_main(Some(name.to_string()), None, None, session_options.clone()).await?;
             }
             None => {
+                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
                 handle_main(
                     None,
                     None,
@@ -274,12 +294,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                 };
+                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
                 handle_main(None, restore_id, None, session_options.clone()).await?;
             }
             Some(id) => {
+                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
                 handle_main(None, Some(id.to_string()), None, session_options.clone()).await?;
             }
             None => {
+                prepare_session_or_exit(interactive_session_interaction(), None, default_url).await;
                 handle_main(
                     None,
                     None,
@@ -289,27 +312,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
         },
-        Some(Commands::List { what }) => match what {
-            Some(ListTarget::Agent) => list_agents(),
-            Some(ListTarget::Session) => list_sessions(),
-            Some(ListTarget::Skills) => list_skills(),
-            None => {
-                list_agents();
-                println!();
-                list_sessions();
-                println!();
-                list_skills();
+        Some(Commands::List { what }) => {
+            default_config(default_url).await;
+            match what {
+                Some(ListTarget::Agent) => list_agents(),
+                Some(ListTarget::Session) => list_sessions(),
+                Some(ListTarget::Skills) => list_skills(),
+                None => {
+                    list_agents();
+                    println!();
+                    list_sessions();
+                    println!();
+                    list_skills();
+                }
             }
-        },
+        }
         #[cfg(unix)]
         Some(Commands::Precmd { command }) => {
+            default_config(default_url).await;
             let command_str = command.join(" ");
             handle_precmd(command_str)?;
         }
         #[cfg(unix)]
         Some(Commands::Postcmd { exit_code, command }) => {
             let command_str = command.join(" ");
-            handle_postcmd(exit_code, command_str).await?;
+            handle_postcmd(exit_code, command_str, default_url).await?;
         }
         Some(Commands::Serve {
             host,
@@ -319,9 +346,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_sessions,
             yes,
         }) => {
+            prepare_session_or_exit(
+                FallbackInteraction::NonInteractive,
+                agent.as_deref(),
+                default_url,
+            )
+            .await;
             handle_serve(host, port, agent, ephemeral, max_sessions, yes).await?;
         }
         Some(Commands::Import { overwrite }) => {
+            default_config(default_url).await;
             handle_import(overwrite)?;
         }
         None => {
@@ -336,12 +370,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Handle --list-tools flag
             if cli.list_tools {
+                default_config(default_url).await;
                 list_all_tools();
                 return Ok(());
             }
 
             // Handle --version flag
             if cli.version {
+                default_config(default_url).await;
                 show_version()?;
                 return Ok(());
             }
@@ -359,7 +395,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref stdin_content) = stdin_input {
                     messages.push(stdin_content.clone());
                 }
-                let _ = handle_fix(HeadlessRun {
+                prepare_session_or_exit(
+                    FallbackInteraction::NonInteractive,
+                    cli.agent.as_deref(),
+                    default_url,
+                )
+                .await;
+                if let Err(err) = handle_fix(HeadlessRun {
                     prompt: messages,
                     tools: cli.tools,
                     remove: cli.remove,
@@ -369,7 +411,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     yes: cli.yes,
                     session_options: session_options.clone(),
                 })
-                .await;
+                .await
+                {
+                    exit_session_error(err);
+                }
                 return Ok(());
             }
 
@@ -383,7 +428,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 if cli.interactive {
-                    // Interactive mode: show TUI with piped content as initial prompt
+                    // Interactive mode: show TUI with piped content as initial prompt.
+                    // Stdin is not a TTY here, so the gate warns instead of prompting.
+                    prepare_session_or_exit(
+                        FallbackInteraction::NonInteractive,
+                        cli.agent.as_deref(),
+                        default_url,
+                    )
+                    .await;
                     handle_main_with_prompt(
                         cli.agent.clone(),
                         stdin_content,
@@ -393,7 +445,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 } else {
                     // Headless mode from pipe
-                    let _ = handle_fix(HeadlessRun {
+                    prepare_session_or_exit(
+                        FallbackInteraction::NonInteractive,
+                        cli.agent.as_deref(),
+                        default_url,
+                    )
+                    .await;
+                    if let Err(err) = handle_fix(HeadlessRun {
                         prompt: vec![stdin_content],
                         tools: cli.tools,
                         remove: cli.remove,
@@ -403,7 +461,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         yes: cli.yes,
                         session_options: session_options.clone(),
                     })
-                    .await;
+                    .await
+                    {
+                        exit_session_error(err);
+                    }
                     return Ok(());
                 }
             }
@@ -411,6 +472,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // No input, show TUI
             if cli.restore.as_deref() == Some(RESTORE_PICKER_SENTINEL) {
                 // Bare `--restore`: open the session picker
+                prepare_session_or_exit(
+                    interactive_session_interaction(),
+                    cli.agent.as_deref(),
+                    default_url,
+                )
+                .await;
                 handle_main(
                     cli.agent.clone(),
                     None,
@@ -431,6 +498,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 cli.restore.clone()
             };
+            prepare_session_or_exit(
+                interactive_session_interaction(),
+                cli.agent.as_deref(),
+                default_url,
+            )
+            .await;
             handle_main(cli.agent.clone(), restore_id, None, session_options.clone()).await?;
         }
     }
@@ -439,6 +512,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn default_config(default_config_url: Option<String>) {
+    if let Some(env_setting) = env_anonymous_fallback() {
+        if resolve_anonymous_fallback(None, Some(&env_setting)).mode == AnonymousFallbackMode::Deny
+        {
+            return;
+        }
+    }
+
     // One look at the config decides. Looking twice could see it broken and
     // then fine, while another process writes it, and fetch a starter config
     // over it.
@@ -474,6 +554,95 @@ async fn default_config(default_config_url: Option<String>) {
     let _ = config.save();
 }
 
+fn interactive_session_interaction() -> FallbackInteraction {
+    if io::stdin().is_terminal() {
+        FallbackInteraction::InteractiveTty
+    } else {
+        FallbackInteraction::NonInteractive
+    }
+}
+
+fn fallback_situation(loaded: Option<&ShaiConfig>, agent_name: Option<&str>) -> FallbackSituation {
+    if let Some(name) = agent_name {
+        if AgentConfig::has_explicit_llm_provider(name) {
+            return FallbackSituation::Configured;
+        }
+    }
+    match loaded {
+        Some(config) if config.selected_is_anonymous_ovh() => FallbackSituation::AnonymousOvh,
+        Some(_) => FallbackSituation::Configured,
+        None => FallbackSituation::MissingConfig,
+    }
+}
+
+fn exit_session_error(err: SessionStartError) -> ! {
+    eprintln!("error: {err}");
+    std::process::exit(err.exit_code());
+}
+
+/// Apply the anonymous-fallback setting before a session starts. On deny, an
+/// unreadable config, or an invalid value this returns a typed error with exit
+/// code 2 and does not provision a default config or start a network request.
+async fn prepare_session(
+    interaction: FallbackInteraction,
+    agent_name: Option<&str>,
+    default_config_url: Option<String>,
+) -> Result<(), SessionStartError> {
+    let loaded = match ShaiConfig::load_for_roles() {
+        Ok(config) => Some(config),
+        Err(RoleError::ConfigMissing) => None,
+        Err(RoleError::ConfigInvalid { path, reason }) => {
+            return Err(PrimaryConfigError::Invalid { path, reason }.into());
+        }
+        Err(other) => {
+            return Err(PrimaryConfigError::Other(other.to_string()).into());
+        }
+    };
+    let config_setting = loaded
+        .as_ref()
+        .and_then(|config| config.anonymous_fallback.as_deref());
+    let env_setting = env_anonymous_fallback();
+    let resolution = resolve_anonymous_fallback(config_setting, env_setting.as_deref());
+    resolution.log();
+
+    let situation = fallback_situation(loaded.as_ref(), agent_name);
+
+    match evaluate_anonymous_fallback_gate(resolution, situation, interaction) {
+        FallbackGate::Proceed {
+            first_run_warning, ..
+        } => {
+            if let Some(warning) = first_run_warning {
+                eprintln!("{warning}");
+            }
+            default_config(default_config_url).await;
+            Ok(())
+        }
+        FallbackGate::NeedConfirm { prompt, .. } => {
+            let mut stdin = io::stdin().lock();
+            let mut stderr = io::stderr();
+            let accepted = confirm_anonymous_fallback(&mut stdin, &mut stderr, prompt)
+                .map_err(|e| SessionStartError::other(e.to_string()))?;
+            if accepted {
+                default_config(default_config_url).await;
+                Ok(())
+            } else {
+                Err(SessionStartError::other(CANCEL_MESSAGE))
+            }
+        }
+        FallbackGate::Refuse { message, .. } => Err(SessionStartError::refused(message)),
+    }
+}
+
+async fn prepare_session_or_exit(
+    interaction: FallbackInteraction,
+    agent_name: Option<&str>,
+    default_config_url: Option<String>,
+) {
+    if let Err(error) = prepare_session(interaction, agent_name, default_config_url).await {
+        exit_session_error(error);
+    }
+}
+
 async fn handle_main(
     agent_name: Option<String>,
     restore_session_id: Option<String>,
@@ -486,7 +655,7 @@ async fn handle_main(
         app.initial_modal = modal;
     }
     if let Err(e) = app.run(agent_name, restore_session_id).await {
-        eprintln!("error: {}", e)
+        exit_session_error(e);
     }
     Ok(())
 }
@@ -500,7 +669,7 @@ async fn handle_main_with_prompt(
     app.session_options = session_options;
     app.initial_prompt = Some(prompt);
     if let Err(e) = app.run(agent_name, None).await {
-        eprintln!("error: {}", e)
+        exit_session_error(e);
     }
     Ok(())
 }
@@ -530,7 +699,7 @@ struct HeadlessRun {
     session_options: SessionOptions,
 }
 
-async fn handle_fix(run: HeadlessRun) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_fix(run: HeadlessRun) -> Result<(), SessionStartError> {
     let HeadlessRun {
         prompt,
         tools,
@@ -619,6 +788,7 @@ pub fn handle_precmd(command: String) -> Result<(), Box<dyn std::error::Error>> 
 pub async fn handle_postcmd(
     exit_code: i32,
     command: String,
+    default_config_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     env::var("SHAI_SESSION_ID").ok().and_then(|session_id| {
         let client = ShaiSessionClient::new(&session_id);
@@ -640,11 +810,16 @@ pub async fn handle_postcmd(
             // once as soon as this hook might suggest a fix, so the user is
             // told even if the session history is empty.
             let primary = if env::var("SHAI_SESSION_ID").is_ok() {
+                prepare_session_or_exit(
+                    FallbackInteraction::NonInteractive,
+                    None,
+                    default_config_url,
+                )
+                .await;
                 match SessionOptions::primary_config() {
                     Ok(config) => Some(config),
                     Err(error) => {
-                        eprintln!("error: {}", error);
-                        std::process::exit(2);
+                        exit_session_error(error.into());
                     }
                 }
             } else {

@@ -38,6 +38,7 @@ env:
   SHAI_PROVIDER: openrouter
   SHAI_MODEL: openai/gpt-oss-120b   # pinned default; matrix entries below are shadow comparisons
   SHAI_LLM_MAX_RETRIES: "1"
+  SHAI_ANONYMOUS_FALLBACK: deny
 
 jobs:
   shadow:
@@ -82,7 +83,7 @@ jobs:
           mkdir -p "$XDG_CONFIG_HOME/shai"
           umask 077
           jq -n --arg m "$SHAI_MODEL" \
-            '{providers:[{provider:"openrouter",env_vars:{},model:$m,tool_method:"FunctionCall"}],selected_provider:0,mcp_configs:{}}' \
+            '{providers:[{provider:"openrouter",env_vars:{},model:$m,tool_method:"FunctionCall"}],selected_provider:0,mcp_configs:{},anonymous_fallback:"deny"}' \
             > "$XDG_CONFIG_HOME/shai/auth.config.json"
           chmod 600 "$XDG_CONFIG_HOME/shai/auth.config.json"
           echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >> "$GITHUB_ENV"
