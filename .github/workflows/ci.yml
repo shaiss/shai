@@ -27,6 +27,60 @@ jobs:
       - name: All-empty alarm self-test
         run: ./wave0/run-shadow.sh --test-all-empty-alarm
 
+  # Matches AGENTS.md / CONTRIBUTING expectations: fmt, clippy, and tests.
+  # Kept separate from the multi-target release build matrix so a lint failure
+  # is cheap and does not wait on musl/macOS cross builds.
+  lint-and-test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # rust-toolchain.toml pins the channel; request the components we need.
+          components: rustfmt, clippy
+
+      - name: Install pinned toolchain components
+        run: |
+          rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-lint-test-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-lint-test-target-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
   build:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
