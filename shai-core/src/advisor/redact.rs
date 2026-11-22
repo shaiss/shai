@@ -3869,33 +3869,67 @@ mod tests {
 
     #[test]
     fn mixed_short_and_unicode_json_escapes_are_redacted_together() {
-        let secret = "top\nmid\r\t\"\\/\u{0008}\u{000c}&end-0123456789";
-        let redactor = Redactor::new(
-            [("MIXED_SECRET", secret)],
+        let full_secret = "top\nmid\r\t\"\\/\u{0008}\u{000c}&end-0123456789";
+        let nl_quote_backslash = "a\nb\"c\\d-0123456789";
+        let quote_nl = "q\"r\ns-0123456789";
+        let tab_slash = "t\tu/v-0123456789";
+
+        let cases = [
+            (
+                full_secret,
+                r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-0123456789"}"#,
+                r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-01\u00"#,
+            ),
+            (
+                full_secret,
+                r#"{"msg":"top\u000amid\r\t\"\\\/\b\f\u0026end-0123456789"}"#,
+                r#"{"msg":"top\u000amid\r\t\"\\\/\b\f\u0026end-01\u00"#,
+            ),
+            (
+                nl_quote_backslash,
+                r#"{"msg":"a\u000ab\"c\\d-0123456789"}"#,
+                r#"{"msg":"a\u000ab\"c\\d-01\u00"#,
+            ),
+            (
+                quote_nl,
+                r#"{"msg":"q\u0022r\ns-0123456789"}"#,
+                r#"{"msg":"q\u0022r\ns-01\u00"#,
+            ),
+            (
+                tab_slash,
+                r#"{"msg":"t\u0009u\/v-0123456789"}"#,
+                r#"{"msg":"t\u0009u\/v-01\u00"#,
+            ),
+        ];
+
+        let via_new = Redactor::new(
+            [
+                ("FULL_SECRET", full_secret),
+                ("NL_QB", nl_quote_backslash),
+                ("Q_NL", quote_nl),
+                ("TAB_SLASH", tab_slash),
+            ],
             Vec::<(String, String)>::new(),
             &[],
         );
-        // A serializer that keeps JSON short escapes alongside \uXXXX for `&`
-        // (Go/Java) or escaped slash (`\/`): neither raw serde JSON nor
-        // decoding only \uXXXX and \/ matches alone.
-        // Mix short escapes (\n, \r, \t, \\, \b, \f) with \u0022 for `"`
-        // and \u0026 for `&` (e.g. an HTML-safe JSON encoder): neither
-        // encoded_forms nor decoding only \uXXXX and \/ matches alone.
-        let payload = r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-0123456789"}"#;
-        let out = redactor.redact(payload);
-        assert!(!out.contains("0123456789"), "{out}");
-        assert!(out.contains(REDACTED), "{out}");
+        let mut via_extend = Redactor::default();
+        via_extend.extend_settings([
+            ("FULL_SECRET", full_secret),
+            ("NL_QB", nl_quote_backslash),
+            ("Q_NL", quote_nl),
+            ("TAB_SLASH", tab_slash),
+        ]);
 
-        // Also with `\"` kept as a short escape while `\n` uses `\u000a`.
-        let payload2 = r#"{"msg":"top\u000amid\r\t\"\\\/\b\f\u0026end-0123456789"}"#;
-        let out2 = redactor.redact(payload2);
-        assert!(!out2.contains("0123456789"), "{out2}");
-        assert!(out2.contains(REDACTED), "{out2}");
+        for redactor in [&via_new, &via_extend] {
+            for (secret, payload, cut) in cases {
+                let out = redactor.redact(payload);
+                assert!(!out.contains("0123456789"), "{secret:?} -> {out}");
+                assert!(out.contains(REDACTED), "{secret:?} -> {out}");
 
-        // Also when truncated mid-escape or right after the mixed prefix.
-        let cut = r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-01\u00"#;
-        let out_cut = redactor.redact_truncated(cut);
-        assert!(!out_cut.contains(r"top\nmid"), "{out_cut}");
-        assert!(out_cut.contains(REDACTED), "{out_cut}");
+                let out_cut = redactor.redact_truncated(cut);
+                assert!(!out_cut.contains("-01"), "{secret:?} -> {out_cut}");
+                assert!(out_cut.contains(REDACTED), "{secret:?} -> {out_cut}");
+            }
+        }
     }
 }

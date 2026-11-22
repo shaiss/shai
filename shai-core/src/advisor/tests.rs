@@ -287,7 +287,8 @@ async fn a_note_reaches_the_agent_at_its_next_step_and_nowhere_else() {
     let main = outcome.main.served();
     assert_eq!(main.len(), 3);
     // Before the review there is nothing to show.
-    assert!(!all_payloads(&main[0]).contains("advisor note"));
+    assert!(!all_payloads(&main[0]).contains("[advisor note"));
+    assert!(!all_text(&main[0]).contains("advisor note"));
 
     // The next request carries the note, at the end of the tool result of
     // the step that was reviewed, inside its fixed frame.
@@ -304,7 +305,8 @@ async fn a_note_reaches_the_agent_at_its_next_step_and_nowhere_else() {
     assert_eq!(main[1].messages.len(), main[0].messages.len() + 2);
 
     // It is shown once: the request after that does not have it...
-    assert!(!all_payloads(&main[2]).contains("advisor note"));
+    assert!(!all_payloads(&main[2]).contains("[advisor note"));
+    assert!(!all_text(&main[2]).contains("advisor note"));
     // ...and it never enters the stored conversation.
     let stored = serde_json::to_string(&outcome.result.trace).unwrap();
     assert!(!stored.contains("advisor note"), "{stored}");
