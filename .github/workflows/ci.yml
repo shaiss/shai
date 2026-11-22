@@ -41,10 +41,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             binary_name: shai
             asset_name: shai-linux-aarch64
-#          - os: windows-latest
-#            target: x86_64-pc-windows-msvc
-#            binary_name: shai.exe
-#            asset_name: shai-windows-x86_64.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: shai.exe
+            asset_name: shai-windows-x86_64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
             binary_name: shai

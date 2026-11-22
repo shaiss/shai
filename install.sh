@@ -210,8 +210,13 @@ main() {
     if [ -z "$download_url" ]; then
         log_error "Could not find download URL for platform: $platform"
         log_error "Available assets:"
-        echo "$release_json" | grep -o "\"name\":[[:space:]]*\"[^\"]*\"" | cut -d'"' -f4
-        log_error "No prebuilt binary for $platform in this release. To build from source, see https://github.com/$REPO#development"
+        echo "$release_json" | grep -o "\"name\":[[:space:]]*\"[^\"]*\"" | cut -d'"' -f4 || true
+        log_error "No prebuilt binary for $platform in this release."
+        log_info "Fallback — build from source (requires a Rust toolchain):"
+        echo "  git clone https://github.com/${REPO}.git"
+        echo "  cd shai && cargo install --path shai-cli --locked"
+        log_warn "Do not run 'cargo install shai' from crates.io — that installs an unrelated project (https://crates.io/crates/shai)."
+        log_info "Docs: https://github.com/${REPO}#installation"
         exit 1
     fi
     

@@ -31,6 +31,22 @@ curl -fsSL https://raw.githubusercontent.com/ovh/shai/main/install.sh | SHAI_REL
 
 The `shai` binary will be installed in `$HOME/.local/bin`
 
+### Homebrew
+
+```bash
+brew tap ovh/shai https://github.com/ovh/shai
+brew install shai
+```
+
+See [`Formula/README.md`](Formula/README.md). Do not use `cargo install shai` from crates.io — that name belongs to an unrelated project.
+
+### Build from source
+
+```bash
+git clone https://github.com/ovh/shai.git
+cd shai && cargo install --path shai-cli --locked
+```
+
 ## Quick Start
 
 By default `shai` uses OVHcloud as an anonymous user meaning you will be rate limited! If you want to sign in with your account or select another provider, run:
