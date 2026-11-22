@@ -985,7 +985,7 @@ mod tests {
         let text = (0..area.height)
             .map(|y| {
                 (0..area.width)
-                    .map(|x| buffer.get(x, y).symbol())
+                    .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
