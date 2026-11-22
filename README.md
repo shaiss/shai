@@ -33,12 +33,14 @@ The `shai` binary will be installed in `$HOME/.local/bin`
 
 ### Homebrew
 
+`Formula/shai.rb` lives in this repository. Tap the clone that contains it:
+
 ```bash
-brew tap ovh/shai https://github.com/ovh/shai
+brew tap shaiss/shai https://github.com/shaiss/shai
 brew install shai
 ```
 
-See [`Formula/README.md`](Formula/README.md). Do not use `cargo install shai` from crates.io — that name belongs to an unrelated project.
+Once the formula is merged upstream, the same commands work with `ovh/shai` instead of `shaiss/shai`. See [`Formula/README.md`](Formula/README.md). Do not use `cargo install shai` from crates.io — that name belongs to an unrelated project.
 
 ### Build from source
 

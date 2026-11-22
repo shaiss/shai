@@ -214,7 +214,13 @@ main() {
         log_error "No prebuilt binary for $platform in this release."
         log_info "Fallback — build from source (requires a Rust toolchain):"
         echo "  git clone https://github.com/${REPO}.git"
-        echo "  cd shai && cargo install --path shai-cli --locked"
+        echo "  cd shai"
+        # Honor SHAI_RELEASE when it names a concrete tag so the fallback
+        # builds that revision, not whatever main happens to be.
+        if [ -n "${SHAI_RELEASE}" ] && [ "${SHAI_RELEASE}" != "latest" ]; then
+            echo "  git checkout ${SHAI_RELEASE}"
+        fi
+        echo "  cargo install --path shai-cli --locked"
         log_warn "Do not run 'cargo install shai' from crates.io — that installs an unrelated project (https://crates.io/crates/shai)."
         log_info "Docs: https://github.com/${REPO}#installation"
         exit 1

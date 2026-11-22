@@ -1,12 +1,10 @@
 # Homebrew formula scaffold for Shai (addresses ovh/shai#103).
 #
-# Install from this repository as a tap:
-#   brew tap ovh/shai https://github.com/ovh/shai
-#   brew install shai
-#
-# Or, while reviewing on a fork:
+# Tap the repo that ships Formula/shai.rb:
 #   brew tap shaiss/shai https://github.com/shaiss/shai
 #   brew install shai
+#
+# After upstream merge, the same works with ovh/shai.
 #
 # After each GitHub Release, update `version`, each `url`, and each `sha256`
 # below (see Formula/README.md). Linux aarch64 falls back to a source build
