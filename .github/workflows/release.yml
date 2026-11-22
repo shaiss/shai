@@ -60,14 +60,14 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Install Rust
-        env:
-          TARGET: ${{ matrix.target }}
-        # rustup reads rust-toolchain.toml (1.100.0); do not pass "stable"
+        shell: bash
+        # rustup reads rust-toolchain.toml (1.100.0); do not pass "stable".
+        # shell: bash so Windows runners expand $TARGET (pwsh would not).
         run: |
           set -euo pipefail
           rustup toolchain install
           rustup show
-          rustup target add "$TARGET"
+          rustup target add "${{ matrix.target }}"
           rustc --version --verbose
 
       - name: Install dependencies (Linux)
@@ -81,9 +81,8 @@ jobs:
       # be restored into a release job and ship into published artifacts.
 
       - name: Build binary
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET"
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Prepare binary (Unix)
         if: matrix.os != 'windows-latest'

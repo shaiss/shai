@@ -31,6 +31,7 @@ jobs:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -72,12 +73,12 @@ jobs:
       # rust-toolchain.toml pins the compiler, so the target std from the
       # dtolnay step (installed for `stable`) is not on the active toolchain.
       # Install the pinned toolchain and add the target to it on every runner.
+      # Use ${{ matrix.target }} (not $TARGET): Windows runners use pwsh by
+      # default, where $TARGET is an empty PowerShell variable.
       - name: Add target to pinned toolchain
-        env:
-          TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install
-          rustup target add "$TARGET"
+          rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
