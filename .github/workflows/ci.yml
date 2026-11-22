@@ -40,13 +40,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          # rust-toolchain.toml pins the channel; request the components we need.
+          # dtolnay/rust-toolchain requires an explicit toolchain; keep in sync
+          # with rust-toolchain.toml (cargo still respects the pin after install).
+          toolchain: "1.100.0"
           components: rustfmt, clippy
-
-      - name: Install pinned toolchain components
-        run: |
-          rustup toolchain install
-          rustup component add rustfmt clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4

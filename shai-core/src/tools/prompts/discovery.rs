@@ -276,17 +276,20 @@ mod tests {
             .join("shai")
             .join("prompts");
         fs::create_dir_all(&prompts_dir).unwrap();
+        // Unique name: project-local prompts still win over HOME, so avoid
+        // colliding with a real `.shai/prompts/caveman.md` in the checkout.
+        let name = "ci_gate_unique_prompt_fixture";
         fs::write(
-            prompts_dir.join("caveman.md"),
-            "---\nname: caveman\ndescription: Caveman mode\n---\nBe concise.",
+            prompts_dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: CI fixture\n---\nBe concise."),
         )
         .unwrap();
 
         let _home = crate::config::test_env::HomeGuard::set(temp_home.path());
-        let loaded = load_active_prompts(&["caveman".to_string()]);
+        let loaded = load_active_prompts(&[name.to_string()]);
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, "caveman");
+        assert_eq!(loaded[0].0, name);
         assert!(loaded[0].1.contains("Be concise."));
     }
 }
