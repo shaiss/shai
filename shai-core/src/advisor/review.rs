@@ -172,7 +172,10 @@ impl Reviewer {
             };
 
             let calls = tool_calls.clone().unwrap_or_default();
-            if calls.is_empty() {
+            // The last round does not offer tools. A tool call in that
+            // reply is not run: there is no later request to receive the
+            // result, and a lookup would only delay the agent.
+            if calls.is_empty() || !offer_tools {
                 let text = match content {
                     Some(ChatMessageContent::Text(text)) => text.as_str(),
                     _ => "",
@@ -231,7 +234,10 @@ impl Reviewer {
     /// repeat the request, so it is redacted and reduced to one plain line
     /// like anything else that comes back.
     fn failure(&self, reason: &str) -> String {
-        sanitize_line(&self.redactor.redact(reason), MAX_FAILURE_CHARS)
+        let redacted = self.redactor.redact(reason);
+        let normalized = sanitize_line(&redacted, usize::MAX);
+        let checked = self.redactor.redact_known(&normalized);
+        sanitize_line(&checked, MAX_FAILURE_CHARS)
     }
 
     /// Run one tool call requested by the advisor model.
@@ -888,6 +894,22 @@ mod tests {
         );
         let long = sanitize_line(&"x".repeat(1000), MAX_FAILURE_CHARS);
         assert_eq!(long.chars().count(), MAX_FAILURE_CHARS);
+    }
+
+    #[test]
+    fn a_failure_reason_rechecks_known_values_after_it_is_normalized() {
+        const KEY: &str = "known-provider-key-0123456789";
+        let (_dir, reviewer) = reviewer_knowing(&[KEY]);
+        let reason = format!(
+            "HTTP 401: invalid key {}",
+            KEY.replace("-key-", "-\u{200b}key-")
+        );
+        let shown = reviewer.failure(&reason);
+        assert!(!shown.contains(KEY), "{shown}");
+        assert!(!shown.contains("known-provider"), "{shown}");
+        assert!(shown.contains("(redacted)"), "{shown}");
+        assert!(!shown.contains('\n'), "{shown}");
+        assert!(shown.chars().count() <= MAX_FAILURE_CHARS);
     }
 
     #[tokio::test]

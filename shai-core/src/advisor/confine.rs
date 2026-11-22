@@ -360,6 +360,18 @@ fn names_a_secret(name: &str) -> bool {
 /// The rules that know a file holding secrets by what it is, not by a word
 /// in its name.
 fn names_a_secret_by_kind(name: &str) -> bool {
+    if names_a_secret_by_kind_exact(name) {
+        return true;
+    }
+    // A hidden form of a listed name: `.kubeconfig`, `.auth.config.json`.
+    // Backup handling already strips a leading dot after a suffix
+    // (`.kubeconfig.swp`); the unsuffixed hidden file or directory must
+    // also be refused.
+    name.strip_prefix('.')
+        .is_some_and(|rest| !rest.is_empty() && names_a_secret_by_kind_exact(rest))
+}
+
+fn names_a_secret_by_kind_exact(name: &str) -> bool {
     if SENSITIVE_FILES.contains(&name) {
         return true;
     }
@@ -568,13 +580,73 @@ impl ConfinedFs {
         self.refusals().covers(path)
     }
 
-    /// `path` relative to the root, for display.
+    /// `path` relative to the root, for display, with line breaks and other
+    /// invisible characters already replaced. Prefer
+    /// [`display_to_advisor`](Self::display_raw) plus redaction when the
+    /// text will be shown to the model, redact the raw path first.
     pub(crate) fn display(&self, path: &Path) -> String {
+        shown_name(&self.display_raw(path))
+    }
+
+    /// `path` relative to the root, with the file name as it is on disk.
+    /// Known values are still in the text; redact before [`shown_name`].
+    pub(crate) fn display_raw(&self, path: &Path) -> String {
         match path.strip_prefix(&self.root) {
             Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
-            Ok(relative) => shown_name(&relative.display().to_string()),
-            Err(_) => shown_name(&path.display().to_string()),
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => path.display().to_string(),
         }
+    }
+
+    /// A configured records path that equals the root or is an ancestor of
+    /// it. [`refresh`] only records descendants of the root, so those paths
+    /// would otherwise be dropped and the advisor could read the records.
+    pub(crate) fn records_covering_root(&self) -> Option<PathBuf> {
+        let refusals = self.refusals();
+        for (path, _) in &refusals.configured {
+            for form in [Some(destination(path)), normalized(path)] {
+                let Some(form) = form else {
+                    continue;
+                };
+                if self.root == form || self.root.starts_with(&form) {
+                    return Some(form);
+                }
+            }
+        }
+        None
+    }
+
+    /// Also refuse every destination `other` already refuses, so a renewed
+    /// advisor does not start treating an earlier records path as ordinary
+    /// workspace. Current refusals of this view are kept.
+    pub(crate) fn retaining_refusals_of(self, other: &Self) -> Self {
+        let (refused, rotated, configured) = {
+            let theirs = other.refusals();
+            (
+                theirs.refused.clone(),
+                theirs.rotated.clone(),
+                theirs.configured.clone(),
+            )
+        };
+        {
+            let mut mine = self.refusals();
+            for path in refused {
+                if !mine.refused.contains(&path) {
+                    mine.refused.push(path);
+                }
+            }
+            for path in rotated {
+                if !mine.rotated.contains(&path) {
+                    mine.rotated.push(path);
+                }
+            }
+            for entry in configured {
+                if !mine.configured.contains(&entry) {
+                    mine.configured.push(entry);
+                }
+            }
+        }
+        self
     }
 
     /// `requested` as a path relative to the root, judged by its text alone:
@@ -1344,6 +1416,13 @@ mod tests {
             ("config", "secrets.yaml"),
             ("config", "gcp-credentials.json"),
             ("config", "auth.config.json"),
+            ("config", ".auth.config.json"),
+            // A hidden file named after a listed kind, and a hidden
+            // directory of the same kind holding a child. These cannot
+            // share a parent: creating the file first would block the
+            // directory.
+            ("dotfiles", ".kubeconfig"),
+            ("home/.kubeconfig", "config"),
             // Neighbours of the above that are easy to forget.
             ("infra", "terraform.tfstate.backup"),
             ("infra", "prod.auto.tfvars.json"),

@@ -1476,7 +1476,7 @@ fn quoted_value_closes(rest: &str, quote: &str) -> bool {
         return false;
     }
     let mut escaped = false;
-    let limit = rest.len().min(8 * 1024);
+    let limit = char_floor(rest, 8 * 1024);
     let body = &rest[..limit];
     let mut i = 0;
     while i < body.len() {
@@ -3843,5 +3843,15 @@ mod tests {
             !debug.contains(KEY) && !debug.contains(ENV_TOKEN),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn quoted_value_closes_does_not_slice_inside_a_utf8_character() {
+        // 8190 ASCII bytes, then a 3-byte character that would be split by a
+        // raw 8192-byte cut, then a closing quote. Must not panic.
+        let mut rest = "a".repeat(8190);
+        rest.push('\u{4e2d}');
+        rest.push('"');
+        let _ = quoted_value_closes(&rest, "\"");
     }
 }

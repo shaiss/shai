@@ -160,6 +160,12 @@ impl Advisor {
         let (fs, session_dir) = confined_to(working_dir, &environment)
             .map_err(|e| AdvisorError::WorkingDir(e.to_string()))?;
         let fs = fs.refusing(own_records).refusing_rotated(own_log);
+        if let Some(records) = fs.records_covering_root() {
+            return Err(AdvisorError::WorkingDir(format!(
+                "the working directory lies inside the records path {}",
+                records.display()
+            )));
+        }
         let settings = config
             .providers
             .iter()
@@ -230,6 +236,9 @@ impl Advisor {
         environment: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, AdvisorError> {
         let mut renewed = Self::with_environment(model, working_dir, limits, config, environment)?;
+        let mut reviewer = (*renewed.reviewer).clone();
+        reviewer.fs = reviewer.fs.retaining_refusals_of(&self.reviewer.fs);
+        renewed.reviewer = Arc::new(reviewer);
         renewed.spent = self.spent.clone();
         Ok(renewed)
     }
@@ -287,7 +296,17 @@ impl Advisor {
             .turns_since_review
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        !self.is_off() && self.has_calls_left() && turns > self.limits.cooldown_turns
+        if self.is_off() || !self.has_calls_left() {
+            return false;
+        }
+        // The first review of a session is not held for a cooldown, including
+        // after the advisor is renewed with a larger cooldown before any
+        // review has been reserved. After one has been taken, the shared
+        // turn count must have passed the cooldown again.
+        if self.calls_made() == 0 {
+            return true;
+        }
+        turns > self.limits.cooldown_turns
     }
 
     /// Whether the session's budget still holds a review, without taking it.

@@ -219,12 +219,60 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
 }
 
 fn clip_line(line: &str) -> String {
-    if line.chars().count() > MAX_LINE_CHARS {
-        let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
-        format!("{cut}…")
-    } else {
-        line.to_string()
+    excerpt_around(line, 0, 0)
+}
+
+/// `line` cut to [`MAX_LINE_CHARS`], keeping the span from `match_start` to
+/// `match_end` (byte offsets) when the line is longer. Used by `grep` so a
+/// match late in a minified line is still shown, and by `read` from the
+/// start of the line.
+fn excerpt_around(line: &str, match_start: usize, match_end: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= MAX_LINE_CHARS {
+        return line.to_string();
     }
+    let to_char = |byte: usize| line[..byte.min(line.len())].chars().count();
+    let start = to_char(match_start);
+    let end = to_char(match_end.max(match_start));
+    let match_len = end.saturating_sub(start).min(MAX_LINE_CHARS);
+    // Leave room for a leading and trailing ellipsis when the window is
+    // not flush with either end.
+    let mut budget = MAX_LINE_CHARS;
+    let mut from = start.saturating_sub((budget.saturating_sub(match_len)) / 2);
+    if from > 0 {
+        budget = budget.saturating_sub(1);
+    }
+    if from + budget < chars.len() {
+        budget = budget.saturating_sub(1);
+    }
+    if from + budget > chars.len() {
+        from = chars.len().saturating_sub(budget);
+    }
+    if start + match_len > from + budget {
+        from = (start + match_len).saturating_sub(budget);
+    }
+    let to = (from + budget).min(chars.len());
+    let mut out = String::new();
+    if from > 0 {
+        out.push('…');
+    }
+    out.extend(chars[from..to].iter().copied());
+    if to < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// A path or file name as the advisor may see it: known values are removed
+/// first, so a name that holds a multiline secret is not saved by replacing
+/// its line breaks, and only then are remaining line breaks and other
+/// invisible characters turned into `?`.
+fn shown_to_advisor(name: &str, redactor: &Redactor) -> String {
+    shown_name(&redactor.redact(name))
+}
+
+fn display_to_advisor(fs: &ConfinedFs, path: &std::path::Path, redactor: &Redactor) -> String {
+    shown_to_advisor(&fs.display_raw(path), redactor)
 }
 
 /// The text of a file, or `None` when it is not UTF-8 text.
@@ -293,8 +341,8 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
     let dir = fs.resolve_dir(str_arg(args, "path").unwrap_or("."))?;
 
     let mut entries: Vec<String> = Vec::new();
-    let mut listing =
-        std::fs::read_dir(&dir).map_err(|e| Failure::about(fs.display(&dir), e.to_string()))?;
+    let mut listing = std::fs::read_dir(&dir)
+        .map_err(|e| Failure::about(display_to_advisor(fs, &dir, redactor), e.to_string()))?;
     let mut partial = false;
     // Entries the advisor may not look at are left out, by the same rule as
     // `read`, `find` and `grep` use, and only counted.
@@ -322,7 +370,10 @@ fn ls(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fail
         // Each name by itself, before the list is put in order: where an
         // entry comes in the list then says nothing about what was removed
         // from its name.
-        let name = listed(redactor.redact(&shown_name(&entry.file_name().to_string_lossy())));
+        let name = listed(shown_to_advisor(
+            &entry.file_name().to_string_lossy(),
+            redactor,
+        ));
         // Names only: nothing here is opened or followed.
         if file_type.is_dir() {
             entries.push(format!("{name}/"));
@@ -534,7 +585,7 @@ fn find(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
         // The pattern is matched against the path as the advisor may see
         // it: whether a path comes back never tells it anything about a
         // part of the path that is not shown.
-        let shown = listed(redactor.redact(&fs.display(path)));
+        let shown = listed(display_to_advisor(fs, path, redactor));
         if regex.is_match(&shown) {
             matches.push(shown);
         }
@@ -585,12 +636,13 @@ fn grep(fs: &ConfinedFs, redactor: &Redactor, args: &Value) -> Result<String, Fa
         // be read as a field called token and its value.
         let mut shown_path = None;
         for (index, line) in text.lines().enumerate() {
-            if regex.is_match(line) {
+            if let Some(found) = regex.find(line) {
                 matches.push(format!(
                     "{}:{}: {}",
-                    shown_path.get_or_insert_with(|| listed(redactor.redact(&fs.display(path)))),
+                    shown_path
+                        .get_or_insert_with(|| listed(display_to_advisor(fs, path, redactor))),
                     index + 1,
-                    clip_line(line.trim_end())
+                    excerpt_around(line.trim_end(), found.start(), found.end())
                 ));
                 if matches.len() >= MAX_MATCHES {
                     return false;
@@ -828,6 +880,25 @@ mod tests {
             let out = AdvisorTool::Ls.run(&fs, &Redactor::default(), &json!({"path": path}));
             assert!(out.starts_with("error:"), "{path}: {out}");
         }
+    }
+
+    #[test]
+    fn ls_redacts_a_filename_before_replacing_its_line_breaks() {
+        let (tmp, fs) = project();
+        let root = tmp.path().join("work");
+        let secret = "preamble\nknown-provider-value-0123456789";
+        let redactor = Redactor::new(
+            [("SOME_API_KEY", secret)],
+            Vec::<(String, String)>::new(),
+            &[],
+        );
+        // A file name can hold a line break. Replacing it first would leave
+        // the rest of the known value in the listing.
+        std::fs::write(root.join(secret), "ok\n").unwrap();
+        let out = AdvisorTool::Ls.run(&fs, &redactor, &json!({}));
+        assert!(!out.contains("known-provider-value-0123456789"), "{out}");
+        assert!(!out.contains("preamble"), "{out}");
+        assert!(out.contains("[redacted]"), "{out}");
     }
 
     #[test]
@@ -1432,6 +1503,29 @@ mod tests {
             out,
             "src/password_reset.rs:1: fn send_reset_mail() {}\nsrc/token.rs:3: fn next_token() {}"
         );
+    }
+
+    #[test]
+    fn grep_shows_a_match_that_is_past_the_line_cap() {
+        let (tmp, fs) = project();
+        let root = tmp.path().join("work");
+        let prefix = "x".repeat(400);
+        fs::write(
+            root.join("minified.js"),
+            format!("{prefix}NEEDLE{prefix}\n"),
+        )
+        .unwrap();
+        let out = AdvisorTool::Grep.run(
+            &fs,
+            &Redactor::default(),
+            &json!({"pattern": "NEEDLE", "path": "minified.js"}),
+        );
+        assert!(out.contains("NEEDLE"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        let line = out.lines().next().unwrap();
+        let body = line.split_once(": ").map(|(_, rest)| rest).unwrap();
+        assert!(body.chars().count() <= MAX_LINE_CHARS + 2, "{body}");
+        assert!(body.starts_with('…') && body.ends_with('…'), "{body}");
     }
 
     #[test]

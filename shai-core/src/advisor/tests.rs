@@ -813,6 +813,60 @@ async fn a_review_that_runs_out_of_rounds_leaves_no_note() {
 }
 
 #[tokio::test]
+async fn the_final_round_keeps_a_text_verdict_and_does_not_run_tools() {
+    use openai_dive::v1::resources::chat::{Function, ToolCall};
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("canary.txt"), "should-not-be-looked-up\n").unwrap();
+    // Five lookups, then a last reply that both calls a tool and gives a
+    // verdict. The last round must keep the verdict and not start the
+    // lookup there is no later request to receive.
+    let mut stalling: Vec<Reply> = (0..review::MAX_ROUNDS - 1)
+        .map(|_| Reply::Message(call("ls", json!({}))))
+        .collect();
+    stalling.push(Reply::Message(ChatMessage::Assistant {
+        content: Some(ChatMessageContent::Text(
+            "nit: the last lookup was not needed".to_string(),
+        )),
+        reasoning: None,
+        reasoning_content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "call_final".to_string(),
+            r#type: "function".to_string(),
+            function: Function {
+                name: "read".to_string(),
+                arguments: r#"{"path": "canary.txt"}"#.to_string(),
+            },
+        }]),
+        name: None,
+        audio: None,
+        refusal: None,
+    }));
+    let outcome = run(
+        dir.path(),
+        steps(dir.path(), 1),
+        stalling,
+        Some(limits(10, 5)),
+    )
+    .await;
+
+    let reviews = outcome.advisor.served();
+    assert_eq!(reviews.len(), review::MAX_ROUNDS);
+    assert!(reviews.last().unwrap().tools.is_empty());
+    // No later request was made with a tool result, so the canary was not
+    // sent back to the model.
+    let sent = reviews
+        .iter()
+        .flat_map(|review| review.messages.iter())
+        .map(|message| format!("{message:?}"))
+        .collect::<String>();
+    assert!(!sent.contains("should-not-be-looked-up"), "{sent}");
+    assert_eq!(
+        outcome.notes(),
+        [(Severity::Nit, "the last lookup was not needed".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn a_review_has_a_budget_of_tool_calls() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
@@ -1234,6 +1288,87 @@ fn where_this_process_keeps_its_records_is_out_of_reach_wherever_that_is() {
     let reviewer = advisor.reviewer();
     assert!(reviewer.fs.resolve("var/transcripts/s.json").is_err());
     assert!(reviewer.fs.resolve("var/readme.md").is_ok());
+}
+
+#[test]
+fn a_working_directory_inside_a_records_folder_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let records = dir.path().join("records");
+    let day = records.join("day");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(day.join("README.md"), "ok\n").unwrap();
+    let script = Script::new(vec![]);
+    for root in [&day, &records] {
+        let error = Advisor::with_environment(
+            BoundModel::new(script.client(ADVISOR), ADVISOR_MODEL),
+            root,
+            AdvisorLimits::default(),
+            &ShaiConfig::default(),
+            [(
+                "SHAI_SESSION_FOLDER".to_string(),
+                records.to_string_lossy().into_owned(),
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, AdvisorError::WorkingDir(_)),
+            "{root:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_renewed_advisor_still_refuses_the_old_records_path() {
+    let dir = TempDir::new().unwrap();
+    let old = dir.path().join("old-transcripts");
+    let new = dir.path().join("new-transcripts");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(old.join("s.json"), "old-transcript").unwrap();
+    std::fs::write(new.join("s.json"), "new-transcript").unwrap();
+    std::fs::write(dir.path().join("README.md"), "ok\n").unwrap();
+    let script = Script::new(vec![]);
+    let env_for = |folder: &Path| {
+        let mut env = environment();
+        env.push((
+            "SHAI_SESSION_PERSIST_FOLDER".to_string(),
+            folder.to_string_lossy().into_owned(),
+        ));
+        env
+    };
+    let advisor = Advisor::with_environment(
+        BoundModel::new(script.client(ADVISOR), ADVISOR_MODEL),
+        dir.path(),
+        AdvisorLimits::default(),
+        &ShaiConfig::default(),
+        env_for(&old),
+    )
+    .unwrap();
+    assert!(advisor
+        .reviewer()
+        .fs
+        .resolve("old-transcripts/s.json")
+        .is_err());
+    let renewed = advisor
+        .renewed_with_environment(
+            BoundModel::new(script.client(ADVISOR), ADVISOR_MODEL),
+            dir.path(),
+            AdvisorLimits::default(),
+            &ShaiConfig::default(),
+            env_for(&new),
+        )
+        .unwrap();
+    assert!(renewed
+        .reviewer()
+        .fs
+        .resolve("old-transcripts/s.json")
+        .is_err());
+    assert!(renewed
+        .reviewer()
+        .fs
+        .resolve("new-transcripts/s.json")
+        .is_err());
+    assert!(renewed.reviewer().fs.resolve("README.md").is_ok());
 }
 
 /// An advisor confined to `dir` that is told `environment` and never asked.
@@ -1732,4 +1867,27 @@ fn a_second_review_cannot_be_reserved_before_the_cooldown_elapses() {
     assert!(!advisor.take_call());
     advisor.elapse_cooldown();
     assert!(advisor.take_call());
+}
+
+#[test]
+fn the_first_review_stays_eligible_after_a_larger_cooldown_is_set() {
+    let dir = TempDir::new().unwrap();
+    let advisor = advisor_on(
+        &Script::new(vec![]),
+        dir.path(),
+        limits(3, 2),
+        &ShaiConfig::default(),
+    );
+    assert_eq!(advisor.calls_made(), 0);
+    let renewed = advisor
+        .renewed_with_environment(
+            BoundModel::new(Script::new(vec![]).client(ADVISOR), ADVISOR_MODEL),
+            dir.path(),
+            limits(3, 5),
+            &ShaiConfig::default(),
+            environment(),
+        )
+        .unwrap();
+    assert!(renewed.step_completed());
+    assert!(renewed.take_call());
 }
