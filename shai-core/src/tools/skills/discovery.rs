@@ -260,6 +260,11 @@ mod tests {
 
     #[test]
     fn test_discover_skills_includes_builtins() {
+        // discover_skills() reads HOME for ~/.config/shai/skills; serialize
+        // against tests that temporarily override HOME.
+        let _lock = crate::config::test_env::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let skills = discover_skills();
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(

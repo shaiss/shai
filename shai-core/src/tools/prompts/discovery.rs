@@ -264,6 +264,11 @@ mod tests {
         // load_active_prompts resolves names through discover_prompts(), which
         // reads ~/.config/shai/prompts (and project .shai/prompts). Point HOME
         // at a temp tree so the test does not depend on the developer's config.
+        // HOME is process-wide: take HOME_LOCK and restore via HomeGuard so
+        // parallel skill/prompt discovery tests cannot race.
+        let _lock = crate::config::test_env::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_home = TempDir::new().unwrap();
         let prompts_dir = temp_home
             .path()
@@ -277,14 +282,8 @@ mod tests {
         )
         .unwrap();
 
-        let previous_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", temp_home.path());
-
+        let _home = crate::config::test_env::HomeGuard::set(temp_home.path());
         let loaded = load_active_prompts(&["caveman".to_string()]);
-        match previous_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "caveman");
