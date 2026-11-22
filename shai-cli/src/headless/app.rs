@@ -88,8 +88,11 @@ impl AppHeadless {
             // Load the agent config directly so a PrimaryConfigError (for example
             // an omitted `llm_provider` with `anonymous_fallback: deny` and no
             // primary config) stays typed and exits 2 (#67).
-            let config = AgentConfig::load(&agent_name)
-                .map_err(|e| SessionStartError::from_start(Some(&agent_name), e))?;
+            let config = AgentConfig::load_with_primary_result(
+                &agent_name,
+                self.session_options.startup_primary_ref(),
+            )
+            .map_err(|e| SessionStartError::from_start(Some(&agent_name), e))?;
             let mut builder = AgentBuilder::from_config(config)
                 .await
                 .map_err(|e| SessionStartError::from_start(Some(&agent_name), e.into()))?;
@@ -117,7 +120,7 @@ impl AppHeadless {
             // One load of the config, which also builds the primary model:
             // a file that breaks after the start-up check stops the run
             // instead of falling back to the built-in default.
-            let config = SessionOptions::primary_config()?;
+            let config = self.session_options.startup_primary_config()?;
             let (llm_client, model) = config
                 .get_llm_from_config()
                 .await

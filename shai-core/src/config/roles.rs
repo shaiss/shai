@@ -580,6 +580,16 @@ pub enum PrimaryConfigError {
 }
 
 impl PrimaryConfigError {
+    /// Convert a [`RoleError`] from loading the auth config into a typed
+    /// [`PrimaryConfigError`], preserving missing vs. unreadable distinctions.
+    pub fn from_role_error(error: RoleError) -> Self {
+        match error {
+            RoleError::ConfigMissing => Self::Missing,
+            RoleError::ConfigInvalid { path, reason } => Self::Invalid { path, reason },
+            other => Self::Other(other.to_string()),
+        }
+    }
+
     /// A missing/refused or unusable auth config is a refused start (exit 2).
     pub fn is_refused_start(&self) -> bool {
         true
@@ -617,6 +627,39 @@ impl ShaiConfig {
             Some(config) => Self::primary_from(Ok(config.clone())),
             None => Self::primary(),
         }
+    }
+
+    /// Enforce `anonymous_fallback` policy for an explicit provider (e.g. from
+    /// a named agent config). Invalid policies always refuse; `deny` refuses
+    /// when the provider resolves to anonymous OVH; a broken auth config also
+    /// refuses anonymous OVH instead of failing open.
+    pub fn enforce_provider_anonymous_fallback(
+        provider: &str,
+        env_vars: &std::collections::HashMap<String, String>,
+        primary: Result<&ShaiConfig, &PrimaryConfigError>,
+    ) -> Result<(), PrimaryConfigError> {
+        let env_setting = env_anonymous_fallback();
+        let config_setting = primary
+            .as_ref()
+            .ok()
+            .and_then(|config| config.anonymous_fallback.as_deref());
+        let resolution = resolve_anonymous_fallback(config_setting, env_setting.as_deref());
+        if let Some(message) = resolution.invalid {
+            return Err(PrimaryConfigError::Other(message));
+        }
+        if Self::provider_is_anonymous_ovh(provider, env_vars) {
+            if let Err(err) = primary {
+                if !matches!(err, PrimaryConfigError::Missing) {
+                    return Err(err.clone());
+                }
+            }
+            if resolution.mode == AnonymousFallbackMode::Deny {
+                return Err(PrimaryConfigError::Other(deny_message(
+                    FallbackSituation::AnonymousOvh,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// [`ShaiConfig::primary`] from an already-attempted load, reading the

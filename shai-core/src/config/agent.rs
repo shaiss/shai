@@ -240,10 +240,9 @@ fn default_llm_provider() -> AgentProviderConfig {
     }
 }
 
-/// Fill in `llm_provider` from the auth config when the agent file omits it.
-/// A broken auth config is an error; the built-in default is used only when
-/// there is no config file. If the agent file names its own provider, a
-/// broken auth config is ignored.
+/// Fill in `llm_provider` from the auth config when the agent file omits it,
+/// and enforce `anonymous_fallback` against both omitted and explicit
+/// providers (refusing keyless `ovhcloud` under `deny` or an invalid policy).
 pub(crate) fn agent_config_from_value(
     mut value: serde_json::Value,
     primary: Result<ShaiConfig, crate::config::roles::PrimaryConfigError>,
@@ -252,11 +251,19 @@ pub(crate) fn agent_config_from_value(
     if !value.is_object() {
         return Err(unreadable_agent_config(path, json_kind(&value)).into());
     }
-    if value.get("llm_provider").is_none() {
-        let config = primary?;
+    let has_explicit_provider = value.get("llm_provider").is_some();
+    if !has_explicit_provider {
+        let config = ShaiConfig::primary_from(Ok(primary?))?;
         value["llm_provider"] = serde_json::to_value(llm_provider_from_config(&config))?;
+        return Ok(serde_json::from_value(value)?);
     }
-    Ok(serde_json::from_value(value)?)
+    let agent: AgentConfig = serde_json::from_value(value)?;
+    ShaiConfig::enforce_provider_anonymous_fallback(
+        &agent.llm_provider.provider,
+        &agent.llm_provider.env_vars,
+        primary.as_ref(),
+    )?;
+    Ok(agent)
 }
 
 fn json_kind(value: &serde_json::Value) -> &'static str {
@@ -349,32 +356,66 @@ impl AgentConfig {
         agent_name: &str,
         primary: Option<&ShaiConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_primary_result(agent_name, primary.map(Ok))
+    }
+
+    /// [`AgentConfig::load_with_primary`], accepting a pre-resolved `Result`
+    /// (so a startup snapshot or missing-config refusal is reused without
+    /// re-reading disk).
+    pub fn load_with_primary_result(
+        agent_name: &str,
+        primary: Option<Result<&ShaiConfig, &crate::config::roles::PrimaryConfigError>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = Self::agent_config_path(agent_name)?;
 
         if config_path.exists() {
             let content_bytes = std::fs::read(&config_path)?;
-            return Self::from_bytes(&content_bytes, &config_path, primary);
+            return Self::from_bytes_with_primary_result(&content_bytes, &config_path, primary);
         }
 
         let legacy_path = Self::legacy_agent_config_path(agent_name)?;
         if legacy_path.exists() {
             let content_bytes = std::fs::read(&legacy_path)?;
-            return Self::from_bytes(&content_bytes, &legacy_path, primary);
+            return Self::from_bytes_with_primary_result(&content_bytes, &legacy_path, primary);
         }
 
         Err(format!("Agent config '{}' does not exist", agent_name).into())
     }
 
+    #[cfg(test)]
     fn from_bytes(
         content_bytes: &[u8],
         path: &Path,
         primary: Option<&ShaiConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_bytes_with_primary_result(content_bytes, path, primary.map(Ok))
+    }
+
+    fn from_bytes_with_primary_result(
+        content_bytes: &[u8],
+        path: &Path,
+        primary: Option<Result<&ShaiConfig, &crate::config::roles::PrimaryConfigError>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let content_stripped = StripComments::new(content_bytes);
         let value: serde_json::Value = serde_json::from_reader(content_stripped)?;
+        let has_explicit_provider = value.get("llm_provider").is_some();
         let primary = match primary {
-            Some(config) => Ok(config.clone()),
-            None => ShaiConfig::primary(),
+            Some(Ok(config)) => {
+                if has_explicit_provider {
+                    Ok(config.clone())
+                } else {
+                    ShaiConfig::primary_from(Ok(config.clone()))
+                }
+            }
+            Some(Err(err)) => Err(err.clone()),
+            None => {
+                let raw = ShaiConfig::load_for_roles();
+                if has_explicit_provider {
+                    raw.map_err(crate::config::roles::PrimaryConfigError::from_role_error)
+                } else {
+                    ShaiConfig::primary_from(raw)
+                }
+            }
         };
         agent_config_from_value(value, primary, Some(path))
     }
@@ -736,6 +777,89 @@ mod broken_config_fallback_tests {
         match previous {
             Some(value) => std::env::set_var("OVH_API_KEY", value),
             None => std::env::remove_var("OVH_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn explicit_anonymous_ovh_agent_is_refused_under_deny_or_invalid_policy() {
+        let _xdg = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = crate::config::test_env::ENV_TEST_LOCK.blocking_lock();
+
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai_dir = dir.path().join("shai");
+        let agents_dir = shai_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        let anon_agent = r#"{"name":"anon","description":"x","llm_provider":{"provider":"ovhcloud","env_vars":{},"model":"qwen3-32b","tool_method":"FunctionCall"}}"#;
+        let openai_agent = r#"{"name":"keyed","description":"x","llm_provider":{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}}"#;
+        let anon_path = agents_dir.join("anon.config.json");
+        let openai_path = agents_dir.join("keyed.config.json");
+        std::fs::write(&anon_path, anon_agent).unwrap();
+        std::fs::write(&openai_path, openai_agent).unwrap();
+
+        // a) No auth file + SHAI_ANONYMOUS_FALLBACK=deny:
+        // explicit keyless ovhcloud is refused (from_bytes & agent_config_from_value),
+        // while explicit openai still loads.
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+        let err = AgentConfig::from_bytes(anon_agent.as_bytes(), &anon_path, None)
+            .map(|_| ())
+            .expect_err("from_bytes must refuse explicit anonymous OVH under env deny");
+        assert!(
+            err.downcast_ref::<crate::config::roles::PrimaryConfigError>()
+                .is_some_and(|e| e.is_refused_start()),
+            "expected PrimaryConfigError, got: {err}"
+        );
+        let ok_openai = AgentConfig::from_bytes(openai_agent.as_bytes(), &openai_path, None)
+            .expect("explicit openai must still load under missing auth + env deny");
+        assert_eq!(ok_openai.llm_provider.provider, "openai");
+
+        // b) Auth config has anonymous_fallback: deny (with env unset),
+        // both when primary is openai and when primary is anonymous OVH.
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+        for auth in [
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+            r#"{"providers":[{"provider":"ovhcloud","env_vars":{},"model":"qwen3-32b","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+        ] {
+            std::fs::write(shai_dir.join("auth.config.json"), auth).unwrap();
+            let err = AgentConfig::from_bytes(anon_agent.as_bytes(), &anon_path, None)
+                .map(|_| ())
+                .expect_err("from_bytes must refuse explicit anonymous OVH under config deny");
+            assert!(
+                err.downcast_ref::<crate::config::roles::PrimaryConfigError>()
+                    .is_some_and(|e| e.is_refused_start()),
+                "expected PrimaryConfigError for auth={auth}, got: {err}"
+            );
+            AgentConfig::from_bytes(openai_agent.as_bytes(), &openai_path, None)
+                .expect("explicit openai must still load when auth has anonymous_fallback=deny");
+        }
+
+        // c) Invalid anonymous_fallback policy in env refuses.
+        std::fs::remove_file(shai_dir.join("auth.config.json")).unwrap();
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "bogus");
+        let err = AgentConfig::from_bytes(anon_agent.as_bytes(), &anon_path, None)
+            .map(|_| ())
+            .expect_err("invalid policy must refuse explicit anonymous OVH");
+        assert!(
+            err.downcast_ref::<crate::config::roles::PrimaryConfigError>()
+                .is_some_and(|e| e.is_refused_start()),
+            "expected PrimaryConfigError, got: {err}"
+        );
+
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
         }
     }
 }

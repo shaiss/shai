@@ -374,4 +374,20 @@ fn anonymous_fallback_deny_stops_missing_config_and_headless_agent_without_provi
         "stderr={}",
         outcome.stderr
     );
+
+    // 6) Config-level anonymous_fallback: "deny" with a non-anonymous primary
+    // must still refuse a named agent that declares keyless ovhcloud (exit 2).
+    let openai_deny_cfg = r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#;
+    let (outcome, _) = shai_with_env(
+        Some(openai_deny_cfg),
+        Some(("helper", agent_anon_ovh)),
+        &[],
+        &["-p", "hello", "--agent", "helper"],
+    );
+    assert_eq!(outcome.status, 2, "stderr={}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("Anonymous fallback is disabled"),
+        "stderr={}",
+        outcome.stderr
+    );
 }

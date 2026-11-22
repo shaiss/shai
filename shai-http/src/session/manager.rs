@@ -293,6 +293,7 @@ impl SessionManager {
 
 #[cfg(test)]
 mod tests {
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use super::*;
     use async_trait::async_trait;
     use openai_dive::v1::resources::chat::{ChatMessageContent, Function, ToolCall};
@@ -512,8 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_uses_the_startup_snapshot_when_the_auth_file_is_broken() {
-        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = LOCK.lock().await;
+        let _guard = ENV_LOCK.lock().await;
 
         let dir = scratch_dir();
         let shai = dir.join("config").join("shai");
@@ -608,5 +608,101 @@ mod tests {
         }
         restore();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn named_agent_with_anonymous_ovh_is_refused_under_deny() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = scratch_dir();
+        let config_home = dir.join("config");
+        let agents_dir = config_home.join("shai").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("anon.config.json"),
+            r#"{
+                "name": "anon",
+                "description": "explicit keyless ovhcloud",
+                "llm_provider": {
+                    "provider": "ovhcloud",
+                    "env_vars": {},
+                    "model": "qwen3-32b",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let keys = [
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "SHAI_SESSION_PERSIST_ENABLE",
+            "SHAI_ANONYMOUS_FALLBACK",
+            "OVH_API_KEY",
+        ];
+        let prev: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var("HOME", dir.join("home"));
+        std::env::set_var("SHAI_SESSION_PERSIST_ENABLE", "false");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+
+        let mut deny_snapshot = snapshot_with_key("k");
+        deny_snapshot.anonymous_fallback = Some("deny".to_string());
+
+        let manager = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(deny_snapshot)),
+            ..SessionManagerConfig::default()
+        });
+        let res = manager
+            .create_new_session(
+                "req-anon-deny",
+                "anon-deny-1",
+                Some("anon".to_string()),
+                true,
+            )
+            .await;
+        if res.is_ok() {
+            let _ = manager
+                .cancel_session(&"req-anon-deny".to_string(), "anon-deny-1")
+                .await;
+        }
+
+        // Also test env-level SHAI_ANONYMOUS_FALLBACK=deny with a snapshot that leaves anonymous_fallback unset.
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+        let manager_env = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot_with_key("k"))),
+            ..SessionManagerConfig::default()
+        });
+        let res_env = manager_env
+            .create_new_session(
+                "req-anon-env-deny",
+                "anon-env-deny-1",
+                Some("anon".to_string()),
+                true,
+            )
+            .await;
+        if res_env.is_ok() {
+            let _ = manager_env
+                .cancel_session(&"req-anon-env-deny".to_string(), "anon-env-deny-1")
+                .await;
+        }
+
+        for (k, v) in keys.iter().zip(prev) {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        assert!(
+            res.is_err(),
+            "shai serve must refuse named agent with keyless ovhcloud under config deny"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            res_env.is_err(),
+            "shai serve must refuse named agent with keyless ovhcloud under env deny"
+        );
     }
 }

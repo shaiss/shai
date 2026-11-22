@@ -371,8 +371,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             // The HTTP server does not yet use `--agent`, so the gate must
             // not treat a named agent as the provider the server will run.
-            prepare_session_or_exit(FallbackInteraction::NonInteractive, None, default_url).await;
-            handle_serve(host, port, agent, ephemeral, max_sessions, yes).await?;
+            let startup_primary =
+                prepare_session_or_exit(FallbackInteraction::NonInteractive, None, default_url)
+                    .await;
+            handle_serve(
+                host,
+                port,
+                agent,
+                ephemeral,
+                max_sessions,
+                yes,
+                startup_primary,
+            )
+            .await?;
         }
         Some(Commands::Import { overwrite }) => {
             default_config(default_url).await;
@@ -557,6 +568,10 @@ async fn default_config(default_config_url: Option<String>) {
         Err(_) => {}
     }
 
+    let _ = fetch_and_save_default_config(default_config_url).await;
+}
+
+async fn fetch_and_save_default_config(default_config_url: Option<String>) -> ShaiConfig {
     let default_url = match default_config_url {
         Some(url) => url,
         None => {
@@ -573,6 +588,21 @@ async fn default_config(default_config_url: Option<String>) {
     };
 
     let _ = config.save();
+    config
+}
+
+async fn provision_default_config(
+    default_config_url: Option<String>,
+    loaded: Option<ShaiConfig>,
+    allow_fallback_provision: bool,
+) -> Result<ShaiConfig, PrimaryConfigError> {
+    if let Some(config) = loaded {
+        return Ok(config);
+    }
+    if !allow_fallback_provision {
+        return Err(PrimaryConfigError::Missing);
+    }
+    Ok(fetch_and_save_default_config(default_config_url).await)
 }
 
 fn interactive_session_interaction() -> FallbackInteraction {
@@ -608,11 +638,13 @@ fn exit_session_error(err: SessionStartError) -> ! {
 /// Apply the anonymous-fallback setting before a session starts. On deny, an
 /// unreadable config, or an invalid value this returns a typed error with exit
 /// code 2 and does not provision a default config or start a network request.
+/// Returns the single loaded (or provisioned) primary config snapshot so
+/// callers do not re-read `auth.config.json` after the gate passes.
 async fn prepare_session(
     interaction: FallbackInteraction,
     agent_name: Option<&str>,
     default_config_url: Option<String>,
-) -> Result<(), SessionStartError> {
+) -> Result<Result<ShaiConfig, PrimaryConfigError>, SessionStartError> {
     let loaded = match ShaiConfig::load_for_roles() {
         Ok(config) => Some(config),
         Err(RoleError::ConfigMissing) => None,
@@ -630,6 +662,7 @@ async fn prepare_session(
     let resolution = resolve_anonymous_fallback(config_setting, env_setting.as_deref());
     resolution.log();
 
+    let allow_fallback_provision = resolution.mode == AnonymousFallbackMode::Prompt;
     let situation = fallback_situation(loaded.as_ref(), agent_name);
 
     match evaluate_anonymous_fallback_gate(resolution, situation, interaction) {
@@ -639,8 +672,10 @@ async fn prepare_session(
             if let Some(warning) = first_run_warning {
                 eprintln!("{warning}");
             }
-            default_config(default_config_url).await;
-            Ok(())
+            Ok(
+                provision_default_config(default_config_url, loaded, allow_fallback_provision)
+                    .await,
+            )
         }
         FallbackGate::NeedConfirm { prompt, .. } => {
             let mut stdin = io::stdin().lock();
@@ -648,8 +683,10 @@ async fn prepare_session(
             let accepted = confirm_anonymous_fallback(&mut stdin, &mut stderr, prompt)
                 .map_err(|e| SessionStartError::other(e.to_string()))?;
             if accepted {
-                default_config(default_config_url).await;
-                Ok(())
+                Ok(
+                    provision_default_config(default_config_url, loaded, allow_fallback_provision)
+                        .await,
+                )
             } else {
                 Err(SessionStartError::other(CANCEL_MESSAGE))
             }
@@ -662,22 +699,29 @@ async fn prepare_session_or_exit(
     interaction: FallbackInteraction,
     agent_name: Option<&str>,
     default_config_url: Option<String>,
-) {
-    if let Err(error) = prepare_session(interaction, agent_name, default_config_url).await {
-        exit_session_error(error);
+) -> Result<ShaiConfig, PrimaryConfigError> {
+    match prepare_session(interaction, agent_name, default_config_url).await {
+        Ok(primary) => primary,
+        Err(error) => exit_session_error(error),
     }
 }
 
 /// Apply the fallback gate, provision a starter config if allowed, then
-/// resolve session options against the resulting config.
+/// resolve session options against the resulting config without re-reading disk.
 async fn prepare_and_resolve_or_exit(
     interaction: FallbackInteraction,
     agent_name: Option<&str>,
     default_config_url: Option<String>,
     prewalk_into: Option<&str>,
 ) -> SessionOptions {
-    prepare_session_or_exit(interaction, agent_name, default_config_url).await;
-    SessionOptions::resolve_or_exit(prewalk_into)
+    let startup_primary =
+        prepare_session_or_exit(interaction, agent_name, default_config_url).await;
+    let missing = RoleError::ConfigMissing;
+    let loaded = match &startup_primary {
+        Ok(config) => Ok(config),
+        Err(_) => Err(&missing),
+    };
+    SessionOptions::resolve_from_loaded_or_exit(prewalk_into, loaded, startup_primary.clone())
 }
 
 async fn handle_main(
@@ -847,13 +891,13 @@ pub async fn handle_postcmd(
             // once as soon as this hook might suggest a fix, so the user is
             // told even if the session history is empty.
             let primary = if env::var("SHAI_SESSION_ID").is_ok() {
-                prepare_session_or_exit(
+                let startup_primary = prepare_session_or_exit(
                     FallbackInteraction::NonInteractive,
                     None,
                     default_config_url,
                 )
                 .await;
-                match SessionOptions::primary_config() {
+                match startup_primary {
                     Ok(config) => Some(config),
                     Err(error) => {
                         exit_session_error(error.into());
@@ -1005,11 +1049,11 @@ async fn handle_serve(
     ephemeral: bool,
     max_sessions: Option<usize>,
     yes: bool,
+    startup_primary: Result<ShaiConfig, PrimaryConfigError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Load the auth config once: refuse to start if the file is there and
-    // cannot be read, and pass the same snapshot to every HTTP session so
-    // a later edit cannot change credentials or silently fall back.
-    let primary = match SessionOptions::primary_config() {
+    // Pass the single startup snapshot to every HTTP session so a later edit
+    // cannot change credentials or silently fall back.
+    let primary = match startup_primary {
         Ok(config) => config,
         Err(error) => {
             eprintln!("error: {}", error);
@@ -1181,6 +1225,57 @@ mod cli_tests {
 
         // The flag needs a value.
         assert!(Cli::try_parse_from(["shai", "--prewalk-into"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_auth_config_after_prepare_session_does_not_switch_to_anonymous_ovh() {
+        let _guard = tui::app::tests::CONFIG_HOME_LOCK.lock().await;
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai_dir = dir.path().join("shai");
+        std::fs::create_dir_all(&shai_dir).unwrap();
+        let auth_path = shai_dir.join("auth.config.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
+        )
+        .unwrap();
+        let _home = tui::app::tests::ConfigHomeGuard::set(dir.path());
+
+        let options =
+            prepare_and_resolve_or_exit(FallbackInteraction::NonInteractive, None, None, None)
+                .await;
+
+        // Auth config vanishes before headless/TUI starts its agent.
+        std::fs::remove_file(&auth_path).unwrap();
+
+        let headless_cfg = options
+            .startup_primary_config()
+            .expect("headless startup_primary_config should use the snapshot");
+        assert_eq!(
+            headless_cfg.get_selected_provider().unwrap().provider,
+            "openai",
+            "headless must keep the config that passed prepare_session instead of falling back to anonymous OVH"
+        );
+
+        let tui_prepared =
+            tui::app::App::load_initial_prepared(None, options.startup_primary_ref())
+                .expect("TUI initial load should use the snapshot");
+        match tui_prepared {
+            tui::app::PreparedAgent::Primary(cfg) => assert_eq!(
+                cfg.get_selected_provider().unwrap().provider,
+                "openai",
+                "TUI must keep the config that passed prepare_session instead of falling back to anonymous OVH"
+            ),
+            tui::app::PreparedAgent::Named { .. } => panic!("expected primary"),
+        }
+
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
     }
 }
 

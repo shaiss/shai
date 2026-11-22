@@ -147,19 +147,12 @@ pub struct SessionOptions {
     announced: Option<String>,
     /// Where the session went, once the handoff has happened.
     handed_off: Option<String>,
+    /// Primary auth config resolved once during `prepare_session` so start-up
+    /// builds the primary model without re-reading disk after the gate.
+    startup_primary: Option<Result<ShaiConfig, PrimaryConfigError>>,
 }
 
 impl SessionOptions {
-    /// Resolve the options of a session about to start.
-    ///
-    /// `prewalk_into` is the value of `--prewalk-into`. Nothing here performs
-    /// network I/O.
-    pub fn resolve(prewalk_into: Option<&str>) -> Result<Self, String> {
-        // The user's own config, never the built-in default.
-        let config = ShaiConfig::load_for_roles();
-        Self::resolve_from(prewalk_into, config.as_ref())
-    }
-
     fn resolve_from(
         prewalk_into: Option<&str>,
         config: Result<&ShaiConfig, &RoleError>,
@@ -177,7 +170,50 @@ impl SessionOptions {
             prewalk: prewalk.map(Prewalk::new),
             announced: None,
             handed_off: None,
+            startup_primary: None,
         })
+    }
+
+    /// Resolve session options from an already-loaded (or provisioned)
+    /// startup config snapshot, without re-reading `auth.config.json`.
+    pub fn resolve_from_loaded(
+        prewalk_into: Option<&str>,
+        loaded: Result<&ShaiConfig, &RoleError>,
+        startup_primary: Result<ShaiConfig, PrimaryConfigError>,
+    ) -> Result<Self, String> {
+        let mut options = Self::resolve_from(prewalk_into, loaded)?;
+        options.startup_primary = Some(startup_primary);
+        Ok(options)
+    }
+
+    /// Like [`SessionOptions::resolve_from_loaded`], exiting with status 2 on
+    /// an invalid option or unreadable config.
+    pub fn resolve_from_loaded_or_exit(
+        prewalk_into: Option<&str>,
+        loaded: Result<&ShaiConfig, &RoleError>,
+        startup_primary: Result<ShaiConfig, PrimaryConfigError>,
+    ) -> Self {
+        match Self::resolve_from_loaded(prewalk_into, loaded, startup_primary) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("error: {}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    /// The startup primary config snapshot from `prepare_session`, or a fresh
+    /// [`SessionOptions::primary_config`] load when none was recorded.
+    pub fn startup_primary_config(&self) -> Result<ShaiConfig, PrimaryConfigError> {
+        match &self.startup_primary {
+            Some(result) => result.clone(),
+            None => Self::primary_config(),
+        }
+    }
+
+    /// Borrowed view of the startup primary config snapshot, if recorded.
+    pub fn startup_primary_ref(&self) -> Option<Result<&ShaiConfig, &PrimaryConfigError>> {
+        self.startup_primary.as_ref().map(Result::as_ref)
     }
 
     /// A missing config file asks for nothing. One that is there and cannot
@@ -219,20 +255,6 @@ impl SessionOptions {
             return Err(problem);
         }
         resolve_prewalk(prewalk_into, config).map_err(|e| e.to_string())
-    }
-
-    /// Like [`SessionOptions::resolve`], but a failure ends the process: the
-    /// reason goes to stderr and the exit code is 2. The callers of the
-    /// session entry points do not propagate errors, so this is where
-    /// "refuse to start" is enforced.
-    pub fn resolve_or_exit(prewalk_into: Option<&str>) -> Self {
-        match Self::resolve(prewalk_into) {
-            Ok(options) => options,
-            Err(error) => {
-                eprintln!("error: {}", error);
-                std::process::exit(2);
-            }
-        }
     }
 
     /// Options with `prewalk` still to come, for tests of the front-ends.
