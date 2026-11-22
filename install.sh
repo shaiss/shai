@@ -215,10 +215,14 @@ main() {
         log_info "Fallback — build from source (requires a Rust toolchain):"
         echo "  git clone https://github.com/${REPO}.git"
         echo "  cd shai"
-        # Honor SHAI_RELEASE when it names a concrete tag so the fallback
-        # builds that revision, not whatever main happens to be.
-        if [ -n "${SHAI_RELEASE}" ] && [ "${SHAI_RELEASE}" != "latest" ]; then
-            echo "  git checkout ${SHAI_RELEASE}"
+        # Prefer the release we just queried (including when SHAI_RELEASE is
+        # unset/"latest") so the fallback builds that tag, not main.
+        release_tag=$(echo "$release_json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [ -z "$release_tag" ] && [ -n "${SHAI_RELEASE}" ] && [ "${SHAI_RELEASE}" != "latest" ]; then
+            release_tag="${SHAI_RELEASE}"
+        fi
+        if [ -n "$release_tag" ]; then
+            echo "  git checkout ${release_tag}"
         fi
         echo "  cargo install --path shai-cli --locked"
         log_warn "Do not run 'cargo install shai' from crates.io — that installs an unrelated project (https://crates.io/crates/shai)."
