@@ -500,7 +500,8 @@ impl App<'_> {
         let hold = self.start_holding_events().await;
         let built = match self.build_agent(prepared).await {
             Ok(built) => {
-                let _held = self.stop_holding_events(hold).await;
+                let held = self.stop_holding_events(hold).await;
+                self.show_held_advisor_notices(&held);
                 built
             }
             Err(error) => {
@@ -717,6 +718,20 @@ impl App<'_> {
             self.handle_agent_event(event).await?;
         }
         Ok(())
+    }
+
+    /// Render advisor notices that arrived while an agent replacement was
+    /// being built, without replaying the old agent's prompts or state
+    /// updates onto its replacement.
+    pub(crate) fn show_held_advisor_notices(&mut self, held: &[AgentEvent]) {
+        for event in held {
+            if matches!(
+                event,
+                AgentEvent::AdvisorNote { .. } | AgentEvent::AdvisorFailed { .. }
+            ) {
+                self.show_notice(event);
+            }
+        }
     }
 
     pub fn notify(&mut self, msg: &str, duration: std::time::Duration) {
@@ -1502,5 +1517,78 @@ mod tests {
             "held events must be replayed onto the kept agent"
         );
         assert_eq!(app.agent_state.token_counter().output_tokens(), 3);
+    }
+
+    #[tokio::test]
+    async fn advisor_notices_buffered_during_a_successful_replacement_are_shown() {
+        let home = broken_auth_home(
+            r#"{
+                "name": "reviewer",
+                "description": "has its own provider",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        );
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let _home = ConfigHomeGuard::set(home.path());
+        let mut app = App::new();
+        let (txcmd, _rxcmd) =
+            tokio::sync::mpsc::unbounded_channel::<shai_core::agent::protocol::SentCommand>();
+        let (tx, rx) = broadcast::channel(16);
+        app.agent = Some(AppRunningAgent {
+            handle: tokio::spawn(async {}),
+            controller: shai_core::agent::AgentController { txcmd },
+            events: rx,
+            tools: Vec::new(),
+            identity: std::sync::Arc::new(()),
+        });
+
+        let prepared = app
+            .prepared_replacement(Some("reviewer"))
+            .expect("the reviewer snapshot should load");
+
+        let _ = tx.send(AgentEvent::AdvisorNote {
+            severity: shai_core::advisor::Severity::Concern,
+            note: "buffered advisor note before swap".to_string(),
+        });
+        let _ = tx.send(AgentEvent::AdvisorFailed {
+            error: "buffered failure".to_string(),
+            disabled: false,
+        });
+        let _ = tx.send(AgentEvent::TokenUsage {
+            input_tokens: 11,
+            output_tokens: 5,
+            cached_tokens: 0,
+        });
+
+        let replaced = app
+            .install_restored_agent(prepared)
+            .await
+            .expect("install from the snapshot should not error");
+
+        assert!(replaced);
+        let scrollback = app.renderer.history().raw_text();
+        assert!(
+            scrollback.contains("advisor (concern): buffered advisor note before swap"),
+            "{scrollback}"
+        );
+        assert!(
+            scrollback.contains("advisor: review failed (buffered failure)"),
+            "{scrollback}"
+        );
+        assert_eq!(
+            app.agent_state.token_counter().input_tokens(),
+            0,
+            "old agent state updates must not replay onto the replacement"
+        );
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
     }
 }

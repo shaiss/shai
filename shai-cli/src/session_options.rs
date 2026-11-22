@@ -681,15 +681,12 @@ mod tests {
 
     /// The same config with the role `advisor` on the `ollama` entry.
     fn config_with_advisor(tail: &str) -> ShaiConfig {
-        serde_json::from_str(
-            &serde_json::to_string(&config(Some(URL_A), tail))
-                .unwrap()
-                .replace(
-                    r#""cheap": "ollama/qwen3:8b""#,
-                    r#""cheap": "ollama/qwen3:8b", "advisor": "ollama/reviewer""#,
-                ),
-        )
-        .unwrap()
+        let mut cfg = config(Some(URL_A), tail);
+        cfg.roles = shai_core::config::roles::RolesConfig::from_pairs([
+            ("cheap", "ollama/qwen3:8b"),
+            ("advisor", "ollama/reviewer"),
+        ]);
+        cfg
     }
 
     fn invalid() -> RoleError {

@@ -225,9 +225,10 @@ static UNFINISHED_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:\\[uU][dD][89abAB][0-9a-fA-F]{2})?\\(?:[uU][0-9a-fA-F]{0,3})?$").unwrap()
 });
 
-/// `text` with its JSON escapes `\uXXXX` (either case, surrogate pairs
-/// joined) and `\/` decoded, and for each byte of the decoded text, the
-/// offset in `text` it comes from, with one more entry for its end.
+/// `text` with its standard JSON string escapes (`\uXXXX`, either case,
+/// surrogate pairs joined, `\/`, `\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`)
+/// decoded, and for each byte of the decoded text, the offset in `text` it
+/// comes from, with one more entry for its end.
 fn decode_json_escapes(text: &str) -> (String, Vec<usize>) {
     let bytes = text.as_bytes();
     let unit_at = |at: usize| -> Option<u16> {
@@ -249,7 +250,17 @@ fn decode_json_escapes(text: &str) -> (String, Vec<usize>) {
                 _ => (None, 6),
             },
             Some(unit) => (char::from_u32(u32::from(unit)), 6),
-            None if bytes[at] == b'\\' && bytes.get(at + 1) == Some(&b'/') => (Some('/'), 2),
+            None if bytes[at] == b'\\' => match bytes.get(at + 1) {
+                Some(b'/') => (Some('/'), 2),
+                Some(b'"') => (Some('"'), 2),
+                Some(b'\\') => (Some('\\'), 2),
+                Some(b'n') => (Some('\n'), 2),
+                Some(b'r') => (Some('\r'), 2),
+                Some(b't') => (Some('\t'), 2),
+                Some(b'b') => (Some('\x08'), 2),
+                Some(b'f') => (Some('\x0c'), 2),
+                _ => (Some('\\'), 1),
+            },
             None => {
                 let c = text[at..].chars().next().unwrap_or('\u{fffd}');
                 (Some(c), c.len_utf8())
@@ -1933,7 +1944,7 @@ impl Redactor {
     /// in a copy, the values looked for there, and what they were written as
     /// replaced in `text`.
     fn redact_escaped_known(&self, text: &str) -> String {
-        if !(text.contains("\\u") || text.contains("\\/")) {
+        if !text.contains('\\') {
             return text.to_string();
         }
         let (decoded, origin) = decode_json_escapes(text);
@@ -1999,7 +2010,8 @@ impl Redactor {
         let raw = longest_prefix(text).map(|len| text.len() - len);
         // The same, behind JSON escapes, an escape cut in two at the end
         // left out.
-        let escaped = (text.contains("\\u") || text.contains("\\/"))
+        let escaped = text
+            .contains('\\')
             .then(|| {
                 let whole = UNFINISHED_ESCAPE
                     .find(text)
@@ -3853,5 +3865,37 @@ mod tests {
         rest.push('\u{4e2d}');
         rest.push('"');
         let _ = quoted_value_closes(&rest, "\"");
+    }
+
+    #[test]
+    fn mixed_short_and_unicode_json_escapes_are_redacted_together() {
+        let secret = "top\nmid\r\t\"\\/\u{0008}\u{000c}&end-0123456789";
+        let redactor = Redactor::new(
+            [("MIXED_SECRET", secret)],
+            Vec::<(String, String)>::new(),
+            &[],
+        );
+        // A serializer that keeps JSON short escapes alongside \uXXXX for `&`
+        // (Go/Java) or escaped slash (`\/`): neither raw serde JSON nor
+        // decoding only \uXXXX and \/ matches alone.
+        // Mix short escapes (\n, \r, \t, \\, \b, \f) with \u0022 for `"`
+        // and \u0026 for `&` (e.g. an HTML-safe JSON encoder): neither
+        // encoded_forms nor decoding only \uXXXX and \/ matches alone.
+        let payload = r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-0123456789"}"#;
+        let out = redactor.redact(payload);
+        assert!(!out.contains("0123456789"), "{out}");
+        assert!(out.contains(REDACTED), "{out}");
+
+        // Also with `\"` kept as a short escape while `\n` uses `\u000a`.
+        let payload2 = r#"{"msg":"top\u000amid\r\t\"\\\/\b\f\u0026end-0123456789"}"#;
+        let out2 = redactor.redact(payload2);
+        assert!(!out2.contains("0123456789"), "{out2}");
+        assert!(out2.contains(REDACTED), "{out2}");
+
+        // Also when truncated mid-escape or right after the mixed prefix.
+        let cut = r#"{"msg":"top\nmid\r\t\u0022\\\/\b\f\u0026end-01\u00"#;
+        let out_cut = redactor.redact_truncated(cut);
+        assert!(!out_cut.contains(r"top\nmid"), "{out_cut}");
+        assert!(out_cut.contains(REDACTED), "{out_cut}");
     }
 }
