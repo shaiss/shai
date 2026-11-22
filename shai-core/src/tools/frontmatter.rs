@@ -4,7 +4,7 @@
 /// Parse frontmatter from a markdown file content.
 ///
 /// Frontmatter format:
-/// ```
+/// ```text
 /// ---
 /// name: My Name
 /// description: A short description

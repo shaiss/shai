@@ -18,7 +18,7 @@ pub struct PromptInfo {
 /// Parse a prompt file content to extract name and description from frontmatter.
 ///
 /// Frontmatter format:
-/// ```
+/// ```text
 /// ---
 /// name: My Prompt
 /// description: A short description
@@ -261,18 +261,31 @@ mod tests {
 
     #[test]
     fn test_load_active_prompts() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
-
+        // load_active_prompts resolves names through discover_prompts(), which
+        // reads ~/.config/shai/prompts (and project .shai/prompts). Point HOME
+        // at a temp tree so the test does not depend on the developer's config.
+        let temp_home = TempDir::new().unwrap();
+        let prompts_dir = temp_home
+            .path()
+            .join(".config")
+            .join("shai")
+            .join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
         fs::write(
-            temp_path.join("caveman.md"),
+            prompts_dir.join("caveman.md"),
             "---\nname: caveman\ndescription: Caveman mode\n---\nBe concise.",
         )
         .unwrap();
 
-        let prompts = discover_prompts_in_dir(temp_path);
-        let names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
-        let loaded = load_active_prompts(&names);
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let loaded = load_active_prompts(&["caveman".to_string()]);
+        match previous_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "caveman");
         assert!(loaded[0].1.contains("Be concise."));

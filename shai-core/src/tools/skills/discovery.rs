@@ -34,7 +34,7 @@ impl SkillInfo {
 /// Parse a SKILL.md file content to extract name and description from frontmatter.
 ///
 /// Frontmatter format:
-/// ```
+/// ```text
 /// ---
 /// name: My Skill
 /// description: A short description
