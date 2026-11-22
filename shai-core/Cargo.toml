@@ -34,10 +34,8 @@ tree-sitter-php = "0.23"
 tree-sitter-lua = "0.5"
 tree-sitter-bash = "0.25"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-# Tool system dependencies
+# Tool system dependencies (must stay in [dependencies]; a prior
+# [target.'cfg(unix)'.dependencies] libc stanza accidentally owned these)
 schemars = "1.0.1"
 shai-macros = { path = "../shai-macros" }
 shai-llm = { path = "../shai-llm" }
@@ -59,6 +57,9 @@ oauth2 = "4.4"
 warp = "0.3"
 anyhow = "1.0"
 webbrowser = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.23.0"
