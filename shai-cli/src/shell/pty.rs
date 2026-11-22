@@ -1,4 +1,4 @@
-use libc::c_char;
+use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
@@ -87,21 +87,20 @@ impl ShaiPtyManager {
             return Err("Failed to unlock pty".into());
         }
 
+        // ptsname returns a pointer into libc-owned storage; copy into a
+        // CString before open so the path is NUL-terminated (String::as_ptr
+        // is not). Without that, slave open fails intermittently under CI.
         let slave_name = unsafe {
             let ptr = libc::ptsname(master_fd);
             if ptr.is_null() {
                 libc::close(master_fd);
                 return Err("Failed to get slave pty name".into());
             }
-            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            CString::new(std::ffi::CStr::from_ptr(ptr).to_bytes())
+                .map_err(|_| "Slave pty name contains interior NUL")?
         };
 
-        let slave_fd = unsafe {
-            libc::open(
-                slave_name.as_ptr() as *const c_char,
-                libc::O_RDWR | libc::O_NOCTTY,
-            )
-        };
+        let slave_fd = unsafe { libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if slave_fd == -1 {
             unsafe { libc::close(master_fd) };
             return Err("Failed to open slave pty".into());
@@ -355,11 +354,19 @@ impl Drop for ShaiPtyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
 
+    /// Serialize PTY allocation across this module — parallel tests can exhaust
+    /// `/dev/pts` on constrained CI runners.
+    static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_pty_manager_creation() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pty = ShaiPtyManager::new().unwrap();
 
         // Should have valid file descriptors
@@ -374,6 +381,9 @@ mod tests {
 
     #[test]
     fn test_session_id_format() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pty = ShaiPtyManager::new().unwrap();
         let session_id = pty.get_session_id();
 
@@ -403,6 +413,9 @@ mod tests {
 
     #[test]
     fn test_unique_session_ids() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pty1 = ShaiPtyManager::new().unwrap();
         thread::sleep(Duration::from_millis(1)); // Ensure different timestamp
         let pty2 = ShaiPtyManager::new().unwrap();
@@ -412,6 +425,9 @@ mod tests {
 
     #[test]
     fn test_create_pty_pair() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = ShaiPtyManager::create_pty_pair();
         assert!(result.is_ok());
 
@@ -431,6 +447,9 @@ mod tests {
 
     #[test]
     fn test_pty_pair_communication() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (master_fd, slave_fd) = ShaiPtyManager::create_pty_pair().unwrap();
 
         // Write to master, should be readable from slave
@@ -466,6 +485,9 @@ mod tests {
 
     #[test]
     fn test_multiple_pty_creation() {
+        let _lock = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut ptys = Vec::new();
 
         // Create multiple PTYs
