@@ -39,10 +39,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             binary_name: shai
             asset_name: shai-linux-aarch64
-          #- os: windows-latest
-          #  target: x86_64-pc-windows-msvc
-          #  binary_name: shai.exe
-          #  asset_name: shai-windows-x86_64.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: shai.exe
+            asset_name: shai-windows-x86_64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
             binary_name: shai
@@ -60,6 +60,7 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Install Rust
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         # rustup reads rust-toolchain.toml (1.100.0); do not pass "stable"
@@ -81,6 +82,7 @@ jobs:
       # be restored into a release job and ship into published artifacts.
 
       - name: Build binary
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET"
@@ -98,13 +100,14 @@ jobs:
 
       - name: Prepare binary (Windows)
         if: matrix.os == 'windows-latest'
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           BINARY_NAME: ${{ matrix.binary_name }}
           ASSET: ${{ matrix.asset_name }}
         run: |
           cp "target/${TARGET}/release/${BINARY_NAME}" "$ASSET"
-          shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+          sha256sum "$ASSET" | tee "$ASSET.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -139,12 +142,12 @@ jobs:
             echo "refusing to publish unexpected tag: $TAG" >&2
             exit 1
           fi
-          for f in shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64; do
+          for f in shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64 shai-windows-x86_64.exe; do
             test -f "$f" || { echo "missing asset: $f" >&2; exit 1; }
             test -f "$f.sha256" || { echo "missing builder checksum: $f.sha256" >&2; exit 1; }
             sha256sum -c "$f.sha256"
           done
-          sha256sum shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64 | tee SHA256SUMS
+          sha256sum shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64 shai-windows-x86_64.exe | tee SHA256SUMS
           NOTES="shaiss/shai ${TAG} at ${SHA}"
           if gh release view -R "$GITHUB_REPOSITORY" "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists; refusing to overwrite" >&2
@@ -154,4 +157,5 @@ jobs:
             --title "$TAG" \
             --notes "$NOTES" \
             shai-linux-x86_64 shai-linux-aarch64 shai-macos-x86_64 shai-macos-aarch64 \
+            shai-windows-x86_64.exe \
             SHA256SUMS
