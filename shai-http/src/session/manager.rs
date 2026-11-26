@@ -125,12 +125,12 @@ impl SessionManager {
 
         // Build the agent from the startup config snapshot so a later edit
         // of the auth file cannot change credentials mid-server.
-        let builder = AgentBuilder::create_with_primary(
-            agent_name.clone().filter(|name| name != "default"),
-            self.primary.as_deref(),
-        )
-        .await
-        .map_err(|e| AgentError::ExecutionError(format!("Failed to create agent: {}", e)))?;
+        let builder =
+            AgentBuilder::create_with_primary(agent_name.clone(), self.primary.as_deref())
+                .await
+                .map_err(|e| {
+                    AgentError::ExecutionError(format!("Failed to create agent: {}", e))
+                })?;
 
         let mut agent = self.prepare_agent(builder, trace).build();
 
@@ -760,6 +760,143 @@ mod tests {
             missing_err.contains("missing-default"),
             "unexpected error: {missing_err}"
         );
+
+        restore();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn literal_default_agent_is_loaded_when_configured_and_primary_when_unset() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = scratch_dir();
+        let shai_dir = dir.join("config").join("shai");
+        let agents_dir = shai_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // Broken auth file ensures AgentBuilder::default_from(None) fails if reached.
+        std::fs::write(shai_dir.join("auth.config.json"), "{ not valid json").unwrap();
+
+        let keys = [
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "SHAI_SESSION_PERSIST_ENABLE",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "OPENAI_API_KEY",
+        ];
+        let prev: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        std::env::set_var("HOME", dir.join("home"));
+        std::env::set_var("SHAI_SESSION_PERSIST_ENABLE", "false");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let restore = || {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        };
+
+        // 1. When default_agent is Some("default") and default.config.json does not exist,
+        // both None and Some("default") must try to load agent "default" (fail, not fall back).
+        let literal_default_missing = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot_with_key("k"))),
+            default_agent: Some("default".to_string()),
+            ..SessionManagerConfig::default()
+        });
+        for (req_id, sid, arg) in [
+            ("req-lit-none", "sess-lit-none-miss", None),
+            (
+                "req-lit-def",
+                "sess-lit-def-miss",
+                Some("default".to_string()),
+            ),
+        ] {
+            let err = match literal_default_missing
+                .create_new_session(req_id, sid, arg, true)
+                .await
+            {
+                Ok(_) => {
+                    restore();
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!(
+                        "default_agent=Some(\"default\") must not fall back to built-in primary"
+                    );
+                }
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("default"),
+                "expected error referencing 'default', got: {err}"
+            );
+        }
+
+        // 2. When default.config.json exists with its own provider, default_agent=Some("default")
+        // loads it for both None and Some("default") requests even with no usable primary auth file.
+        std::fs::write(
+            agents_dir.join("default.config.json"),
+            r#"{
+                "name": "default",
+                "description": "configured literal default agent",
+                "llm_provider": {
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k-default"},
+                    "model": "default-agent-model",
+                    "tool_method": "FunctionCall"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let literal_default_ok = SessionManager::new(SessionManagerConfig {
+            primary: None,
+            default_agent: Some("default".to_string()),
+            ..SessionManagerConfig::default()
+        });
+        for (req_id, sid, arg) in [
+            ("req-lit-ok-none", "sess-lit-ok-none", None),
+            (
+                "req-lit-ok-def",
+                "sess-lit-ok-def",
+                Some("default".to_string()),
+            ),
+        ] {
+            let session = literal_default_ok
+                .create_new_session(req_id, sid, arg, true)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("default_agent=Some(\"default\") should load default.config.json: {e}")
+                });
+            assert_eq!(session.agent_name, "default");
+            let _ = literal_default_ok
+                .cancel_session(&req_id.to_string(), sid)
+                .await;
+        }
+
+        // 3. When default_agent is None, None and Some("default") still fall back to built-in
+        // primary (ignoring any default.config.json).
+        let primary_only = SessionManager::new(SessionManagerConfig {
+            primary: Some(Arc::new(snapshot_with_key("k"))),
+            default_agent: None,
+            ..SessionManagerConfig::default()
+        });
+        for (req_id, sid, arg) in [
+            ("req-prim-none", "sess-prim-none", None),
+            ("req-prim-def", "sess-prim-def", Some("default".to_string())),
+        ] {
+            let session = primary_only
+                .create_new_session(req_id, sid, arg, true)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("default_agent=None should fall back to built-in primary: {e}")
+                });
+            assert_eq!(session.agent_name, "default");
+            let _ = primary_only.cancel_session(&req_id.to_string(), sid).await;
+        }
 
         restore();
         let _ = std::fs::remove_dir_all(&dir);

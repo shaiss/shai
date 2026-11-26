@@ -101,18 +101,41 @@ fn shai_serve_starts_with_valid_named_agent() {
 
     let mut child = command.spawn().expect("the shai binary should start");
     let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let started = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(Ok(line.clone())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen_default_agent = false;
     let mut seen_listening = false;
     let mut collected = String::new();
-    let mut line = String::new();
+    let mut timed_out = false;
+    let mut read_err = None;
 
-    while started.elapsed() < Duration::from_secs(5) {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            timed_out = true;
+            break;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
                 collected.push_str(&line);
                 if line.contains("Default agent:") && line.contains("reviewer") {
                     seen_default_agent = true;
@@ -122,15 +145,28 @@ fn shai_serve_starts_with_valid_named_agent() {
                     break;
                 }
             }
-            Err(err) => panic!("failed reading serve stdout: {err}"),
+            Ok(Err(err)) => {
+                read_err = Some(err);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
     let _ = child.kill();
     let _ = child.wait();
+    drop(rx);
+    let _ = reader_thread.join();
 
+    if let Some(err) = read_err {
+        panic!("failed reading serve stdout: {err}");
+    }
     assert!(
-        seen_default_agent && seen_listening,
-        "expected Default agent: reviewer and Server starting on; stdout={collected}"
+        !timed_out && seen_default_agent && seen_listening,
+        "timed_out={timed_out}; expected Default agent: reviewer and Server starting on; stdout={collected}"
     );
 }
