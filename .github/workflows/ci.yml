@@ -31,6 +31,7 @@ jobs:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -41,10 +42,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             binary_name: shai
             asset_name: shai-linux-aarch64
-#          - os: windows-latest
-#            target: x86_64-pc-windows-msvc
-#            binary_name: shai.exe
-#            asset_name: shai-windows-x86_64.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: shai.exe
+            asset_name: shai-windows-x86_64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
             binary_name: shai
@@ -73,6 +74,7 @@ jobs:
       # dtolnay step (installed for `stable`) is not on the active toolchain.
       # Install the pinned toolchain and add the target to it on every runner.
       - name: Add target to pinned toolchain
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -104,6 +106,7 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-target-
 
       - name: Build binary
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare binary (Unix)
@@ -114,6 +117,7 @@ jobs:
 
       - name: Prepare binary (Windows)
         if: matrix.os == 'windows-latest'
+        shell: bash
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
