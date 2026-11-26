@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::headless::tools::ToolConfig;
-use crate::session_options::SessionOptions;
+use crate::session_options::{SessionOptions, SessionStartError};
 
 use super::tools::{list_all_tools, restrict_toolbox, ToolName};
 use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
@@ -66,7 +66,7 @@ impl AppHeadless {
         trace: bool,
         agent_name: Option<String>,
         yes: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), SessionStartError> {
         // Configure internal debug logging to file
         /*
         let _ = LoggingConfig::default()
@@ -85,10 +85,17 @@ impl AppHeadless {
         }
 
         let mut agent = if let Some(agent_name) = agent_name {
-            // Use custom agent from config
-            let mut builder = AgentBuilder::create(Some(agent_name.clone()))
+            // Load the agent config directly so a PrimaryConfigError (for example
+            // an omitted `llm_provider` with `anonymous_fallback: deny` and no
+            // primary config) stays typed and exits 2 (#67).
+            let config = AgentConfig::load_with_primary_result(
+                &agent_name,
+                self.session_options.startup_primary_ref(),
+            )
+            .map_err(|e| SessionStartError::from_start(Some(&agent_name), e))?;
+            let mut builder = AgentBuilder::from_config(config)
                 .await
-                .map_err(|e| format!("Failed to create agent: {}", e))?;
+                .map_err(|e| SessionStartError::from_start(Some(&agent_name), e.into()))?;
 
             // --tools / --remove narrow the agent's own tools, never widen them
             if tools.is_some() || remove.is_some() {
@@ -96,7 +103,8 @@ impl AppHeadless {
                     std::mem::take(&mut builder.available_tools),
                     tools.as_deref(),
                     remove.as_deref(),
-                )?;
+                )
+                .map_err(|e| SessionStartError::other(e.to_string()))?;
                 for tool in missing {
                     eprintln!(
                         "Warning: agent '{}' does not provide tool '{}', ignoring it",
@@ -112,14 +120,11 @@ impl AppHeadless {
             // One load of the config, which also builds the primary model:
             // a file that breaks after the start-up check stops the run
             // instead of falling back to the built-in default.
-            let config = match SessionOptions::primary_config() {
-                Ok(config) => config,
-                Err(problem) => {
-                    eprintln!("error: {}", problem);
-                    std::process::exit(2);
-                }
-            };
-            let (llm_client, model) = config.get_llm_from_config().await?;
+            let config = self.session_options.startup_primary_config()?;
+            let (llm_client, model) = config
+                .get_llm_from_config()
+                .await
+                .map_err(|e| SessionStartError::other(e.to_string()))?;
             eprintln!(
                 "\x1b[2m░ {} on {}\x1b[0m",
                 model,
@@ -129,7 +134,8 @@ impl AppHeadless {
             // Handle tool selection if needed
             if tools.is_some() || remove.is_some() {
                 // Need custom tool configuration
-                let tools = ToolConfig::from_args(tools.as_deref(), remove.as_deref())?;
+                let tools = ToolConfig::from_args(tools.as_deref(), remove.as_deref())
+                    .map_err(|e| SessionStartError::other(e.to_string()))?;
 
                 let toolbox = tools.build_toolbox();
                 let brain: Box<dyn Brain> = match self.kind {
@@ -172,37 +178,49 @@ impl AppHeadless {
             .run()
             .await;
 
-        match result {
-            Ok(AgentResult {
-                success: _success,
-                message: _message,
-                trace: agent_trace,
-            }) => {
-                // TODO: use `success` to set exit code and `message` for summary output
-                if trace {
-                    println!("{}", serde_json::to_string_pretty(&agent_trace)?);
-                } else {
-                    if let Some(message) = agent_trace.last() {
-                        match message {
-                            ChatMessage::Assistant {
-                                content: Some(ChatMessageContent::Text(content)),
-                                ..
-                            } => {
-                                println!("{}", content);
-                            }
-                            ChatMessage::Tool { content, .. } => {
-                                println!("{}", content);
-                            }
-                            _ => {}
-                        }
+        finish_headless_run(result, trace).map_err(|e| SessionStartError::other(e.to_string()))
+    }
+}
+
+/// Print the headless result and return an error when the agent did not
+/// succeed, so the process exits non-zero. Exit 0 used to be returned
+/// after `Agent failed: …` as well.
+fn finish_headless_run(
+    result: Result<AgentResult, AgentError>,
+    trace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match result {
+        Ok(AgentResult {
+            success,
+            message: _,
+            trace: agent_trace,
+        }) => {
+            if trace {
+                println!("{}", serde_json::to_string_pretty(&agent_trace)?);
+            } else if let Some(message) = agent_trace.last() {
+                match message {
+                    ChatMessage::Assistant {
+                        content: Some(ChatMessageContent::Text(content)),
+                        ..
+                    } => {
+                        println!("{}", content);
                     }
+                    ChatMessage::Tool { content, .. } => {
+                        println!("{}", content);
+                    }
+                    _ => {}
                 }
             }
-            Err(e) => {
-                eprintln!("Agent failed: {}", e);
+            if !success {
+                eprintln!("Agent failed");
+                return Err("agent did not succeed".into());
             }
+            Ok(())
         }
-        Ok(())
+        Err(e) => {
+            eprintln!("Agent failed: {}", e);
+            Err(e.into())
+        }
     }
 }
 
@@ -383,5 +401,28 @@ mod tests {
         .await;
         assert!(!prompted);
         assert!(target.exists(), "write did not run with --yes");
+    }
+
+    #[test]
+    fn finish_headless_run_errors_when_the_agent_does_not_succeed() {
+        let failed = AgentResult {
+            success: false,
+            message: "Agent completed".to_string(),
+            trace: vec![],
+        };
+        let error =
+            finish_headless_run(Ok(failed), false).expect_err("success: false must not exit 0");
+        assert!(error.to_string().contains("did not succeed"), "{error}");
+
+        let error = finish_headless_run(Err(AgentError::ExecutionError("boom".into())), false)
+            .expect_err("Agent failed must not exit 0");
+        assert!(error.to_string().contains("boom"), "{error}");
+
+        let ok = AgentResult {
+            success: true,
+            message: "Agent completed".to_string(),
+            trace: vec![],
+        };
+        finish_headless_run(Ok(ok), false).expect("a successful run still exits 0");
     }
 }

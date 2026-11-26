@@ -55,12 +55,18 @@ impl AgentBuilder {
         match config_name {
             Some(name) => {
                 let config = AgentConfig::load_with_primary(&name, primary).map_err(|e| {
-                    AgentError::ConfigurationError(format!(
-                        "Failed to load agent '{}': {}",
-                        name, e
-                    ))
+                    if let Some(primary_err) =
+                        e.downcast_ref::<crate::config::roles::PrimaryConfigError>()
+                    {
+                        AgentError::PrimaryConfig(primary_err.clone())
+                    } else {
+                        AgentError::ConfigurationError(format!(
+                            "Failed to load agent '{}': {}",
+                            name, e
+                        ))
+                    }
                 })?;
-                Self::from_config(config).await
+                Self::from_config_with_primary(config, primary).await
             }
             None => Self::default_from(primary).await,
         }
@@ -77,8 +83,8 @@ impl AgentBuilder {
         // Same rule as the TUI and headless mode: the built-in default is
         // used only when there is no config file. A file that is there and
         // cannot be read is an error, never a silent fallback.
-        let config = ShaiConfig::from_snapshot_or_primary(primary)
-            .map_err(AgentError::ConfigurationError)?;
+        let config =
+            ShaiConfig::from_snapshot_or_primary(primary).map_err(AgentError::PrimaryConfig)?;
         let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;
@@ -259,7 +265,29 @@ impl AgentBuilder {
     }
 
     /// Create an AgentBuilder from an AgentConfig
-    pub async fn from_config(mut config: AgentConfig) -> Result<Self, AgentError> {
+    pub async fn from_config(config: AgentConfig) -> Result<Self, AgentError> {
+        Self::from_config_with_primary(config, None).await
+    }
+
+    async fn from_config_with_primary(
+        mut config: AgentConfig,
+        primary: Option<&ShaiConfig>,
+    ) -> Result<Self, AgentError> {
+        let loaded;
+        let primary_res = match primary {
+            Some(cfg) => Ok(cfg),
+            None => {
+                loaded = ShaiConfig::load_for_roles()
+                    .map_err(crate::config::roles::PrimaryConfigError::from_role_error);
+                loaded.as_ref()
+            }
+        };
+        ShaiConfig::enforce_provider_anonymous_fallback(
+            &config.llm_provider.provider,
+            &config.llm_provider.env_vars,
+            primary_res,
+        )?;
+
         // Same resolution as a primary replacement: original user env, then
         // this agent's env_vars, and the model from the agent file. Do not
         // use create_provider, which would inherit a live primary's export.
@@ -687,6 +715,126 @@ mod tests {
         }
 
         kept.expect("a named replacement must keep a key the user exported");
+    }
+
+    fn named_anonymous_ovh(env_vars: serde_json::Value) -> AgentConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "anon",
+            "description": "explicit keyless ovhcloud",
+            "llm_provider": {
+                "provider": "ovhcloud",
+                "env_vars": env_vars,
+                "model": "qwen3-32b",
+                "tool_method": "FunctionCall"
+            }
+        }))
+        .expect("named ovh agent should deserialize")
+    }
+
+    #[test]
+    fn from_config_refuses_explicit_anonymous_ovh_under_deny_or_invalid_policy() {
+        let _xdg = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = ENV_TEST_LOCK.blocking_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shai_dir = dir.path().join("shai");
+        std::fs::create_dir_all(&shai_dir).unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        // 1) SHAI_ANONYMOUS_FALLBACK=deny refuses keyless ovhcloud in AgentBuilder::from_config
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+        let res = rt.block_on(AgentBuilder::from_config(named_anonymous_ovh(
+            serde_json::json!({}),
+        )));
+        assert!(
+            res.is_err(),
+            "from_config must refuse keyless ovhcloud under env deny"
+        );
+
+        // Keyed ovhcloud still succeeds under deny
+        rt.block_on(AgentBuilder::from_config(named_anonymous_ovh(
+            serde_json::json!({"OVH_API_KEY": "k"}),
+        )))
+        .expect("keyed ovhcloud must still build under deny");
+
+        // 2) auth.config.json anonymous_fallback=deny refuses keyless ovhcloud
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+        std::fs::write(
+            shai_dir.join("auth.config.json"),
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+        )
+        .unwrap();
+        let res = rt.block_on(AgentBuilder::from_config(named_anonymous_ovh(
+            serde_json::json!({}),
+        )));
+        assert!(
+            res.is_err(),
+            "from_config must refuse keyless ovhcloud under config deny"
+        );
+
+        // 3) Invalid policy refuses
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "bogus");
+        let res = rt.block_on(AgentBuilder::from_config(named_anonymous_ovh(
+            serde_json::json!({}),
+        )));
+        assert!(res.is_err(), "from_config must refuse under invalid policy");
+
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+    }
+
+    #[test]
+    fn create_none_under_deny_preserves_primary_config_error() {
+        let _xdg = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = ENV_TEST_LOCK.blocking_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        let result = rt.block_on(AgentBuilder::create(None));
+
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+
+        match result {
+            Err(AgentError::PrimaryConfig(error)) => {
+                assert!(error.is_refused_start(), "{error}");
+            }
+            Err(other) => panic!("expected PrimaryConfig, got {other}"),
+            Ok(_) => panic!("expected PrimaryConfig, create(None) succeeded"),
+        }
     }
 
     #[tokio::test]

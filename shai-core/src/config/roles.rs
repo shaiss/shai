@@ -37,6 +37,10 @@
 //! is reported by the provider on first use, and nothing here substitutes
 //! another model for it.
 
+use super::anonymous_fallback::{
+    deny_message, env_anonymous_fallback, resolve_anonymous_fallback, AnonymousFallbackMode,
+    FallbackSituation,
+};
 use super::config::{ProviderConfig, ShaiConfig};
 use super::section::{RawSection, Repeated};
 use serde::de::{MapAccess, Visitor};
@@ -555,6 +559,43 @@ fn describe_load_error(error: &(dyn std::error::Error + 'static)) -> String {
     }
 }
 
+/// Why [`ShaiConfig::primary`] could not load or allow a config for the session.
+///
+/// Every variant is a refused start: front-ends map this to process exit code 2.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrimaryConfigError {
+    /// There is no config file and `anonymous_fallback` is `deny`.
+    #[error("No config found (no 3rd-party API configured). Anonymous fallback is disabled. Run `shai auth` to configure a provider.")]
+    Missing,
+
+    /// The config file exists but could not be read or parsed.
+    #[error("the config file {path} could not be loaded ({reason})")]
+    Invalid { path: String, reason: String },
+
+    /// The file or setting refused startup (for example `anonymous_fallback: deny`
+    /// with anonymous OVH, an invalid `anonymous_fallback` value, or a broken
+    /// `roles` section).
+    #[error("{0}")]
+    Other(String),
+}
+
+impl PrimaryConfigError {
+    /// Convert a [`RoleError`] from loading the auth config into a typed
+    /// [`PrimaryConfigError`], preserving missing vs. unreadable distinctions.
+    pub fn from_role_error(error: RoleError) -> Self {
+        match error {
+            RoleError::ConfigMissing => Self::Missing,
+            RoleError::ConfigInvalid { path, reason } => Self::Invalid { path, reason },
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// A missing/refused or unusable auth config is a refused start (exit 2).
+    pub fn is_refused_start(&self) -> bool {
+        true
+    }
+}
+
 impl ShaiConfig {
     /// Why the user's config file cannot be loaded, if it is there and does
     /// not load: its path and what is wrong with it, without repeating
@@ -568,32 +609,103 @@ impl ShaiConfig {
 
     /// The config the primary model runs on, loaded once.
     ///
-    /// The built-in default stands in only when there is no config file. A
-    /// file that is there and cannot be read is an error, never a silent
-    /// fallback to that default.
-    pub fn primary() -> Result<ShaiConfig, String> {
+    /// When there is no config file, behavior follows `anonymous_fallback`:
+    /// `prompt` uses the built-in default, while `deny` (or an invalid setting)
+    /// refuses to start. A file that is there and cannot be read is always an
+    /// error, never a silent fallback to that default.
+    pub fn primary() -> Result<ShaiConfig, PrimaryConfigError> {
         Self::primary_from(Self::load_for_roles())
     }
 
     /// The caller's already-loaded config, or a fresh [`ShaiConfig::primary`]
     /// load if they have not passed one. Serve uses this so HTTP sessions
     /// keep the startup snapshot instead of reading the file again.
-    pub fn from_snapshot_or_primary(primary: Option<&ShaiConfig>) -> Result<ShaiConfig, String> {
+    pub fn from_snapshot_or_primary(
+        primary: Option<&ShaiConfig>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         match primary {
-            Some(config) => Ok(config.clone()),
+            Some(config) => Self::primary_from(Ok(config.clone())),
             None => Self::primary(),
         }
     }
 
-    /// [`ShaiConfig::primary`] from an already-attempted load.
-    pub fn primary_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
+    /// Enforce `anonymous_fallback` policy for an explicit provider (e.g. from
+    /// a named agent config). Invalid policies always refuse; `deny` refuses
+    /// when the provider resolves to anonymous OVH; a broken auth config also
+    /// refuses anonymous OVH instead of failing open.
+    pub fn enforce_provider_anonymous_fallback(
+        provider: &str,
+        env_vars: &std::collections::HashMap<String, String>,
+        primary: Result<&ShaiConfig, &PrimaryConfigError>,
+    ) -> Result<(), PrimaryConfigError> {
+        let env_setting = env_anonymous_fallback();
+        let config_setting = primary
+            .as_ref()
+            .ok()
+            .and_then(|config| config.anonymous_fallback.as_deref());
+        let resolution = resolve_anonymous_fallback(config_setting, env_setting.as_deref());
+        if let Some(message) = resolution.invalid {
+            return Err(PrimaryConfigError::Other(message));
+        }
+        if Self::provider_is_anonymous_ovh(provider, env_vars) {
+            if let Err(err) = primary {
+                if !matches!(err, PrimaryConfigError::Missing) {
+                    return Err(err.clone());
+                }
+            }
+            if resolution.mode == AnonymousFallbackMode::Deny {
+                return Err(PrimaryConfigError::Other(deny_message(
+                    FallbackSituation::AnonymousOvh,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`ShaiConfig::primary`] from an already-attempted load, reading the
+    /// environment override for `anonymous_fallback`.
+    pub fn primary_from(
+        config: Result<ShaiConfig, RoleError>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
+        let env_setting = env_anonymous_fallback();
+        Self::primary_from_with_env(config, env_setting.as_deref())
+    }
+
+    /// [`ShaiConfig::primary_from`] with an explicit environment override value.
+    pub fn primary_from_with_env(
+        config: Result<ShaiConfig, RoleError>,
+        env_setting: Option<&str>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         match config {
-            Ok(config) => Ok(config),
-            Err(RoleError::ConfigMissing) => Ok(ShaiConfig::default()),
-            Err(RoleError::ConfigInvalid { path, reason }) => Err(format!(
-                "the config file {path} could not be loaded ({reason})"
-            )),
-            Err(error) => Err(error.to_string()),
+            Ok(config) => {
+                let resolution =
+                    resolve_anonymous_fallback(config.anonymous_fallback.as_deref(), env_setting);
+                if let Some(message) = resolution.invalid {
+                    return Err(PrimaryConfigError::Other(message));
+                }
+                if resolution.mode == AnonymousFallbackMode::Deny
+                    && config.selected_is_anonymous_ovh()
+                {
+                    return Err(PrimaryConfigError::Other(deny_message(
+                        FallbackSituation::AnonymousOvh,
+                    )));
+                }
+                Ok(config)
+            }
+            Err(RoleError::ConfigMissing) => {
+                let resolution = resolve_anonymous_fallback(None, env_setting);
+                if let Some(message) = resolution.invalid {
+                    return Err(PrimaryConfigError::Other(message));
+                }
+                match resolution.mode {
+                    AnonymousFallbackMode::Deny => Err(PrimaryConfigError::Missing),
+                    AnonymousFallbackMode::Prompt => Ok(ShaiConfig::default()),
+                }
+            }
+            Err(RoleError::ConfigInvalid { path, reason }) => {
+                Err(PrimaryConfigError::Invalid { path, reason })
+            }
+            Err(error) => Err(PrimaryConfigError::Other(error.to_string())),
         }
     }
 
@@ -601,7 +713,7 @@ impl ShaiConfig {
     pub fn primary_from_paths(
         config_path: &std::path::Path,
         legacy_path: &std::path::Path,
-    ) -> Result<ShaiConfig, String> {
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
         Self::primary_from(Self::load_for_roles_from(config_path, legacy_path))
     }
 
@@ -877,6 +989,7 @@ mod tests {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::from_pairs(roles.iter().copied()),
             prewalk: Default::default(),
+            anonymous_fallback: None,
             advisor: Default::default(),
         }
     }
@@ -1082,31 +1195,63 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_config_defaults_only_when_the_file_is_missing() {
+    fn the_primary_config_respects_anonymous_fallback_setting() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("auth.config.json");
         let legacy = dir.path().join("auth.config");
 
-        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
+        // Missing file under default prompt mode falls back to default.
+        let primary = ShaiConfig::primary_from_with_env(
+            ShaiConfig::load_for_roles_from(&path, &legacy),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             primary.providers[0].provider,
             ShaiConfig::default().providers[0].provider
         );
+
+        // Missing file under deny or invalid setting refuses with PrimaryConfigError.
+        let err = ShaiConfig::primary_from_with_env(
+            ShaiConfig::load_for_roles_from(&path, &legacy),
+            Some("deny"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PrimaryConfigError::Missing), "{err:?}");
+        assert!(err.is_refused_start());
+
+        let err = ShaiConfig::primary_from_with_env(
+            ShaiConfig::load_for_roles_from(&path, &legacy),
+            Some("allow"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PrimaryConfigError::Other(_)), "{err:?}");
+        assert!(err.to_string().contains(r#"expected "prompt" or "deny""#));
 
         std::fs::write(
             &path,
             r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0}"#,
         )
         .unwrap();
-        let primary = ShaiConfig::primary_from_paths(&path, &legacy).unwrap();
+        let primary = ShaiConfig::primary_from_with_env(
+            ShaiConfig::load_for_roles_from(&path, &legacy),
+            Some("deny"),
+        )
+        .unwrap();
         assert_eq!(primary.providers[0].provider, "openai");
         assert_eq!(primary.providers[0].model, "gpt-4o");
 
         std::fs::write(&path, "{ this is not json").unwrap();
         let error = ShaiConfig::primary_from_paths(&path, &legacy).unwrap_err();
-        assert!(error.contains("auth.config.json"), "{error}");
-        assert!(error.contains("could not be loaded"), "{error}");
-        assert!(!error.to_lowercase().contains("ovh"), "{error}");
+        assert!(
+            matches!(error, PrimaryConfigError::Invalid { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_refused_start());
+        let msg = error.to_string();
+        assert!(msg.contains("auth.config.json"), "{msg}");
+        assert!(msg.contains("could not be loaded"), "{msg}");
+        assert!(!msg.to_lowercase().contains("ovh"), "{msg}");
 
         // A caller that already holds a good snapshot must not reread the
         // now-broken file.

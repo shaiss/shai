@@ -58,6 +58,11 @@ pub struct ShaiConfig {
     pub roles: RolesConfig,
     /// One-shot handoff to another model, see [`crate::config::prewalk`].
     pub prewalk: Lenient<PrewalkConfig>,
+    /// How to handle a missing config or an anonymous OVH provider.
+    /// Unset means the built-in default (`prompt`). Stored as a raw string so
+    /// an unrecognized value can be rejected after load instead of failing
+    /// the rest of the file (or silently becoming the default).
+    pub anonymous_fallback: Option<String>,
     /// Second model that reviews the agent's work, see [`crate::config::advisor`].
     pub advisor: Lenient<AdvisorConfig>,
 }
@@ -78,6 +83,9 @@ impl Serialize for ShaiConfig {
         map.serialize_entry("mcp_configs", &self.mcp_configs)?;
         self.roles.section().write("roles", &mut map)?;
         self.prewalk.section().write("prewalk", &mut map)?;
+        if let Some(ref fallback) = self.anonymous_fallback {
+            map.serialize_entry("anonymous_fallback", fallback)?;
+        }
         self.advisor.section().write("advisor", &mut map)?;
         map.end()
     }
@@ -113,6 +121,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                 let mut mcp_configs = None;
                 let mut roles = RolesConfig::default();
                 let mut prewalk = Lenient::unset();
+                let mut anonymous_fallback: Option<Option<String>> = None;
                 let mut advisor = Lenient::unset();
 
                 while let Some(key) = map.next_key::<String>()? {
@@ -122,6 +131,20 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                             once(&mut selected_provider, "selected_provider", &mut map)?
                         }
                         "mcp_configs" => once(&mut mcp_configs, "mcp_configs", &mut map)?,
+                        "anonymous_fallback" => {
+                            let raw = map.next_value::<Option<serde_json::Value>>()?;
+                            if anonymous_fallback.is_some() {
+                                return Err(de::Error::duplicate_field("anonymous_fallback"));
+                            }
+                            // JSON null must not collapse to "unset" (which
+                            // would default to prompt). Keep an invalid
+                            // placeholder so resolution fails closed.
+                            anonymous_fallback = Some(Some(match raw {
+                                None => "null".to_string(),
+                                Some(serde_json::Value::String(s)) => s,
+                                Some(other) => other.to_string(),
+                            }));
+                        }
                         // Optional sections: every copy is kept as text.
                         "roles" => roles.section_mut().push(map.next_value()?),
                         "prewalk" => prewalk.section_mut().push(map.next_value()?),
@@ -139,6 +162,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                     mcp_configs: mcp_configs.unwrap_or_default(),
                     roles,
                     prewalk,
+                    anonymous_fallback: anonymous_fallback.flatten(),
                     advisor,
                 })
             }
@@ -296,10 +320,11 @@ impl ShaiConfig {
             .unwrap_or(false)
     }
 
-    /// Load the config, falling back to the default one.
+    /// Load the config, or the built-in default as an in-memory template.
     ///
+    /// Used by the auth wizard so a first `shai auth` has something to show.
     /// Returns a warning message only when a config file exists but could not
-    /// be loaded; a missing file is the normal first-run case.
+    /// be loaded; the default is not written unless the user saves.
     pub fn load_or_default() -> (ShaiConfig, Option<String>) {
         match Self::load() {
             Ok(config) => (config, None),
@@ -328,6 +353,10 @@ impl ShaiConfig {
                 std::env::set_var(name, value);
             };
             for (name, value) in &provider_config.env_vars {
+                // Launch policy must not be overwritten by a provider entry.
+                if name.eq_ignore_ascii_case("SHAI_ANONYMOUS_FALLBACK") {
+                    continue;
+                }
                 set(name, value);
             }
             // Set model-specific environment variable if model is specified
@@ -449,6 +478,36 @@ impl ShaiConfig {
     pub fn has_mcp_config(&self, name: &str) -> bool {
         self.mcp_configs.contains_key(name)
     }
+
+    /// True when the selected provider is OVHcloud with no effective
+    /// `OVH_API_KEY`: an explicit blank in the entry wins, a live provider's
+    /// export is ignored, and only `OVH_API_KEY` is consulted, from the same
+    /// original-user-plus-entry environment used to build the client.
+    pub fn selected_is_anonymous_ovh(&self) -> bool {
+        let Some(provider) = self.get_selected_provider() else {
+            return false;
+        };
+        Self::provider_is_anonymous_ovh(&provider.provider, &provider.env_vars)
+    }
+
+    /// True when this provider entry would talk to OVHcloud anonymously.
+    pub fn provider_is_anonymous_ovh(provider: &str, env_vars: &HashMap<String, String>) -> bool {
+        if provider != "ovhcloud" {
+            return false;
+        }
+        let env = Self::env_vars_for_llm(env_vars);
+        !env.get(env_map_key("OVH_API_KEY").as_ref())
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+/// Whether an API key is set on the provider. Only the presence of a
+/// non-empty `*_API_KEY` value is checked, never the value itself.
+pub fn provider_has_api_key(provider: &ProviderConfig) -> bool {
+    provider
+        .env_vars
+        .iter()
+        .any(|(name, value)| name.ends_with("_API_KEY") && !value.trim().is_empty())
 }
 
 impl Default for ShaiConfig {
@@ -470,6 +529,7 @@ impl Default for ShaiConfig {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
             prewalk: Lenient::unset(),
+            anonymous_fallback: None,
             advisor: Lenient::unset(),
         }
     }
@@ -477,10 +537,7 @@ impl Default for ShaiConfig {
 
 impl ShaiConfig {
     pub async fn get_llm() -> Result<(LlmClient, String), Box<dyn std::error::Error>> {
-        let config = ShaiConfig::load().unwrap_or_else(|e| {
-            tracing::warn!("Failed to load config, using default: {}", e);
-            ShaiConfig::default()
-        });
+        let config = ShaiConfig::primary()?;
         config.get_llm_from_config().await
     }
 
@@ -606,6 +663,7 @@ mod tests {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
             prewalk: Lenient::unset(),
+            anonymous_fallback: None,
             advisor: Lenient::unset(),
         };
         config.add_provider(
@@ -967,5 +1025,146 @@ mod tests {
         let (_, model) =
             built.expect("llm_from_config must not panic on an unrelated non-UTF-8 variable");
         assert_eq!(model, "test-model");
+    }
+
+    #[test]
+    fn anonymous_fallback_key_round_trip_and_invalid() {
+        use crate::config::anonymous_fallback::{
+            resolve_anonymous_fallback, AnonymousFallbackMode, AnonymousFallbackSource,
+        };
+
+        let missing: ShaiConfig =
+            serde_json::from_str(r#"{"providers":[],"selected_provider":0}"#).unwrap();
+        assert_eq!(missing.anonymous_fallback, None);
+        assert!(serde_json::to_value(&missing)
+            .unwrap()
+            .get("anonymous_fallback")
+            .is_none());
+
+        let deny: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+        )
+        .unwrap();
+        assert_eq!(deny.anonymous_fallback.as_deref(), Some("deny"));
+        assert_eq!(
+            serde_json::to_value(&deny).unwrap()["anonymous_fallback"],
+            "deny"
+        );
+
+        let numeric: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[],"selected_provider":0,"anonymous_fallback":1}"#,
+        )
+        .unwrap();
+        let res = resolve_anonymous_fallback(numeric.anonymous_fallback.as_deref(), None);
+        assert_eq!(res.mode, AnonymousFallbackMode::Deny);
+        assert_eq!(res.source, AnonymousFallbackSource::Config);
+        assert!(res.invalid.is_some());
+
+        let dup = serde_json::from_str::<ShaiConfig>(
+            r#"{"providers":[],"selected_provider":0,"anonymous_fallback":"prompt","anonymous_fallback":"deny"}"#,
+        );
+        assert!(dup.is_err());
+
+        let null_cfg = serde_json::from_str::<ShaiConfig>(
+            r#"{"providers":[],"selected_provider":0,"anonymous_fallback":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null_cfg.anonymous_fallback.as_deref(), Some("null"));
+        let res = resolve_anonymous_fallback(null_cfg.anonymous_fallback.as_deref(), None);
+        assert_eq!(res.mode, AnonymousFallbackMode::Deny);
+        assert_eq!(res.source, AnonymousFallbackSource::Config);
+        assert!(res.invalid.is_some());
+        let msg = res.invalid.unwrap();
+        assert!(msg.contains("expected \"prompt\" or \"deny\""), "{msg}");
+        assert!(!msg.contains("null"), "{msg}");
+
+        let object_cfg = serde_json::from_str::<ShaiConfig>(
+            r#"{"providers":[],"selected_provider":0,"anonymous_fallback":{"api_key":"sk-should-not-be-echoed"}}"#,
+        )
+        .unwrap();
+        let res = resolve_anonymous_fallback(object_cfg.anonymous_fallback.as_deref(), None);
+        assert_eq!(res.mode, AnonymousFallbackMode::Deny);
+        let msg = res.invalid.unwrap();
+        assert!(msg.contains("expected \"prompt\" or \"deny\""), "{msg}");
+        assert!(!msg.contains("sk-should-not-be-echoed"), "{msg}");
+        assert!(!msg.contains("api_key"), "{msg}");
+    }
+
+    #[test]
+    fn selected_is_anonymous_ovh_detects_keyless_ovh() {
+        let _guard = crate::config::test_env::ENV_TEST_LOCK.blocking_lock();
+        let previous = std::env::var_os("OVH_API_KEY");
+        std::env::remove_var("OVH_API_KEY");
+
+        let def = ShaiConfig::default();
+        assert!(def.selected_is_anonymous_ovh());
+
+        let keyed = config_with("ovhcloud", &[("OVH_API_KEY", "k")]);
+        assert!(!keyed.selected_is_anonymous_ovh());
+
+        let other = config_with("openai", &[("OPENAI_API_KEY", "k")]);
+        assert!(!other.selected_is_anonymous_ovh());
+
+        // Another provider's key on an ovhcloud entry is not an OVH credential.
+        let cross = config_with("ovhcloud", &[("OPENAI_API_KEY", "k")]);
+        assert!(cross.selected_is_anonymous_ovh());
+
+        // An explicit blank entry key wins over a shell export.
+        std::env::set_var("OVH_API_KEY", "shell-key");
+        let blank = config_with("ovhcloud", &[("OVH_API_KEY", "")]);
+        assert!(blank.selected_is_anonymous_ovh());
+        let omitted = config_with("ovhcloud", &[]);
+        assert!(!omitted.selected_is_anonymous_ovh());
+
+        match previous {
+            Some(value) => std::env::set_var("OVH_API_KEY", value),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_is_anonymous_ovh_ignores_a_live_provider_export() {
+        let _guard = crate::config::test_env::ENV_TEST_LOCK.lock().await;
+        let previous = std::env::var_os("OVH_API_KEY");
+        std::env::remove_var("OVH_API_KEY");
+        let snapshot = ShaiConfig::snapshot_applied_env();
+        let live = config_with("ovhcloud", &[("OVH_API_KEY", "live-export-key")]);
+        live.set_env_vars();
+        assert_eq!(
+            std::env::var("OVH_API_KEY").as_deref(),
+            Ok("live-export-key")
+        );
+        let replacement = config_with("ovhcloud", &[]);
+        assert!(
+            replacement.selected_is_anonymous_ovh(),
+            "a keyless replacement must not inherit a key only the live provider exported"
+        );
+        ShaiConfig::restore_applied_env(&snapshot);
+        match previous {
+            Some(value) => std::env::set_var("OVH_API_KEY", value),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn set_env_vars_does_not_export_anonymous_fallback() {
+        let _guard = crate::config::test_env::ENV_TEST_LOCK.blocking_lock();
+        let previous = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+        let snapshot = ShaiConfig::snapshot_applied_env();
+        let mut cfg = config_with("openai", &[("OPENAI_API_KEY", "k")]);
+        cfg.providers[0]
+            .env_vars
+            .insert("SHAI_ANONYMOUS_FALLBACK".into(), "prompt".into());
+        cfg.set_env_vars();
+        assert_eq!(
+            std::env::var("SHAI_ANONYMOUS_FALLBACK").as_deref(),
+            Ok("deny")
+        );
+        ShaiConfig::restore_applied_env(&snapshot);
+        match previous {
+            Some(value) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", value),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
     }
 }

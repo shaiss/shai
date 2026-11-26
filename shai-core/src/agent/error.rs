@@ -29,6 +29,8 @@ pub enum AgentError {
     InvalidState(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+    #[error("{0}")]
+    PrimaryConfig(#[from] crate::config::roles::PrimaryConfigError),
 }
 
 #[derive(Debug)]

@@ -6,6 +6,7 @@ set -euo pipefail
 # Cipher: OVH_API_KEY must never be set (shai's anonymous-OVH path would send it). Record, then drop it.
 OVH_KEY_WAS_SET=${OVH_API_KEY+1}
 unset OVH_API_KEY
+export SHAI_ANONYMOUS_FALLBACK=deny
 
 SHAI_BIN="${SHAI_BIN:-./shai}"
 TOOLS="read,ls,find"                  # Cipher condition 3: no fetch. Names verified against `shai --list-tools` (v0.2.2)
@@ -33,9 +34,10 @@ self_check() {
   # LlmClient::default_model() returns SHAI_MODEL. The config `model` field is NOT ignored.
   local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/shai/auth.config.json" model=${SHAI_MODEL:?SHAI_MODEL required} banner
   [[ -f "$cfg" ]] || { echo "perms-check: missing $cfg" >&2; exit 1; }
+  jq -e '.anonymous_fallback == "deny"' "$cfg" >/dev/null || { echo "perms-check: $cfg must set anonymous_fallback=deny" >&2; exit 1; }
   # Offline probe: dummy key, proxies pointed at a dead port so no request can leave the runner.
   # shai prints "<model> on <provider>" to stderr for the config it actually loaded.
-  banner=$(printf 'selfcheck' | env -i PATH="$PATH" HOME="${HOME:-/tmp}" XDG_CONFIG_HOME="${cfg%/shai/auth.config.json}" \
+  banner=$(printf 'selfcheck' | env -i PATH="$PATH" HOME="${HOME:-/tmp}" XDG_CONFIG_HOME="${cfg%/shai/auth.config.json}" SHAI_ANONYMOUS_FALLBACK=deny \
     OPENROUTER_API_KEY=selfcheck-dummy HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
     NO_PROXY= timeout 30 "$SHAI_BIN" --tools "$TOOLS" 2>&1 >/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -m1 ' on ' || true)
   if grep -qi 'failed to parse config' <<<"$banner" || [[ "$banner" != *" $model on openrouter"* ]]; then

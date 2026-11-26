@@ -22,7 +22,7 @@ use shai_core::agent::{AgentCore, AgentEvent, Prewalk, PrewalkArmError};
 use shai_core::config::advisor::resolve_advisor;
 use shai_core::config::config::ShaiConfig;
 use shai_core::config::prewalk::resolve_prewalk;
-use shai_core::config::roles::{BoundModel, RoleError};
+use shai_core::config::roles::{BoundModel, PrimaryConfigError, RoleError};
 
 /// Why an agent gets no advisor when the session's one failed too often
 /// under an earlier agent.
@@ -31,6 +31,116 @@ const SWITCHED_OFF_EARLIER: &str = "it was switched off earlier, after its revie
 /// Why a headless agent run without `--yes` is not armed.
 const HEADLESS_WITHOUT_YES: &str = "headless mode without --yes denies write and edit, \
      so the edit that starts the handoff can never happen; pass --yes to arm it";
+
+/// Why a session could not start. The kind decides the process exit code:
+/// a refused start (missing or unusable auth config) is 2; any other
+/// failure is 1. The kind is structural, not derived from the message.
+#[derive(Debug)]
+pub struct SessionStartError {
+    kind: SessionStartKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStartKind {
+    Refused,
+    Other,
+}
+
+impl SessionStartError {
+    pub fn other(message: impl Into<String>) -> Self {
+        Self {
+            kind: SessionStartKind::Other,
+            message: message.into(),
+        }
+    }
+
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self {
+            kind: SessionStartKind::Refused,
+            message: message.into(),
+        }
+    }
+
+    /// Classify a start-agent failure, preserving a refused-start kind even
+    /// when the display message is rewritten for the user.
+    pub fn from_start(agent_name: Option<&str>, err: Box<dyn std::error::Error>) -> Self {
+        let kind = start_kind(err.as_ref());
+        let message = match agent_name {
+            Some(name) => format!("could not start custom agent '{name}': {err}"),
+            None => err.to_string(),
+        };
+        Self { kind, message }
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        match self.kind {
+            SessionStartKind::Refused => 2,
+            SessionStartKind::Other => 1,
+        }
+    }
+
+    pub fn is_refused(&self) -> bool {
+        matches!(self.kind, SessionStartKind::Refused)
+    }
+}
+
+fn start_kind(err: &(dyn std::error::Error + 'static)) -> SessionStartKind {
+    if err
+        .downcast_ref::<PrimaryConfigError>()
+        .is_some_and(|error| error.is_refused_start())
+    {
+        return SessionStartKind::Refused;
+    }
+    if let Some(error) = err.downcast_ref::<SessionStartError>() {
+        return error.kind;
+    }
+    let mut source = err.source();
+    while let Some(inner) = source {
+        if inner
+            .downcast_ref::<PrimaryConfigError>()
+            .is_some_and(|error| error.is_refused_start())
+        {
+            return SessionStartKind::Refused;
+        }
+        if inner
+            .downcast_ref::<SessionStartError>()
+            .is_some_and(|error| error.is_refused())
+        {
+            return SessionStartKind::Refused;
+        }
+        source = inner.source();
+    }
+    SessionStartKind::Other
+}
+
+impl std::fmt::Display for SessionStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionStartError {}
+
+impl From<PrimaryConfigError> for SessionStartError {
+    fn from(err: PrimaryConfigError) -> Self {
+        let kind = if err.is_refused_start() {
+            SessionStartKind::Refused
+        } else {
+            SessionStartKind::Other
+        };
+        Self {
+            kind,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for SessionStartError {
+    fn from(err: std::io::Error) -> Self {
+        Self::other(err.to_string())
+    }
+}
 
 /// What a session was asked to do beyond running on the primary model.
 #[derive(Clone, Default)]
@@ -44,6 +154,9 @@ pub struct SessionOptions {
     announced: Option<String>,
     /// Where the session went, once the handoff has happened.
     handed_off: Option<String>,
+    /// Primary auth config resolved once during `prepare_session` so start-up
+    /// builds the primary model without re-reading disk after the gate.
+    startup_primary: Option<Result<ShaiConfig, PrimaryConfigError>>,
     /// Whether `--advisor` was given, kept for the same reason as the flag
     /// above.
     advisor_flag: bool,
@@ -55,16 +168,6 @@ pub struct SessionOptions {
 }
 
 impl SessionOptions {
-    /// Resolve the options of a session about to start.
-    ///
-    /// `prewalk_into` is the value of `--prewalk-into` and `advisor` is
-    /// `--advisor`. Nothing here performs network I/O.
-    pub fn resolve(prewalk_into: Option<&str>, advisor: bool) -> Result<Self, String> {
-        // The user's own config, never the built-in default.
-        let config = ShaiConfig::load_for_roles();
-        Self::resolve_from(prewalk_into, advisor, config.as_ref())
-    }
-
     fn resolve_from(
         prewalk_into: Option<&str>,
         advisor: bool,
@@ -84,10 +187,55 @@ impl SessionOptions {
             prewalk: prewalk.map(Prewalk::new),
             announced: None,
             handed_off: None,
+            startup_primary: None,
             advisor_flag: advisor,
             advisor: advisor_handle,
             advisor_announced: None,
         })
+    }
+
+    /// Resolve session options from an already-loaded (or provisioned)
+    /// startup config snapshot, without re-reading `auth.config.json`.
+    pub fn resolve_from_loaded(
+        prewalk_into: Option<&str>,
+        advisor: bool,
+        loaded: Result<&ShaiConfig, &RoleError>,
+        startup_primary: Result<ShaiConfig, PrimaryConfigError>,
+    ) -> Result<Self, String> {
+        let mut options = Self::resolve_from(prewalk_into, advisor, loaded)?;
+        options.startup_primary = Some(startup_primary);
+        Ok(options)
+    }
+
+    /// Like [`SessionOptions::resolve_from_loaded`], exiting with status 2 on
+    /// an invalid option or unreadable config.
+    pub fn resolve_from_loaded_or_exit(
+        prewalk_into: Option<&str>,
+        advisor: bool,
+        loaded: Result<&ShaiConfig, &RoleError>,
+        startup_primary: Result<ShaiConfig, PrimaryConfigError>,
+    ) -> Self {
+        match Self::resolve_from_loaded(prewalk_into, advisor, loaded, startup_primary) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("error: {}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    /// The startup primary config snapshot from `prepare_session`, or a fresh
+    /// [`SessionOptions::primary_config`] load when none was recorded.
+    pub fn startup_primary_config(&self) -> Result<ShaiConfig, PrimaryConfigError> {
+        match &self.startup_primary {
+            Some(result) => result.clone(),
+            None => Self::primary_config(),
+        }
+    }
+
+    /// Borrowed view of the startup primary config snapshot, if recorded.
+    pub fn startup_primary_ref(&self) -> Option<Result<&ShaiConfig, &PrimaryConfigError>> {
+        self.startup_primary.as_ref().map(Result::as_ref)
     }
 
     /// A missing config file asks for nothing. One that is there and cannot
@@ -108,13 +256,16 @@ impl SessionOptions {
     /// file that is there and cannot be read is an error, as at start-up:
     /// the primary model is built from this same load, so the file cannot
     /// break between a check and the read that builds the client.
-    pub fn primary_config() -> Result<ShaiConfig, String> {
+    pub fn primary_config() -> Result<ShaiConfig, PrimaryConfigError> {
         ShaiConfig::primary()
     }
 
     #[cfg(test)]
-    fn primary_config_from(config: Result<ShaiConfig, RoleError>) -> Result<ShaiConfig, String> {
-        ShaiConfig::primary_from(config)
+    fn primary_config_from_with_env(
+        config: Result<ShaiConfig, RoleError>,
+        env_setting: Option<&str>,
+    ) -> Result<ShaiConfig, PrimaryConfigError> {
+        ShaiConfig::primary_from_with_env(config, env_setting)
     }
 
     /// The handoff target the session is asked for, as things are now.
@@ -158,20 +309,6 @@ impl SessionOptions {
         }
         .map(Some)
         .map_err(|e| e.to_string())
-    }
-
-    /// Like [`SessionOptions::resolve`], but a failure ends the process: the
-    /// reason goes to stderr and the exit code is 2. The callers of the
-    /// session entry points do not propagate errors, so this is where
-    /// "refuse to start" is enforced.
-    pub fn resolve_or_exit(prewalk_into: Option<&str>, advisor: bool) -> Self {
-        match Self::resolve(prewalk_into, advisor) {
-            Ok(options) => options,
-            Err(error) => {
-                eprintln!("error: {}", error);
-                std::process::exit(2);
-            }
-        }
     }
 
     /// Options with `prewalk` still to come, for tests of the front-ends.
@@ -847,26 +984,44 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_model_runs_on_the_default_only_without_a_config_file() {
+    fn the_primary_model_respects_anonymous_fallback_without_silently_ignoring_broken_files() {
         // The user's file, as loaded.
         let cfg = config(Some(URL_A), "");
-        let primary = SessionOptions::primary_config_from(Ok(cfg)).unwrap();
+        let primary = SessionOptions::primary_config_from_with_env(Ok(cfg), None).unwrap();
         assert_eq!(primary.providers[0].provider, "openai");
 
-        // No file at all: the built-in default, as before.
-        let primary = SessionOptions::primary_config_from(Err(RoleError::ConfigMissing)).unwrap();
+        // No file at all under default prompt mode: the built-in default.
+        let primary =
+            SessionOptions::primary_config_from_with_env(Err(RoleError::ConfigMissing), None)
+                .unwrap();
         assert_eq!(
             primary.providers[0].provider,
             ShaiConfig::default().providers[0].provider
         );
 
+        // No file at all under deny: refuse to start with PrimaryConfigError::Missing.
+        let error = SessionOptions::primary_config_from_with_env(
+            Err(RoleError::ConfigMissing),
+            Some("deny"),
+        )
+        .map(|_| ())
+        .expect_err("deny must refuse a missing file");
+        assert!(matches!(error, PrimaryConfigError::Missing), "{error:?}");
+        assert!(error.is_refused_start());
+
         // A file that is there and does not load is never replaced by the
         // default: the agent does not start, and the user is told why.
-        let error = SessionOptions::primary_config_from(Err(invalid()))
+        let error = SessionOptions::primary_config_from_with_env(Err(invalid()), None)
             .map(|_| ())
             .expect_err("no default for a broken file");
-        assert!(error.contains("auth.config.json"), "{error}");
-        assert!(error.contains("line 3 column 7"), "{error}");
+        assert!(
+            matches!(error, PrimaryConfigError::Invalid { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_refused_start());
+        let message = error.to_string();
+        assert!(message.contains("auth.config.json"), "{message}");
+        assert!(message.contains("line 3 column 7"), "{message}");
     }
 
     #[test]

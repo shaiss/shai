@@ -27,6 +27,9 @@ jobs:
       - name: All-empty alarm self-test
         run: ./wave0/run-shadow.sh --test-all-empty-alarm
 
+      - name: Check starter config sets anonymous_fallback=deny
+        run: jq -e '.anonymous_fallback == "deny"' .shai.config >/dev/null
+
   build:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -172,6 +175,7 @@ jobs:
       - name: sh install.sh, then shai --version
         env:
           PLATFORM: ${{ matrix.platform }}
+          SHAI_ANONYMOUS_FALLBACK: deny
         run: |
           set -o pipefail
           expected="shai version $(grep -m1 '^version' shai-cli/Cargo.toml | cut -d'"' -f2)"
@@ -185,3 +189,45 @@ jobs:
             test "$version" = "$expected"
             echo "::endgroup::"
           done
+
+      - name: Preflight anonymous_fallback deny
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/home" "$tmp/cfg/shai"
+
+          # 1) No config + SHAI_ANONYMOUS_FALLBACK=deny must exit 2, resolve deny, and write no config.
+          set +e
+          out="$(
+            env -i PATH="$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/cfg" \
+              NO_COLOR=1 SHAI_LOG_LEVEL=info SHAI_ANONYMOUS_FALLBACK=deny \
+              "$HOME/.local/bin/shai" -p "preflight" </dev/null 2>&1
+          )"
+          rc=$?
+          set -e
+          test "$rc" -eq 2 || { echo "expected exit 2 on no-config deny, got $rc: $out" >&2; exit 1; }
+          printf '%s\n' "$out" | grep -q 'anonymous fallback: deny' || {
+            echo "resolved mode was not deny: $out" >&2
+            exit 1
+          }
+          test ! -e "$tmp/cfg/shai/auth.config.json" || {
+            echo "deny must not write auth.config.json" >&2
+            exit 1
+          }
+
+          # 2) Starter config (.shai.config) + SHAI_ANONYMOUS_FALLBACK=prompt must still resolve deny and exit 2.
+          cp .shai.config "$tmp/cfg/shai/auth.config.json"
+          set +e
+          out="$(
+            env -i PATH="$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/cfg" \
+              NO_COLOR=1 SHAI_LOG_LEVEL=info SHAI_ANONYMOUS_FALLBACK=prompt \
+              "$HOME/.local/bin/shai" -p "preflight" </dev/null 2>&1
+          )"
+          rc=$?
+          set -e
+          test "$rc" -eq 2 || { echo "expected exit 2 on starter-config deny, got $rc: $out" >&2; exit 1; }
+          printf '%s\n' "$out" | grep -q 'anonymous fallback: deny' || {
+            echo "starter-config resolved mode was not deny: $out" >&2
+            exit 1
+          }

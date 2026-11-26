@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::agent_meta::AgentMeta;
 use super::agent_state::AgentState;
-use crate::session_options::SessionOptions;
+use crate::session_options::{SessionOptions, SessionStartError};
 
 use super::handler::AgentHandler;
 use super::input::InputArea;
@@ -136,25 +136,48 @@ impl App<'_> {
         // As at start-up: a config file that is there and cannot be read
         // is not replaced by the built-in default, which would send the
         // conversation to a provider the user did not choose.
-        // The file is loaded once, and the agent built from that load, so
-        // it cannot break between a check and a later read.
-        let prepared = Self::load_prepared(agent_name)?;
+        // Uses the startup primary snapshot from `prepare_session` so the
+        // file is not read again after the fallback gate passes.
+        let prepared =
+            Self::load_initial_prepared(agent_name, self.session_options.startup_primary_ref())?;
         self.start_prepared(prepared).await
     }
 
-    pub(crate) fn load_prepared(
+    pub(crate) fn load_initial_prepared(
         agent_name: Option<&str>,
+        startup_primary: Option<
+            Result<
+                &shai_core::config::config::ShaiConfig,
+                &shai_core::config::roles::PrimaryConfigError,
+            >,
+        >,
     ) -> Result<PreparedAgent, Box<dyn std::error::Error>> {
         match agent_name {
             Some(name) => {
-                let config = shai_core::config::agent::AgentConfig::load(name)?;
+                let config = shai_core::config::agent::AgentConfig::load_with_primary_result(
+                    name,
+                    startup_primary,
+                )?;
                 Ok(PreparedAgent::Named {
                     name: name.to_string(),
                     config,
                 })
             }
-            None => Ok(PreparedAgent::Primary(SessionOptions::primary_config()?)),
+            None => {
+                let primary = match startup_primary {
+                    Some(Ok(config)) => config.clone(),
+                    Some(Err(err)) => return Err(err.clone().into()),
+                    None => SessionOptions::primary_config()?,
+                };
+                Ok(PreparedAgent::Primary(primary))
+            }
         }
+    }
+
+    pub(crate) fn load_prepared(
+        agent_name: Option<&str>,
+    ) -> Result<PreparedAgent, Box<dyn std::error::Error>> {
+        Self::load_initial_prepared(agent_name, None)
     }
 
     /// Load the replacement, or tell the user why the live agent is kept.
@@ -741,32 +764,30 @@ impl App<'_> {
         &mut self,
         agent_name: Option<String>,
         restore_session_id: Option<String>,
-    ) -> io::Result<()> {
-        let x = self.try_run(agent_name, restore_session_id).await;
+    ) -> Result<(), SessionStartError> {
+        let result = self.try_run(agent_name, restore_session_id).await;
 
+        // Always restore the terminal, including when start is refused
+        // before raw mode is enabled: these calls are then no-ops.
         let _ = execute!(
             std::io::stdout(),
+            crossterm::cursor::Show,
             crossterm::event::DisableMouseCapture,
             crossterm::event::PopKeyboardEnhancementFlags,
         );
         std::io::stdout().flush().ok();
         let _ = disable_raw_mode();
 
-        if let Err(e) = x {
-            println!();
-            eprintln!("{}\r\n", e);
-        }
-
         println!();
         println!();
-        Ok(())
+        result
     }
 
     async fn try_run(
         &mut self,
         agent_name: Option<String>,
         restore_session_id: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), SessionStartError> {
         let agent_name_ref = agent_name.as_deref();
         // A restored conversation starts the trigger over. Reset before the
         // agent is armed, so it holds the new empty signals; after start the
@@ -774,18 +795,10 @@ impl App<'_> {
         if restore_session_id.is_some() {
             self.session_options.reset_prewalk_signals();
         }
-        let banner =
-            self.start_agent(agent_name_ref)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    if let Some(name) = agent_name_ref {
-                        format!("could not start custom agent '{}': {}", name, e).into()
-                    } else {
-                        "could not start shai agent, run shai auth first"
-                            .to_string()
-                            .into()
-                    }
-                })?;
+        let banner = self
+            .start_agent(agent_name_ref)
+            .await
+            .map_err(|e| SessionStartError::from_start(agent_name_ref, e))?;
 
         self.terminal = Some(ratatui::init_with_options(TerminalOptions {
             viewport: Viewport::Fullscreen,
@@ -841,7 +854,7 @@ impl App<'_> {
         while !self.ui_state.exit {
             self.show_session_notices();
             self.draw_ui()
-                .map_err(|_| -> Box<dyn std::error::Error> { "oops... (x_x)'".into() })?;
+                .map_err(|_| SessionStartError::other("oops... (x_x)'"))?;
 
             let mut reader = self.event_reader.take().unwrap_or_default();
 
@@ -881,7 +894,7 @@ impl App<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session_options::test_support::hand_off;
     use shai_core::agent::Prewalk;
@@ -1048,7 +1061,7 @@ mod tests {
     /// Serializes tests that point `XDG_CONFIG_HOME` at a fixture tree.
     /// Async so the failed-reload test can keep exclusive access across
     /// `swap_agent(...).await` without holding a `std` mutex over an await.
-    static CONFIG_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static CONFIG_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn set_config_home(home: &std::path::Path) -> Option<String> {
         let previous = std::env::var("XDG_CONFIG_HOME").ok();
@@ -1066,12 +1079,12 @@ mod tests {
     /// Restores `XDG_CONFIG_HOME` on drop, including when a test panics.
     /// Keep this guard inside the lock scope so restoration finishes
     /// before another test can acquire the lock.
-    struct ConfigHomeGuard {
+    pub(crate) struct ConfigHomeGuard {
         previous: Option<String>,
     }
 
     impl ConfigHomeGuard {
-        fn set(home: &std::path::Path) -> Self {
+        pub(crate) fn set(home: &std::path::Path) -> Self {
             Self {
                 previous: set_config_home(home),
             }
@@ -1516,6 +1529,100 @@ mod tests {
             "held events must be replayed onto the kept agent"
         );
         assert_eq!(app.agent_state.token_counter().output_tokens(), 3);
+    }
+
+    #[tokio::test]
+    async fn tui_agent_swap_and_picker_refuse_anonymous_ovh_under_deny() {
+        use super::super::agent_picker::{AgentPicker, AgentPickerAction};
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let _guard = CONFIG_HOME_LOCK.lock().await;
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+
+        let home = auth_home(
+            r#"{
+                "providers": [{
+                    "provider": "openai",
+                    "env_vars": {"OPENAI_API_KEY": "k"},
+                    "model": "gpt-4o",
+                    "tool_method": "FunctionCall"
+                }],
+                "selected_provider": 0,
+                "anonymous_fallback": "deny"
+            }"#,
+        );
+        let agents_dir = home.path().join("shai").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let anon_json = r#"{
+            "name": "anon",
+            "description": "explicit keyless ovhcloud",
+            "llm_provider": {
+                "provider": "ovhcloud",
+                "env_vars": {},
+                "model": "qwen3-32b",
+                "tool_method": "FunctionCall"
+            }
+        }"#;
+        std::fs::write(agents_dir.join("anon.config.json"), anon_json).unwrap();
+        let _home = ConfigHomeGuard::set(home.path());
+
+        let mut app = App::new();
+
+        // 1) AgentPicker (used by `shai agent` with no args) must not offer `anon`.
+        let mut picker = AgentPicker::new(app.status_bar.palette());
+        let picked = picker.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert!(
+            !matches!(picked, Some(AgentPickerAction::Selected(ref n)) if n == "anon"),
+            "agent picker must not allow selecting keyless ovhcloud under deny"
+        );
+
+        // 2) TUI /agent swap (`load_prepared` -> `prepared_replacement` -> `swap_agent`, app.rs:150)
+        // must refuse `anon` and keep the live agent.
+        attach_live_agent(&mut app);
+        assert!(
+            App::load_prepared(Some("anon")).is_err(),
+            "load_prepared must refuse explicit anonymous OVH under deny"
+        );
+        let replaced = app.swap_agent(Some("anon")).await.unwrap();
+        assert!(
+            !replaced,
+            "swap_agent must refuse explicit anonymous OVH under deny"
+        );
+        assert!(app.agent.is_some(), "live agent must stay active");
+
+        // 3) Direct `build_agent` with `PreparedAgent::Named` (app.rs:190 -> builder.rs:256)
+        // must also refuse when anonymous_fallback is deny.
+        let anon_cfg: shai_core::config::agent::AgentConfig =
+            serde_json::from_str(anon_json).unwrap();
+        let built = app
+            .build_agent(PreparedAgent::Named {
+                name: "anon".to_string(),
+                config: anon_cfg,
+            })
+            .await;
+        assert!(
+            built.is_err(),
+            "build_agent must refuse explicit anonymous OVH under deny"
+        );
+
+        if let Some(agent) = app.agent.take() {
+            let _ = agent.controller.terminate().await;
+            let _ = agent.handle.await;
+        }
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
     }
 
     #[tokio::test]
