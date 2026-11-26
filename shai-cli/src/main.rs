@@ -788,8 +788,7 @@ fn handle_import(overwrite: bool) -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_serve(
     host: String,
     port: u16,
-    // TODO: wire `--agent` to ServerConfig so the HTTP server uses it as default agent name
-    _agent: Option<String>,
+    agent: Option<String>,
     ephemeral: bool,
     max_sessions: Option<usize>,
     yes: bool,
@@ -805,6 +804,13 @@ async fn handle_serve(
         }
     };
 
+    if let Some(ref agent_name) = agent {
+        if let Err(error) = AgentConfig::load_with_primary(agent_name, Some(&primary)) {
+            eprintln!("error: {}", error);
+            std::process::exit(2);
+        }
+    }
+
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
         .with_target(false)
@@ -819,7 +825,8 @@ async fn handle_serve(
         .with_ephemeral(ephemeral)
         .with_max_sessions(max_sessions)
         .with_allow_all_tools(yes)
-        .with_primary_config(primary);
+        .with_primary_config(primary)
+        .with_default_agent(agent);
 
     shai_http::start_server(config).await?;
 

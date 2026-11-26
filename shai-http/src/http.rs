@@ -51,6 +51,12 @@ impl ServerConfig {
         self.session_manager.primary = Some(std::sync::Arc::new(primary));
         self
     }
+
+    /// Set the default agent name used when requests omit an agent or pass `"default"`.
+    pub fn with_default_agent(mut self, default_agent: Option<String>) -> Self {
+        self.session_manager.default_agent = default_agent;
+        self
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -79,6 +85,14 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     } else {
         println!("  Max sessions: \x1b[1munlimited\x1b[0m");
     }
+    println!(
+        "  Default agent: \x1b[1m{}\x1b[0m",
+        config
+            .session_manager
+            .default_agent
+            .as_deref()
+            .unwrap_or("default")
+    );
     println!(
         "  Default mode: \x1b[1m{}\x1b[0m",
         if config.session_manager.ephemeral {
@@ -176,6 +190,16 @@ mod tests {
         assert!(
             !debug.contains("sk-test-do-not-leak"),
             "Debug leaked the key: {debug}"
+        );
+    }
+
+    #[test]
+    fn with_default_agent_sets_session_manager_default_agent() {
+        let config =
+            ServerConfig::new("127.0.0.1:0".into()).with_default_agent(Some("reviewer".into()));
+        assert_eq!(
+            config.session_manager.default_agent.as_deref(),
+            Some("reviewer")
         );
     }
 }

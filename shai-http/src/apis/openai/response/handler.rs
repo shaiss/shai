@@ -114,12 +114,16 @@ pub async fn handle_get_response(
     let request_id = Uuid::new_v4();
     info!("[{}] GET /v1/responses/{}", request_id, response_id);
 
-    // Get the existing session (note: without agent_name, will only check memory, not disk)
-    // For GET we don't have the model from request, so we use the session's agent_name
-    // This means GET can only access in-memory sessions
+    // For GET we don't have a model in the request, so fall back to the server's
+    // configured default agent (or "default") when restoring from disk.
+    let fallback_agent = state
+        .session_manager
+        .default_agent()
+        .unwrap_or("default")
+        .to_string();
     let agent_session = state
         .session_manager
-        .get_session(&request_id.to_string(), &response_id, "default".to_string())
+        .get_session(&request_id.to_string(), &response_id, fallback_agent)
         .await
         .map_err(|e| ErrorResponse::invalid_request(format!("Response not found: {}", e)))?;
 
