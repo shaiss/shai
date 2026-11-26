@@ -81,8 +81,8 @@ impl AgentBuilder {
         // Same rule as the TUI and headless mode: the built-in default is
         // used only when there is no config file. A file that is there and
         // cannot be read is an error, never a silent fallback.
-        let config = ShaiConfig::from_snapshot_or_primary(primary)
-            .map_err(|e| AgentError::ConfigurationError(e.to_string()))?;
+        let config =
+            ShaiConfig::from_snapshot_or_primary(primary).map_err(AgentError::PrimaryConfig)?;
         let (llm_client, model) = config.get_llm_from_config().await.map_err(|e| {
             AgentError::ConfigurationError(format!("Failed to get LLM from config: {}", e))
         })?;
@@ -727,6 +727,44 @@ mod tests {
         match prev_fb {
             Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
             None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+    }
+
+    #[test]
+    fn create_none_under_deny_preserves_primary_config_error() {
+        let _xdg = crate::config::test_env::XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = ENV_TEST_LOCK.blocking_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+        std::env::set_var("SHAI_ANONYMOUS_FALLBACK", "deny");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let _home = crate::config::test_env::XdgConfigHomeGuard::set(dir.path());
+
+        let result = rt.block_on(AgentBuilder::create(None));
+
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+
+        match result {
+            Err(AgentError::PrimaryConfig(error)) => {
+                assert!(error.is_refused_start(), "{error}");
+            }
+            Err(other) => panic!("expected PrimaryConfig, got {other}"),
+            Ok(_) => panic!("expected PrimaryConfig, create(None) succeeded"),
         }
     }
 }

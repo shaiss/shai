@@ -602,7 +602,27 @@ async fn provision_default_config(
     if !allow_fallback_provision {
         return Err(PrimaryConfigError::Missing);
     }
-    Ok(fetch_and_save_default_config(default_config_url).await)
+    let config = fetch_and_save_default_config(default_config_url).await;
+    apply_provisioned_snapshot_policy(config)
+}
+
+/// Re-evaluate a just-provisioned starter config. The pre-download gate has
+/// already run against the empty profile (prompt by default). If the saved
+/// snapshot itself denies anonymous OVH, the first run must refuse the same
+/// way a later run would.
+fn apply_provisioned_snapshot_policy(config: ShaiConfig) -> Result<ShaiConfig, PrimaryConfigError> {
+    let env_setting = env_anonymous_fallback();
+    let resolution =
+        resolve_anonymous_fallback(config.anonymous_fallback.as_deref(), env_setting.as_deref());
+    let situation = fallback_situation(Some(&config), None);
+    match evaluate_anonymous_fallback_gate(
+        resolution,
+        situation,
+        FallbackInteraction::NonInteractive,
+    ) {
+        FallbackGate::Refuse { message, .. } => Err(PrimaryConfigError::Other(message)),
+        _ => Ok(config),
+    }
 }
 
 fn interactive_session_interaction() -> FallbackInteraction {
@@ -1275,6 +1295,48 @@ mod cli_tests {
         match prev_fb {
             Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
             None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+    }
+
+    #[test]
+    fn a_provisioned_starter_with_deny_and_anonymous_ovh_is_refused() {
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+
+        let deny_anon: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"ovhcloud","env_vars":{"OVH_BASE_URL":"https://example.invalid/v1"},"model":"Qwen3-32B","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+        )
+        .unwrap();
+        let err = apply_provisioned_snapshot_policy(deny_anon).unwrap_err();
+        assert!(err.is_refused_start(), "{err}");
+        assert!(
+            err.to_string().contains("Anonymous fallback is disabled"),
+            "{err}"
+        );
+
+        let deny_keyed: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"openai","env_vars":{"OPENAI_API_KEY":"k"},"model":"gpt-4o","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#,
+        )
+        .unwrap();
+        apply_provisioned_snapshot_policy(deny_keyed)
+            .expect("deny must still allow a keyed provider");
+
+        let prompt_anon: ShaiConfig = serde_json::from_str(
+            r#"{"providers":[{"provider":"ovhcloud","env_vars":{"OVH_BASE_URL":"https://example.invalid/v1"},"model":"Qwen3-32B","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"prompt"}"#,
+        )
+        .unwrap();
+        apply_provisioned_snapshot_policy(prompt_anon)
+            .expect("prompt mode starts must stay allowed");
+
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
         }
     }
 }

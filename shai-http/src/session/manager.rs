@@ -454,6 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_allow_all_tools_runs_bash() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = scratch_dir();
         let marker = dir.join("ran");
         let config = SessionManagerConfig {
