@@ -8,7 +8,7 @@ Shai is a terminal-based coding agent written in Rust. It provides an interactiv
 
 - **`shai-cli/`** — CLI entry point (TUI, headless mode, shell assistant).
 - **`shai-core/`** — Core library: agent loop, state machine, tools, skills, memory.
-- **`shai-llm/`** — LLM provider wrappers (OpenAI, Anthropic, Mistral, OVHCloud, Ollama, OpenRouter).
+- **`shai-llm/`** — LLM provider wrappers (OpenAI, Anthropic, Mistral, OVHCloud, Ollama, OpenRouter, OrcaRouter).
 - **`shai-http/`** — HTTP server with OpenAI-compatible endpoints and SSE streaming.
 - **`shai-macros/`** — Procedural macros (`#[tool]` attribute).
 - **`docs/`** — Additional documentation.

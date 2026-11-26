@@ -12,16 +12,36 @@ const ORCAROUTER_API_BASE: &str = "https://api.orcarouter.ai/v1";
 
 /// True for OrcaRouter's free router and any model id ending in `-free`.
 ///
-/// Compared case-insensitively after trimming. `orcarouter/auto` is not
-/// treated as free here; it is a paid-or-mixed router, not a free-model id.
+/// Compared case-insensitively after trimming. Router aliases such as
+/// `orcarouter/auto` are not treated as free here; they stay in the
+/// model list and are skipped only when choosing a default.
 pub(crate) fn is_free_model_id(id: &str) -> bool {
     let id = id.trim().to_ascii_lowercase();
     id == "orcarouter/free" || id.ends_with("-free")
 }
 
+/// True for OrcaRouter router aliases (`orcarouter/auto`,
+/// `orcarouter/fusion`, `orcarouter/free`, and any other `orcarouter/*` id).
+///
+/// Compared case-insensitively after trimming. These stay visible in
+/// `models()` (except the free ones) so a user can pick them, but they
+/// must not become the implicit default.
+pub(crate) fn is_orcarouter_router_alias(id: &str) -> bool {
+    id.trim().to_ascii_lowercase().starts_with("orcarouter/")
+}
+
 fn exclude_free_models(mut models: ListModelResponse) -> ListModelResponse {
     models.data.retain(|model| !is_free_model_id(&model.id));
     models
+}
+
+fn first_concrete_paid_model(models: &ListModelResponse) -> Option<String> {
+    models
+        .data
+        .iter()
+        .map(|model| model.id.as_str())
+        .find(|id| !is_orcarouter_router_alias(id))
+        .map(str::to_string)
 }
 
 pub struct OrcaRouterProvider {
@@ -89,11 +109,7 @@ impl LlmProvider for OrcaRouterProvider {
 
     async fn default_model(&self) -> Result<String, LlmError> {
         let models = self.models().await?;
-        models
-            .data
-            .first()
-            .map(|m| m.id.clone())
-            .ok_or_else(|| "no model available".into())
+        first_concrete_paid_model(&models).ok_or_else(|| "no model available".into())
     }
 
     async fn chat(
@@ -184,10 +200,27 @@ mod tests {
         assert!(is_free_model_id("glm-5.3-flash-free"));
         assert!(is_free_model_id("Qwen/Qwen3-Free"));
         assert!(!is_free_model_id("orcarouter/auto"));
+        assert!(!is_free_model_id("orcarouter/fusion"));
         assert!(!is_free_model_id("openai/gpt-4o-mini"));
         assert!(!is_free_model_id("anthropic/claude-sonnet-4.6"));
         assert!(!is_free_model_id("free"));
         assert!(!is_free_model_id("orcarouter/free-tier"));
+    }
+
+    #[test]
+    fn is_orcarouter_router_alias_matches_any_orcarouter_slash_id() {
+        assert!(is_orcarouter_router_alias("orcarouter/auto"));
+        assert!(is_orcarouter_router_alias("orcarouter/fusion"));
+        assert!(is_orcarouter_router_alias("orcarouter/fusion-flash"));
+        assert!(is_orcarouter_router_alias("orcarouter/fusion-mini"));
+        assert!(is_orcarouter_router_alias("orcarouter/free"));
+        assert!(is_orcarouter_router_alias(" ORCAROUTER/AUTO "));
+        assert!(!is_orcarouter_router_alias("openai/gpt-4o-mini"));
+        assert!(!is_orcarouter_router_alias("anthropic/claude-sonnet-4.6"));
+        assert!(!is_orcarouter_router_alias("orcarouter"));
+        assert!(!is_orcarouter_router_alias(
+            "deepseek/deepseek-v4.1-flash-free"
+        ));
     }
 
     #[test]
@@ -259,6 +292,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_keeps_non_free_router_aliases() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(models_body(&[
+                "orcarouter/free",
+                "orcarouter/fusion",
+                "orcarouter/fusion-flash",
+                "orcarouter/fusion-mini",
+                "orcarouter/auto",
+                "anthropic/claude-sonnet-4.6",
+            ]))
+            .create_async()
+            .await;
+
+        let provider = provider_against(&server).await;
+        let models = provider.models().await.expect("models");
+        assert_eq!(
+            ids_of(&models),
+            [
+                "orcarouter/fusion",
+                "orcarouter/fusion-flash",
+                "orcarouter/fusion-mini",
+                "orcarouter/auto",
+                "anthropic/claude-sonnet-4.6",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn default_model_skips_leading_free_ids() {
         let mut server = mockito::Server::new_async().await;
         server
@@ -278,6 +343,45 @@ mod tests {
         let default = provider.default_model().await.expect("default model");
         assert_eq!(default, "openai/gpt-4o-mini");
         assert!(!is_free_model_id(&default));
+        assert!(!is_orcarouter_router_alias(&default));
+    }
+
+    #[tokio::test]
+    async fn default_model_skips_router_aliases_and_picks_the_first_concrete_paid_model() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(models_body(&[
+                "orcarouter/free",
+                "orcarouter/fusion",
+                "orcarouter/fusion-flash",
+                "orcarouter/fusion-mini",
+                "orcarouter/auto",
+                "openai/gpt-4o-mini",
+                "anthropic/claude-sonnet-4.6",
+            ]))
+            .create_async()
+            .await;
+
+        let provider = provider_against(&server).await;
+        let listed = provider.models().await.expect("models");
+        assert_eq!(
+            ids_of(&listed),
+            [
+                "orcarouter/fusion",
+                "orcarouter/fusion-flash",
+                "orcarouter/fusion-mini",
+                "orcarouter/auto",
+                "openai/gpt-4o-mini",
+                "anthropic/claude-sonnet-4.6",
+            ]
+        );
+        let default = provider.default_model().await.expect("default model");
+        assert_eq!(default, "openai/gpt-4o-mini");
+        assert!(!is_orcarouter_router_alias(&default));
+        assert!(!is_free_model_id(&default));
     }
 
     #[tokio::test]
@@ -296,6 +400,32 @@ mod tests {
             .default_model()
             .await
             .expect_err("only free models should not yield a default")
+            .to_string();
+        assert!(error.contains("no model available"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn default_model_errors_when_only_router_aliases_remain() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(models_body(&[
+                "orcarouter/free",
+                "orcarouter/fusion",
+                "orcarouter/auto",
+            ]))
+            .create_async()
+            .await;
+
+        let provider = provider_against(&server).await;
+        let listed = provider.models().await.expect("models");
+        assert_eq!(ids_of(&listed), ["orcarouter/fusion", "orcarouter/auto"]);
+        let error = provider
+            .default_model()
+            .await
+            .expect_err("router aliases should not become the default")
             .to_string();
         assert!(error.contains("no model available"), "{error}");
     }

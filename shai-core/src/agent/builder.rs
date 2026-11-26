@@ -563,6 +563,7 @@ fn provider_credential_names(provider: &str) -> &'static [&'static str] {
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
+        "orcarouter" => &["ORCAROUTER_API_KEY"],
         "openai_compatible" => &["OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL"],
         "ollama" => &["OLLAMA_API_KEY", "OLLAMA_BASE_URL"],
         "ovhcloud" => &["OVH_API_KEY", "OVH_BASE_URL"],
@@ -714,6 +715,48 @@ mod tests {
             "the resolved environment key must be kept out of what the advisor is sent; known names: {:?}",
             builder
                 .redaction_secrets
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn named_orcarouter(env_vars: serde_json::Value) -> AgentConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "reviewer",
+            "description": "has its own provider",
+            "llm_provider": {
+                "provider": "orcarouter",
+                "env_vars": env_vars,
+                "model": "anthropic/claude-sonnet-4.6",
+                "tool_method": "FunctionCall"
+            }
+        }))
+        .expect("named orcarouter agent should deserialize")
+    }
+
+    #[test]
+    fn orcarouter_credential_names_include_the_api_key() {
+        assert_eq!(
+            provider_credential_names("orcarouter"),
+            &["ORCAROUTER_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn orcarouter_resolved_environment_key_is_collected_for_redaction() {
+        let config = named_orcarouter(serde_json::json!({}));
+        let resolved = std::collections::HashMap::from([(
+            "ORCAROUTER_API_KEY".to_string(),
+            "user-env-orcarouter-key".to_string(),
+        )]);
+        let secrets = agent_redaction_secrets(&config, &resolved);
+        assert!(
+            secrets.iter().any(|(name, value)| {
+                name == "ORCAROUTER_API_KEY" && value == "user-env-orcarouter-key"
+            }),
+            "the resolved OrcaRouter key must be kept out of what the advisor is sent; known names: {:?}",
+            secrets
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>()
