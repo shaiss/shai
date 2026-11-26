@@ -37,6 +37,11 @@ pub enum InternalAgentEvent {
     },
     /// All tools completed execution
     ToolsCompleted { any_denied: bool },
+    /// An advisor review finished: a note, nothing to say, or why it failed
+    AdvisorCompleted {
+        review_id: u64,
+        outcome: Result<Option<crate::advisor::AdvisorNote>, String>,
+    },
     /// User response received from controller
     UserResponseReceived {
         request_id: String,
@@ -106,6 +111,13 @@ pub enum AgentEvent {
     },
     /// The session continues on another model (see `agent::prewalk`)
     ModelSwitched { provider: String, model: String },
+    /// The session's advisor left a note for the agent's next step
+    AdvisorNote {
+        severity: crate::advisor::Severity,
+        note: String,
+    },
+    /// An advisor review failed; `disabled` when the advisor gave up for good
+    AdvisorFailed { error: String, disabled: bool },
 }
 
 /// Types of user input that an agent can request
@@ -295,6 +307,16 @@ impl std::fmt::Debug for AgentEvent {
                 .debug_struct("ModelSwitched")
                 .field("provider", provider)
                 .field("model", model)
+                .finish(),
+            AgentEvent::AdvisorNote { severity, note } => f
+                .debug_struct("AdvisorNote")
+                .field("severity", severity)
+                .field("note", note)
+                .finish(),
+            AgentEvent::AdvisorFailed { error, disabled } => f
+                .debug_struct("AdvisorFailed")
+                .field("error", error)
+                .field("disabled", disabled)
                 .finish(),
         }
     }

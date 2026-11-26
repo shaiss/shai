@@ -113,6 +113,9 @@ struct Cli {
     /// a role name or <provider>/<model> (overrides prewalk.into)
     #[arg(long, value_name = "ROLE_OR_MODEL")]
     prewalk_into: Option<String>,
+    /// Have a second model (the "advisor" role) review the agent's steps, read-only
+    #[arg(long)]
+    advisor: bool,
 }
 
 #[derive(Subcommand)]
@@ -231,11 +234,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Asking for session options where they cannot apply is an error.
     // Resolution itself waits until after the fallback gate (and any
-    // allowed starter config), so `--prewalk-into` can see a just-provisioned
-    // config on a fresh profile.
-    if !session_starts && cli.prewalk_into.is_some() {
-        eprintln!("error: --prewalk-into only applies to commands that start an agent session");
-        std::process::exit(2);
+    // allowed starter config), so `--prewalk-into` and `--advisor` can see
+    // a just-provisioned config on a fresh profile.
+    if !session_starts {
+        for (given, flag) in [
+            (cli.prewalk_into.is_some(), "--prewalk-into"),
+            (cli.advisor, "--advisor"),
+        ] {
+            if given {
+                eprintln!(
+                    "error: {} only applies to commands that start an agent session",
+                    flag
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     match cli.command {
@@ -269,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(name),
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(Some(name.to_string()), None, None, session_options).await?;
@@ -279,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(
@@ -304,6 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(None, restore_id, None, session_options).await?;
@@ -314,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(None, Some(id.to_string()), None, session_options).await?;
@@ -324,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(
@@ -431,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.agent.as_deref(),
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 if let Err(err) = handle_fix(HeadlessRun {
@@ -467,6 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cli.agent.as_deref(),
                         default_url,
                         cli.prewalk_into.as_deref(),
+                        cli.advisor,
                     )
                     .await;
                     handle_main_with_prompt(cli.agent.clone(), stdin_content, session_options)
@@ -479,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cli.agent.as_deref(),
                         default_url,
                         cli.prewalk_into.as_deref(),
+                        cli.advisor,
                     )
                     .await;
                     if let Err(err) = handle_fix(HeadlessRun {
@@ -507,6 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.agent.as_deref(),
                     default_url,
                     cli.prewalk_into.as_deref(),
+                    cli.advisor,
                 )
                 .await;
                 handle_main(
@@ -534,6 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cli.agent.as_deref(),
                 default_url,
                 cli.prewalk_into.as_deref(),
+                cli.advisor,
             )
             .await;
             handle_main(cli.agent.clone(), restore_id, None, session_options).await?;
@@ -744,6 +767,7 @@ async fn prepare_and_resolve_or_exit(
     agent_name: Option<&str>,
     default_config_url: Option<String>,
     prewalk_into: Option<&str>,
+    advisor: bool,
 ) -> SessionOptions {
     let startup_primary =
         prepare_session_or_exit(interaction, agent_name, default_config_url).await;
@@ -752,7 +776,12 @@ async fn prepare_and_resolve_or_exit(
         Ok(config) => Ok(config),
         Err(_) => Err(&missing),
     };
-    SessionOptions::resolve_from_loaded_or_exit(prewalk_into, loaded, startup_primary.clone())
+    SessionOptions::resolve_from_loaded_or_exit(
+        prewalk_into,
+        advisor,
+        loaded,
+        startup_primary.clone(),
+    )
 }
 
 async fn handle_main(
@@ -1075,8 +1104,7 @@ fn handle_import(overwrite: bool) -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_serve(
     host: String,
     port: u16,
-    // TODO: wire `--agent` to ServerConfig so the HTTP server uses it as default agent name
-    _agent: Option<String>,
+    agent: Option<String>,
     ephemeral: bool,
     max_sessions: Option<usize>,
     yes: bool,
@@ -1092,6 +1120,13 @@ async fn handle_serve(
         }
     };
 
+    if let Some(ref agent_name) = agent {
+        if let Err(error) = AgentConfig::load_with_primary(agent_name, Some(&primary)) {
+            eprintln!("error: {}", error);
+            std::process::exit(2);
+        }
+    }
+
     // Initialize tracing for HTTP server logs
     tracing_subscriber::fmt()
         .with_target(false)
@@ -1106,7 +1141,8 @@ async fn handle_serve(
         .with_ephemeral(ephemeral)
         .with_max_sessions(max_sessions)
         .with_allow_all_tools(yes)
-        .with_primary_config(primary);
+        .with_primary_config(primary)
+        .with_default_agent(agent);
 
     shai_http::start_server(config).await?;
 
@@ -1245,6 +1281,26 @@ mod cli_tests {
     }
 
     #[test]
+    fn advisor_is_a_plain_switch_and_off_by_default() {
+        assert!(!Cli::try_parse_from(["shai"]).unwrap().advisor);
+        assert!(
+            !Cli::try_parse_from(["shai", "-p", "do it"])
+                .unwrap()
+                .advisor
+        );
+
+        let cli = Cli::try_parse_from(["shai", "--advisor", "-p", "do it"]).unwrap();
+        assert!(cli.advisor);
+        assert_eq!(cli.prompt.as_deref(), Some("do it"));
+
+        // It takes no value, so it cannot swallow what follows it.
+        let cli = Cli::try_parse_from(["shai", "--advisor", "agent", "reviewer"]).unwrap();
+        assert!(cli.advisor);
+        assert!(matches!(cli.command, Some(Commands::Agent { .. })));
+        assert!(Cli::try_parse_from(["shai", "--advisor=yes"]).is_err());
+    }
+
+    #[test]
     fn prewalk_into_takes_a_role_or_a_model_reference() {
         let cli = Cli::try_parse_from(["shai", "--prewalk-into", "cheap"]).unwrap();
         assert_eq!(cli.prewalk_into.as_deref(), Some("cheap"));
@@ -1275,9 +1331,14 @@ mod cli_tests {
         .unwrap();
         let _home = tui::app::tests::ConfigHomeGuard::set(dir.path());
 
-        let options =
-            prepare_and_resolve_or_exit(FallbackInteraction::NonInteractive, None, None, None)
-                .await;
+        let options = prepare_and_resolve_or_exit(
+            FallbackInteraction::NonInteractive,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
 
         // Auth config vanishes before headless/TUI starts its agent.
         std::fs::remove_file(&auth_path).unwrap();

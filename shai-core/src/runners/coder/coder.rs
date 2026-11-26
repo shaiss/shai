@@ -69,6 +69,13 @@ impl Brain for CoderBrain {
             compact_trace_if_needed(&mut trace, context.max_trace_chars, &metadata);
         }
 
+        // Show the advisor's note, if there is one, for this step only. It is
+        // added to this request's copy of the conversation, never to the
+        // stored trace.
+        if let Some(note) = &context.advisor_note {
+            crate::advisor::attach_note(&mut trace, note);
+        }
+
         // Render the user's system prompt template (cached after first call)
         let system_prompt = match &self.cached_prompt {
             Some(cached) => cached.clone(),
@@ -227,6 +234,10 @@ impl Brain for CoderBrain {
     }
 
     fn can_switch_model(&self) -> bool {
+        true
+    }
+
+    fn takes_advisor_notes(&self) -> bool {
         true
     }
 }

@@ -21,6 +21,7 @@ pub use states::{InternalAgentState, PublicAgentState};
 
 pub use protocol::{AgentController, AgentRequest, AgentResponse};
 
+pub use actions::advisor::AdvisorAttachError;
 pub use events::{
     closure_handler, AgentEvent, AgentEventHandler, ClosureHandler, DynEventHandler,
     InternalAgentEvent, PermissionRequest, PermissionResponse, UserRequest, UserResponse,

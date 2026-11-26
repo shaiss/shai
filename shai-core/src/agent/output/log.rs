@@ -89,6 +89,12 @@ impl FileEventLogger {
             AgentEvent::ModelSwitched { provider, model } => {
                 format!("ModelSwitched: {}/{}", provider, model)
             }
+            AgentEvent::AdvisorNote { severity, note } => {
+                format!("AdvisorNote: {} - {}", severity, note)
+            }
+            AgentEvent::AdvisorFailed { error, disabled } => {
+                format!("AdvisorFailed: {} (disabled={})", error, disabled)
+            }
         };
 
         let log_line = format!(

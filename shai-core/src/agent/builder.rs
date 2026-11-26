@@ -1,5 +1,6 @@
 use openai_dive::v1::resources::chat::{ChatMessage, ChatMessageContent};
 use shai_llm::LlmClient;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -34,6 +35,7 @@ pub struct AgentBuilder {
     pub working_dir: Option<String>,
     pub todo_storage: Option<Arc<TodoStorage>>,
     pub mcp_status: Vec<McpServerStatus>,
+    redaction_secrets: Vec<(String, String)>,
 }
 
 impl AgentBuilder {
@@ -121,6 +123,7 @@ impl AgentBuilder {
             working_dir: None,
             todo_storage: None,
             mcp_status: Vec::new(),
+            redaction_secrets: Vec::new(),
         }
     }
 
@@ -143,6 +146,7 @@ impl AgentBuilder {
             working_dir: parent.working_dir.clone(),
             todo_storage: Some(parent.todo_storage.clone()),
             mcp_status: Vec::new(),
+            redaction_secrets: Vec::new(),
         }
     }
 
@@ -244,7 +248,7 @@ impl AgentBuilder {
             .todo_storage
             .unwrap_or_else(|| Arc::new(TodoStorage::new()));
 
-        AgentCore::new(
+        let mut agent = AgentCore::new(
             self.session_id.clone(),
             self.brain,
             self.trace,
@@ -255,7 +259,9 @@ impl AgentBuilder {
             self.fs_operation_log,
             self.working_dir,
             todo_storage,
-        )
+        );
+        agent.redaction_secrets = self.redaction_secrets;
+        agent
     }
 
     /// Create an AgentBuilder from an AgentConfig
@@ -285,12 +291,16 @@ impl AgentBuilder {
         // Same resolution as a primary replacement: original user env, then
         // this agent's env_vars, and the model from the agent file. Do not
         // use create_provider, which would inherit a live primary's export.
-        let (llm_client, model) = ShaiConfig::llm_from_provider_env(
-            &config.llm_provider.provider,
-            &config.llm_provider.env_vars,
-            &config.llm_provider.model,
-        )
-        .map_err(|e| AgentError::LlmError(e.to_string()))?;
+        let resolved_env = ShaiConfig::env_vars_for_llm(&config.llm_provider.env_vars);
+        let llm_client =
+            LlmClient::create_provider_from_map(&config.llm_provider.provider, &resolved_env)
+                .map_err(|e| {
+                    AgentError::LlmError(format!(
+                        "Failed to create {} client: {e}",
+                        config.llm_provider.provider
+                    ))
+                })?;
+        let model = config.llm_provider.model.clone();
         let llm_client = Arc::new(llm_client);
 
         // Create brain with custom system prompt and temperature
@@ -332,6 +342,7 @@ impl AgentBuilder {
         builder.verification_config = config.verification.clone();
         builder.fs_operation_log = fs_log;
         builder.mcp_status = mcp_status;
+        builder.redaction_secrets = agent_redaction_secrets(&config, &resolved_env);
         Ok(builder
             .tools(tools)
             .set_todo_storage(todo_storage)
@@ -573,6 +584,64 @@ impl AgentBuilder {
     }
 }
 
+/// Provider credential names actually resolved when a client is built.
+fn provider_credential_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["OPENAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "openai_compatible" => &["OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL"],
+        "ollama" => &["OLLAMA_API_KEY", "OLLAMA_BASE_URL"],
+        "ovhcloud" => &["OVH_API_KEY", "OVH_BASE_URL"],
+        _ => &[],
+    }
+}
+
+fn resolved_credential<'a>(resolved: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    resolved
+        .get(key)
+        .map(String::as_str)
+        .or_else(|| {
+            resolved
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.as_str())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// Provider and MCP values an advisor should keep out of what it is sent.
+///
+/// Includes values omitted from the agent file but resolved from the original
+/// user environment by [`ShaiConfig::env_vars_for_llm`], not the whole
+/// process environment.
+fn agent_redaction_secrets(
+    config: &AgentConfig,
+    resolved: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut secrets: Vec<(String, String)> = config
+        .llm_provider
+        .env_vars
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for key in provider_credential_names(&config.llm_provider.provider) {
+        if let Some(value) = resolved_credential(resolved, key) {
+            if !secrets.iter().any(|(_, existing)| existing == value) {
+                secrets.push(((*key).to_string(), value.to_string()));
+            }
+        }
+    }
+    for mcp in config.tools.mcp.values() {
+        for (name, value) in crate::advisor::mcp_settings(&mcp.config) {
+            secrets.push((name.to_string(), value));
+        }
+    }
+    secrets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +835,36 @@ mod tests {
             Err(other) => panic!("expected PrimaryConfig, got {other}"),
             Ok(_) => panic!("expected PrimaryConfig, create(None) succeeded"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_named_agents_environment_key_is_collected_for_redaction() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        const KEY: &str = "OPENAI_API_KEY";
+        const VALUE: &str = "user-env-key-for-advisor-redaction";
+        let previous = std::env::var(KEY).ok();
+        std::env::set_var(KEY, VALUE);
+
+        let result = AgentBuilder::from_config(named_openai(serde_json::json!({}))).await;
+
+        match previous {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+
+        let builder = result
+            .expect("a named agent that omits a key must still use a value the user exported");
+        assert!(
+            builder
+                .redaction_secrets
+                .iter()
+                .any(|(name, value)| name == KEY && value == VALUE),
+            "the resolved environment key must be kept out of what the advisor is sent; known names: {:?}",
+            builder
+                .redaction_secrets
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

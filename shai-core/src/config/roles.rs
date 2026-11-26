@@ -990,6 +990,7 @@ mod tests {
             roles: RolesConfig::from_pairs(roles.iter().copied()),
             prewalk: Default::default(),
             anonymous_fallback: None,
+            advisor: Default::default(),
         }
     }
 
