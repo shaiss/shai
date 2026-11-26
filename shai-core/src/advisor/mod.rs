@@ -238,6 +238,12 @@ impl Advisor {
         let mut renewed = Self::with_environment(model, working_dir, limits, config, environment)?;
         let mut reviewer = (*renewed.reviewer).clone();
         reviewer.fs = reviewer.fs.retaining_refusals_of(&self.reviewer.fs);
+        if let Some(records) = reviewer.fs.records_covering_root() {
+            return Err(AdvisorError::WorkingDir(format!(
+                "the working directory lies inside the records path {}",
+                records.display()
+            )));
+        }
         renewed.reviewer = Arc::new(reviewer);
         renewed.spent = self.spent.clone();
         Ok(renewed)

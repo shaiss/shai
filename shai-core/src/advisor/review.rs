@@ -174,8 +174,11 @@ impl Reviewer {
             let calls = tool_calls.clone().unwrap_or_default();
             // The last round does not offer tools. A tool call in that
             // reply is not run: there is no later request to receive the
-            // result, and a lookup would only delay the agent.
-            if calls.is_empty() || !offer_tools {
+            // result, and a lookup would only delay the agent. A spent tool
+            // budget with rounds left still offers no tools, but a follow-up
+            // tool call is answered with OUT_OF_CALLS rather than ending the
+            // review.
+            if calls.is_empty() || round + 1 >= MAX_ROUNDS {
                 let text = match content {
                     Some(ChatMessageContent::Text(text)) => text.as_str(),
                     _ => "",

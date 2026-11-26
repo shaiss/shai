@@ -897,6 +897,41 @@ async fn a_review_has_a_budget_of_tool_calls() {
 }
 
 #[tokio::test]
+async fn a_follow_up_tool_call_after_the_budget_still_gets_out_of_calls() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+    std::fs::write(dir.path().join("canary.txt"), "should-not-be-looked-up\n").unwrap();
+    let burst: Vec<(&str, serde_json::Value)> = (0..review::MAX_TOOL_CALLS)
+        .map(|_| ("read", json!({"path": "a.txt"})))
+        .collect();
+    let outcome = run(
+        dir.path(),
+        steps(dir.path(), 1),
+        vec![
+            Reply::Message(calls(&burst)),
+            Reply::Message(call("read", json!({"path": "canary.txt"}))),
+            says("nit: enough lookups"),
+        ],
+        Some(limits(10, 5)),
+    )
+    .await;
+
+    let reviews = outcome.advisor.served();
+    assert_eq!(reviews.len(), 3);
+    let sent = reviews
+        .iter()
+        .flat_map(|review| review.messages.iter())
+        .map(|message| format!("{message:?}"))
+        .collect::<String>();
+    assert!(sent.contains("no tool calls left"), "{sent}");
+    assert!(!sent.contains("should-not-be-looked-up"), "{sent}");
+    assert_eq!(
+        outcome.notes(),
+        [(Severity::Nit, "enough lookups".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn the_advisor_leaves_the_session_as_it_would_have_been() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("out.txt");
@@ -1371,6 +1406,39 @@ fn a_renewed_advisor_still_refuses_the_old_records_path() {
         .resolve("new-transcripts/s.json")
         .is_err());
     assert!(renewed.reviewer().fs.resolve("README.md").is_ok());
+}
+
+#[test]
+fn renewing_into_a_previously_configured_records_folder_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("workspace");
+    let records = dir.path().join("records");
+    let day = records.join("day");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(day.join("session.json"), "secret-transcript").unwrap();
+    let script = Script::new(vec![]);
+    let advisor = Advisor::with_environment(
+        BoundModel::new(script.client(ADVISOR), ADVISOR_MODEL),
+        &workspace,
+        AdvisorLimits::default(),
+        &ShaiConfig::default(),
+        [(
+            "SHAI_SESSION_FOLDER".to_string(),
+            records.to_string_lossy().into_owned(),
+        )],
+    )
+    .unwrap();
+    let error = advisor
+        .renewed_with_environment(
+            BoundModel::new(script.client(ADVISOR), ADVISOR_MODEL),
+            &day,
+            AdvisorLimits::default(),
+            &ShaiConfig::default(),
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AdvisorError::WorkingDir(_)), "{error}");
 }
 
 /// An advisor confined to `dir` that is told `environment` and never asked.
