@@ -481,7 +481,9 @@ impl CommandRegistry {
                     }
                 };
                 let held = app.stop_holding_events(hold).await;
-                if !replaced {
+                if replaced {
+                    app.show_held_advisor_notices(&held);
+                } else {
                     shai_core::config::config::ShaiConfig::restore_applied_env(&env_snapshot);
                     app.replay_held_events(held).await?;
                 }

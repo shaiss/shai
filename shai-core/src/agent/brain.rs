@@ -18,6 +18,9 @@ pub struct ThinkerContext {
     pub active_prompts: Vec<String>,
     pub tool_call_metadata:
         Arc<RwLock<std::collections::HashMap<String, crate::agent::agent::ToolCallInfo>>>,
+    /// A note from the session's advisor for this step only, already framed
+    /// as advice. It is not part of the trace.
+    pub advisor_note: Option<String>,
 }
 
 /// Read-only snapshot of tool call budget state, passed to the brain
@@ -129,6 +132,13 @@ pub trait Brain: Send + Sync {
     /// Whether [`Brain::switch_model`] would succeed. Asked before a handoff
     /// is armed, so that one which could never happen is refused up front.
     fn can_switch_model(&self) -> bool {
+        false
+    }
+
+    /// Whether this brain shows [`ThinkerContext::advisor_note`] to its
+    /// model. Asked before an advisor is attached: one whose notes would be
+    /// dropped is refused up front.
+    fn takes_advisor_notes(&self) -> bool {
         false
     }
 }

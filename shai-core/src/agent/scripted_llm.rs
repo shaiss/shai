@@ -10,6 +10,7 @@
 //! each step. Nothing here opens a socket.
 
 use async_trait::async_trait;
+use openai_dive::v1::error::APIError;
 use openai_dive::v1::resources::chat::{
     ChatCompletionChoice, ChatCompletionParameters, ChatCompletionResponse, ChatMessage,
     ChatMessageContent, Function, ToolCall,
@@ -37,9 +38,26 @@ pub(crate) struct Served {
     pub tools: Vec<String>,
 }
 
+/// What a scripted client answers a request with.
+#[derive(Debug, Clone)]
+pub(crate) enum Reply {
+    /// An assistant message.
+    Message(ChatMessage),
+    /// An error from the provider, of a kind the client does not retry.
+    Fail(&'static str),
+    /// No answer at all: the request stays pending until it is dropped.
+    Hold,
+}
+
+impl From<ChatMessage> for Reply {
+    fn from(message: ChatMessage) -> Self {
+        Reply::Message(message)
+    }
+}
+
 #[derive(Default)]
 struct ScriptState {
-    replies: VecDeque<ChatMessage>,
+    replies: VecDeque<Reply>,
     served: Vec<Served>,
 }
 
@@ -51,6 +69,11 @@ pub(crate) struct Script {
 
 impl Script {
     pub(crate) fn new(replies: Vec<ChatMessage>) -> Self {
+        Self::with_replies(replies.into_iter().map(Reply::from).collect())
+    }
+
+    /// A script in which some requests fail.
+    pub(crate) fn with_replies(replies: Vec<Reply>) -> Self {
         Self {
             state: Arc::new(Mutex::new(ScriptState {
                 replies: replies.into(),
@@ -102,24 +125,31 @@ impl LlmProvider for ScriptedProvider {
         &self,
         request: ChatCompletionParameters,
     ) -> Result<ChatCompletionResponse, LlmError> {
-        let mut state = self.script.state.lock().unwrap();
-        state.served.push(Served {
-            client: self.name,
-            model: request.model.clone(),
-            messages: request.messages.clone(),
-            tools: request
-                .tools
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.function.name)
-                .collect(),
-        });
+        let reply = {
+            let mut state = self.script.state.lock().unwrap();
+            state.served.push(Served {
+                client: self.name,
+                model: request.model.clone(),
+                messages: request.messages.clone(),
+                tools: request
+                    .tools
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.function.name)
+                    .collect(),
+            });
+            state.replies.pop_front()
+        };
         // A request the script did not plan for ends the run with a plain
         // reply; tests catch it through `served_by`.
-        let message = state
-            .replies
-            .pop_front()
-            .unwrap_or_else(|| text("(script exhausted)"));
+        let message = match reply {
+            Some(Reply::Message(message)) => message,
+            Some(Reply::Fail(reason)) => {
+                return Err(Box::new(APIError::InvalidRequestError(reason.to_string())));
+            }
+            Some(Reply::Hold) => std::future::pending().await,
+            None => text("(script exhausted)"),
+        };
         Ok(ChatCompletionResponse {
             id: None,
             choices: vec![ChatCompletionChoice {

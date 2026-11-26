@@ -15,8 +15,9 @@ impl AgentCore {
         };
 
         match event {
-            InternalAgentEvent::CancelTask => {
-                // Silently ignore
+            InternalAgentEvent::CancelTask | InternalAgentEvent::AdvisorCompleted { .. } => {
+                // Silently ignore. An advisor result can arrive after the
+                // agent stopped waiting for it; it is dropped.
             }
             InternalAgentEvent::ThinkingStart => {
                 self.spawn_next_step().await;

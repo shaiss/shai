@@ -107,6 +107,9 @@ struct Cli {
     /// a role name or <provider>/<model> (overrides prewalk.into)
     #[arg(long, value_name = "ROLE_OR_MODEL")]
     prewalk_into: Option<String>,
+    /// Have a second model (the "advisor" role) review the agent's steps, read-only
+    #[arg(long)]
+    advisor: bool,
 }
 
 #[derive(Subcommand)]
@@ -223,11 +226,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so that none of their paths runs without them. Asking for one where it
     // cannot apply is an error.
     let session_options = if session_starts {
-        SessionOptions::resolve_or_exit(cli.prewalk_into.as_deref())
+        SessionOptions::resolve_or_exit(cli.prewalk_into.as_deref(), cli.advisor)
     } else {
-        if cli.prewalk_into.is_some() {
-            eprintln!("error: --prewalk-into only applies to commands that start an agent session");
-            std::process::exit(2);
+        for (given, flag) in [
+            (cli.prewalk_into.is_some(), "--prewalk-into"),
+            (cli.advisor, "--advisor"),
+        ] {
+            if given {
+                eprintln!(
+                    "error: {} only applies to commands that start an agent session",
+                    flag
+                );
+                std::process::exit(2);
+            }
         }
         SessionOptions::default()
     };
@@ -962,6 +973,26 @@ mod cli_tests {
         assert!(cli.prewalk_into.is_none());
         let cli = Cli::try_parse_from(["shai", "-p", "do it"]).unwrap();
         assert!(cli.prewalk_into.is_none());
+    }
+
+    #[test]
+    fn advisor_is_a_plain_switch_and_off_by_default() {
+        assert!(!Cli::try_parse_from(["shai"]).unwrap().advisor);
+        assert!(
+            !Cli::try_parse_from(["shai", "-p", "do it"])
+                .unwrap()
+                .advisor
+        );
+
+        let cli = Cli::try_parse_from(["shai", "--advisor", "-p", "do it"]).unwrap();
+        assert!(cli.advisor);
+        assert_eq!(cli.prompt.as_deref(), Some("do it"));
+
+        // It takes no value, so it cannot swallow what follows it.
+        let cli = Cli::try_parse_from(["shai", "--advisor", "agent", "reviewer"]).unwrap();
+        assert!(cli.advisor);
+        assert!(matches!(cli.command, Some(Commands::Agent { .. })));
+        assert!(Cli::try_parse_from(["shai", "--advisor=yes"]).is_err());
     }
 
     #[test]

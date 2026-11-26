@@ -1,3 +1,4 @@
+use super::advisor::AdvisorConfig;
 use super::lenient::Lenient;
 use super::prewalk::PrewalkConfig;
 use super::roles::RolesConfig;
@@ -57,6 +58,8 @@ pub struct ShaiConfig {
     pub roles: RolesConfig,
     /// One-shot handoff to another model, see [`crate::config::prewalk`].
     pub prewalk: Lenient<PrewalkConfig>,
+    /// Second model that reviews the agent's work, see [`crate::config::advisor`].
+    pub advisor: Lenient<AdvisorConfig>,
 }
 
 // Reading and writing are spelled out instead of derived for the sake of the
@@ -75,6 +78,7 @@ impl Serialize for ShaiConfig {
         map.serialize_entry("mcp_configs", &self.mcp_configs)?;
         self.roles.section().write("roles", &mut map)?;
         self.prewalk.section().write("prewalk", &mut map)?;
+        self.advisor.section().write("advisor", &mut map)?;
         map.end()
     }
 }
@@ -109,6 +113,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                 let mut mcp_configs = None;
                 let mut roles = RolesConfig::default();
                 let mut prewalk = Lenient::unset();
+                let mut advisor = Lenient::unset();
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -120,6 +125,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                         // Optional sections: every copy is kept as text.
                         "roles" => roles.section_mut().push(map.next_value()?),
                         "prewalk" => prewalk.section_mut().push(map.next_value()?),
+                        "advisor" => advisor.section_mut().push(map.next_value()?),
                         _ => {
                             map.next_value::<IgnoredAny>()?;
                         }
@@ -133,6 +139,7 @@ impl<'de> Deserialize<'de> for ShaiConfig {
                     mcp_configs: mcp_configs.unwrap_or_default(),
                     roles,
                     prewalk,
+                    advisor,
                 })
             }
         }
@@ -156,6 +163,7 @@ impl ShaiConfig {
         let mut config: ShaiConfig = serde_json::from_str(config_json)?;
         config.roles = RolesConfig::default();
         config.prewalk = Lenient::unset();
+        config.advisor = Lenient::unset();
         Ok(config)
     }
 
@@ -462,6 +470,7 @@ impl Default for ShaiConfig {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
             prewalk: Lenient::unset(),
+            advisor: Lenient::unset(),
         }
     }
 }
@@ -597,6 +606,7 @@ mod tests {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::default(),
             prewalk: Lenient::unset(),
+            advisor: Lenient::unset(),
         };
         config.add_provider(
             provider.to_string(),
@@ -679,14 +689,16 @@ mod tests {
                     {"provider": "ollama", "env_vars": {}, "model": "llama3", "tool_method": "FunctionCall"}
                 ],
                 "selected_provider": 0,
-                "roles": {"planner": "ollama/other"},
-                "prewalk": {"into": "planner"}
+                "roles": {"planner": "ollama/other", "advisor": "ollama/other"},
+                "prewalk": {"into": "planner"},
+                "advisor": {"enabled": true}
             }"#,
         )
         .unwrap();
         assert_eq!(pulled.providers.len(), 1);
         assert!(pulled.roles.is_unset());
         assert!(pulled.prewalk.is_unset());
+        assert!(pulled.advisor.is_unset());
         assert!(pulled.resolve_role("planner").unwrap().is_none());
     }
 

@@ -877,6 +877,7 @@ mod tests {
             mcp_configs: HashMap::new(),
             roles: RolesConfig::from_pairs(roles.iter().copied()),
             prewalk: Default::default(),
+            advisor: Default::default(),
         }
     }
 
