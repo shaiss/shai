@@ -19,6 +19,7 @@ const PROVIDER_KEY_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "OPENAI_COMPATIBLE_API_KEY",
     "OPENROUTER_API_KEY",
+    "ORCAROUTER_API_KEY",
     "OVH_API_KEY",
 ];
 
@@ -85,6 +86,7 @@ mod tests {
     fn scrubs_provider_keys() {
         assert_scrubbed(&[
             "OPENROUTER_API_KEY",
+            "ORCAROUTER_API_KEY",
             "OVH_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",

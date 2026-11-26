@@ -61,10 +61,16 @@ Previous versions of Shai used `auth.config` (without `.json` extension). If `au
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `provider` | string | Provider identifier (e.g. `"ovhcloud"`, `"openai"`, `"anthropic"`) |
+| `provider` | string | Provider identifier (e.g. `"ovhcloud"`, `"openai"`, `"anthropic"`, `"orcarouter"`) |
 | `env_vars` | object&lt;string, string&gt; | Environment variables passed to the provider (API keys, base URLs) |
 | `model` | string | Model identifier |
 | `tool_method` | string | Tool call method (`"Auto"`, `"FunctionCall"`, `"FunctionCallRequired"`, `"StructuredOutput"`) |
+
+### OrcaRouter
+
+OrcaRouter is a first-class, OpenAI-compatible provider. Add it with `shai auth` and choose **OrcaRouter**, or put an entry in `auth.config.json` like the example in [`docs/examples/orcarouter.json`](../examples/orcarouter.json). The only required variable is `ORCAROUTER_API_KEY`. The base URL (`https://api.orcarouter.ai/v1`) is built in.
+
+Model ids are provider-prefixed (`anthropic/claude-sonnet-4.6`, `openai/gpt-4o-mini`, `orcarouter/auto`). Shai omits OrcaRouter's free catalog entries (`orcarouter/free` and any id ending in `-free`) from the model list and will not use one as the default.
 
 ## Roles
 
