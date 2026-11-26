@@ -625,6 +625,17 @@ fn apply_provisioned_snapshot_policy(config: ShaiConfig) -> Result<ShaiConfig, P
     }
 }
 
+/// Map a provision result so a deny is a refused `SessionStartError` and
+/// reaches `exit_session_error` through every `prepare_session_or_exit` caller.
+fn provisioned_session(
+    result: Result<ShaiConfig, PrimaryConfigError>,
+) -> Result<Result<ShaiConfig, PrimaryConfigError>, SessionStartError> {
+    match result {
+        Ok(config) => Ok(Ok(config)),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn interactive_session_interaction() -> FallbackInteraction {
     if io::stdin().is_terminal() {
         FallbackInteraction::InteractiveTty
@@ -692,7 +703,7 @@ async fn prepare_session(
             if let Some(warning) = first_run_warning {
                 eprintln!("{warning}");
             }
-            Ok(
+            provisioned_session(
                 provision_default_config(default_config_url, loaded, allow_fallback_provision)
                     .await,
             )
@@ -703,7 +714,7 @@ async fn prepare_session(
             let accepted = confirm_anonymous_fallback(&mut stdin, &mut stderr, prompt)
                 .map_err(|e| SessionStartError::other(e.to_string()))?;
             if accepted {
-                Ok(
+                provisioned_session(
                     provision_default_config(default_config_url, loaded, allow_fallback_provision)
                         .await,
                 )
@@ -1298,8 +1309,9 @@ mod cli_tests {
         }
     }
 
-    #[test]
-    fn a_provisioned_starter_with_deny_and_anonymous_ovh_is_refused() {
+    #[tokio::test]
+    async fn a_provisioned_starter_with_deny_and_anonymous_ovh_is_refused() {
+        let _guard = tui::app::tests::CONFIG_HOME_LOCK.lock().await;
         let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
         let prev_ovh = std::env::var_os("OVH_API_KEY");
         std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
@@ -1329,6 +1341,64 @@ mod cli_tests {
         .unwrap();
         apply_provisioned_snapshot_policy(prompt_anon)
             .expect("prompt mode starts must stay allowed");
+
+        match prev_fb {
+            Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
+            None => std::env::remove_var("SHAI_ANONYMOUS_FALLBACK"),
+        }
+        match prev_ovh {
+            Some(v) => std::env::set_var("OVH_API_KEY", v),
+            None => std::env::remove_var("OVH_API_KEY"),
+        }
+    }
+
+    /// A provisioned starter that itself denies anonymous OVH must come back
+    /// as a refused `SessionStartError`, so `prepare_session_or_exit` can
+    /// call `exit_session_error` and `--prewalk-into` is not treated as a
+    /// missing config.
+    #[tokio::test]
+    async fn prepare_session_refuses_immediately_when_a_provisioned_starter_denies() {
+        let _guard = tui::app::tests::CONFIG_HOME_LOCK.lock().await;
+        let prev_fb = std::env::var_os("SHAI_ANONYMOUS_FALLBACK");
+        let prev_ovh = std::env::var_os("OVH_API_KEY");
+        std::env::remove_var("SHAI_ANONYMOUS_FALLBACK");
+        std::env::remove_var("OVH_API_KEY");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let _home = tui::app::tests::ConfigHomeGuard::set(dir.path());
+
+        let body = r#"{"providers":[{"provider":"ovhcloud","env_vars":{"OVH_BASE_URL":"https://example.invalid/v1"},"model":"Qwen3-32B","tool_method":"FunctionCall"}],"selected_provider":0,"anonymous_fallback":"deny"}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/starter.config");
+        let served = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("starter request");
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{served}",
+                served.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        });
+
+        let result = prepare_session(FallbackInteraction::NonInteractive, None, Some(url)).await;
+        let _ = server.join();
+
+        let err = match result {
+            Err(err) => err,
+            Ok(Ok(_)) => panic!("expected a refused start after provisioning a deny starter"),
+            Ok(Err(err)) => panic!(
+                "expected a refused SessionStartError so exit_session_error runs, got a wrapped primary config error: {err}"
+            ),
+        };
+        assert!(err.is_refused(), "{err}");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(
+            err.to_string().contains("Anonymous fallback is disabled"),
+            "{err}"
+        );
 
         match prev_fb {
             Some(v) => std::env::set_var("SHAI_ANONYMOUS_FALLBACK", v),
