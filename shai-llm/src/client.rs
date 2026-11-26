@@ -6,7 +6,7 @@ use super::provider::{LlmError, LlmProvider, LlmStream, ProviderInfo};
 use super::providers::{
     anthropic::AnthropicProvider, mistral::MistralProvider, ollama::OllamaProvider,
     openai::OpenAIProvider, openai_compatible::OpenAICompatibleProvider,
-    openrouter::OpenRouterProvider, ovhcloud::OvhCloudProvider,
+    openrouter::OpenRouterProvider, orcarouter::OrcaRouterProvider, ovhcloud::OvhCloudProvider,
 };
 use openai_dive::v1::resources::chat::ChatCompletionParametersBuilder;
 use openai_dive::v1::resources::{
@@ -59,6 +59,14 @@ impl LlmClient {
         })
     }
 
+    /// Create an OrcaRouter provider from environment variables
+    /// Returns None if required environment variables are not set
+    pub fn from_env_orcarouter() -> Option<Self> {
+        OrcaRouterProvider::from_env().map(|provider| Self {
+            provider: Box::new(provider),
+        })
+    }
+
     /// Create an OpenAI Compatible provider from environment variables
     /// Returns None if required environment variables are not set
     pub fn from_env_openai_compatible() -> Option<Self> {
@@ -98,6 +106,12 @@ impl LlmClient {
     pub fn openrouter(api_key: String) -> Self {
         Self {
             provider: Box::new(OpenRouterProvider::new(api_key)),
+        }
+    }
+
+    pub fn orcarouter(api_key: String) -> Self {
+        Self {
+            provider: Box::new(OrcaRouterProvider::new(api_key)),
         }
     }
 
@@ -150,6 +164,7 @@ impl LlmClient {
                 "mistral" => return Self::from_env_mistral(),
                 "anthropic" => return Self::from_env_anthropic(),
                 "openrouter" => return Self::from_env_openrouter(),
+                "orcarouter" => return Self::from_env_orcarouter(),
                 "openai_compatible" => return Self::from_env_openai_compatible(),
                 "ollama" => return Self::from_env_ollama(),
                 _ => {} // Fall through to default behavior
@@ -171,6 +186,9 @@ impl LlmClient {
         if let Some(client) = Self::from_env_openrouter() {
             return Some(client);
         }
+        if let Some(client) = Self::from_env_orcarouter() {
+            return Some(client);
+        }
         if let Some(client) = Self::from_env_openai_compatible() {
             return Some(client);
         }
@@ -188,6 +206,7 @@ impl LlmClient {
             OllamaProvider::info(),
             OpenAICompatibleProvider::info(),
             OpenRouterProvider::info(),
+            OrcaRouterProvider::info(),
             AnthropicProvider::info(),
             OpenAIProvider::info(),
         ]
@@ -344,6 +363,9 @@ enum ProviderSettings {
     OpenRouter {
         api_key: String,
     },
+    OrcaRouter {
+        api_key: String,
+    },
     OpenAiCompatible {
         api_key: String,
         base_url: String,
@@ -397,6 +419,9 @@ impl ProviderSettings {
             "openrouter" => Ok(Self::OpenRouter {
                 api_key: required("OPENROUTER_API_KEY")?,
             }),
+            "orcarouter" => Ok(Self::OrcaRouter {
+                api_key: required("ORCAROUTER_API_KEY")?,
+            }),
             "openai_compatible" => Ok(Self::OpenAiCompatible {
                 api_key: required("OPENAI_COMPATIBLE_API_KEY")?,
                 base_url: required("OPENAI_COMPATIBLE_BASE_URL")?,
@@ -413,6 +438,7 @@ impl ProviderSettings {
             Self::Mistral { api_key } => LlmClient::mistral(api_key),
             Self::OvhCloud { api_key, base_url } => LlmClient::ovhcloud(api_key, base_url),
             Self::OpenRouter { api_key } => LlmClient::openrouter(api_key),
+            Self::OrcaRouter { api_key } => LlmClient::orcarouter(api_key),
             Self::OpenAiCompatible { api_key, base_url } => {
                 LlmClient::compatible(api_key, base_url)
             }
@@ -427,6 +453,7 @@ impl ProviderSettings {
             Self::Mistral { .. } => "mistral",
             Self::OvhCloud { .. } => "ovhcloud",
             Self::OpenRouter { .. } => "openrouter",
+            Self::OrcaRouter { .. } => "orcarouter",
             Self::OpenAiCompatible { .. } => "openai_compatible",
         }
     }
@@ -1077,6 +1104,7 @@ mod provider_settings_tests {
         ("ANTHROPIC_API_KEY", "env-anthropic"),
         ("MISTRAL_API_KEY", "env-mistral"),
         ("OPENROUTER_API_KEY", "env-openrouter"),
+        ("ORCAROUTER_API_KEY", "env-orcarouter"),
         ("OPENAI_COMPATIBLE_API_KEY", "env-compatible"),
         ("OPENAI_COMPATIBLE_BASE_URL", "http://env.invalid/v1"),
         ("OVH_API_KEY", "env-ovh"),
@@ -1090,6 +1118,7 @@ mod provider_settings_tests {
         "anthropic",
         "mistral",
         "openrouter",
+        "orcarouter",
         "openai_compatible",
         "ovhcloud",
         "ollama",
@@ -1206,6 +1235,12 @@ mod provider_settings_tests {
                 })
             );
             assert_eq!(
+                isolated("orcarouter", &[("ORCAROUTER_API_KEY", "entry-key")]),
+                Ok(OrcaRouter {
+                    api_key: key.clone()
+                })
+            );
+            assert_eq!(
                 isolated(
                     "openai_compatible",
                     &[
@@ -1259,6 +1294,7 @@ mod provider_settings_tests {
                 ("anthropic", &[("ANTHROPIC_API_KEY", "k")]),
                 ("mistral", &[("MISTRAL_API_KEY", "k")]),
                 ("openrouter", &[("OPENROUTER_API_KEY", "k")]),
+                ("orcarouter", &[("ORCAROUTER_API_KEY", "k")]),
                 (
                     "openai_compatible",
                     &[
@@ -1282,6 +1318,7 @@ mod provider_settings_tests {
         test_env::with(FULL_ENV, || {
             for blank in ["", "   "] {
                 assert!(isolated("openai", &[("OPENAI_API_KEY", blank)]).is_err());
+                assert!(isolated("orcarouter", &[("ORCAROUTER_API_KEY", blank)]).is_err());
                 assert!(isolated("ollama", &[("OLLAMA_BASE_URL", blank)]).is_err());
             }
             // One of two required settings is not enough.

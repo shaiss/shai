@@ -13,7 +13,7 @@ shai is a coding agent, your pair programming buddy that lives in the terminal. 
 - **Project context** — Load project-specific information via `AGENTS.md` files
 - **MCP Support** — Configure specialized agents with MCP and OAuth support
 - **Skills** — Extend shai with composable, on-demand procedural instructions
-- **Multiple LLM providers** — Works with OVHcloud, OpenAI, Anthropic, Mistral, Ollama, OpenRouter
+- **Multiple LLM providers** — Works with OVHcloud, OpenAI, Anthropic, Mistral, Ollama, OpenRouter, OrcaRouter
 
 ## Installation
 

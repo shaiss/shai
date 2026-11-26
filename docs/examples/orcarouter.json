@@ -1,0 +1,13 @@
+{
+  "providers": [
+    {
+      "provider": "orcarouter",
+      "env_vars": {
+        "ORCAROUTER_API_KEY": "your-api-key"
+      },
+      "model": "anthropic/claude-sonnet-4.6",
+      "tool_method": "FunctionCall"
+    }
+  ],
+  "selected_provider": 0
+}

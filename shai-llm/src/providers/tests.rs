@@ -334,6 +334,8 @@ pub fn create_provider_from_env(provider_name: &str) -> Option<Box<dyn LlmProvid
             .map(|p| Box::new(p) as Box<dyn LlmProvider>),
         "openrouter" => crate::providers::openrouter::OpenRouterProvider::from_env()
             .map(|p| Box::new(p) as Box<dyn LlmProvider>),
+        "orcarouter" => crate::providers::orcarouter::OrcaRouterProvider::from_env()
+            .map(|p| Box::new(p) as Box<dyn LlmProvider>),
         "openai_compatible" => {
             crate::providers::openai_compatible::OpenAICompatibleProvider::from_env()
                 .map(|p| Box::new(p) as Box<dyn LlmProvider>)
@@ -406,6 +408,7 @@ register_providers_for_testing!(
     anthropic,
     ollama,
     openrouter,
+    orcarouter,
     openai_compatible,
     ovhcloud,
     mistral
