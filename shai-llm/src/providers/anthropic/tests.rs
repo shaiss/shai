@@ -8,19 +8,23 @@ mod tests {
     };
     use serde_json::json;
 
+    // These tests only exercise offline request conversion. They must not
+    // require ANTHROPIC_API_KEY or a network call (CI has neither by default).
     fn setup_provider() -> AnthropicProvider {
-        // Assume ANTHROPIC_API_KEY exists in environment
-        AnthropicProvider::from_env().expect("ANTHROPIC_API_KEY must be set for tests")
+        AnthropicProvider::new("test-key".to_string())
+    }
+
+    fn test_model() -> &'static str {
+        "claude-3-5-sonnet-20241022"
     }
 
     #[tokio::test]
     async fn test_system_prompt_handling() {
         let provider = setup_provider();
-        let default_model = provider.default_model().await.unwrap();
 
         // Create a request with system and user messages
         let request = ChatCompletionParametersBuilder::default()
-            .model(default_model)
+            .model(test_model())
             .messages(vec![
                 ChatMessage::System {
                     content: ChatMessageContent::Text("You are a helpful assistant.".to_string()),
@@ -53,11 +57,10 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_system_messages() {
         let provider = setup_provider();
-        let default_model = provider.default_model().await.unwrap();
 
         // Create a request with multiple system messages
         let request = ChatCompletionParametersBuilder::default()
-            .model(default_model)
+            .model(test_model())
             .messages(vec![
                 ChatMessage::System {
                     content: ChatMessageContent::Text("You are a helpful assistant.".to_string()),
@@ -92,11 +95,10 @@ mod tests {
     #[tokio::test]
     async fn test_no_system_messages() {
         let provider = setup_provider();
-        let default_model = provider.default_model().await.unwrap();
 
         // Create a request with no system messages
         let request = ChatCompletionParametersBuilder::default()
-            .model(default_model)
+            .model(test_model())
             .messages(vec![ChatMessage::User {
                 content: ChatMessageContent::Text("Hello!".to_string()),
                 name: None,
@@ -118,11 +120,10 @@ mod tests {
     #[tokio::test]
     async fn test_tool_result_conversion() {
         let provider = setup_provider();
-        let default_model = provider.default_model().await.unwrap();
 
         // Create a request with a tool call exchange
         let request = ChatCompletionParametersBuilder::default()
-            .model(default_model)
+            .model(test_model())
             .messages(vec![
                 ChatMessage::User {
                     content: ChatMessageContent::Text("make me a hello world in main.py".to_string()),

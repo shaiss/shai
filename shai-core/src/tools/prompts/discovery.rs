@@ -18,7 +18,7 @@ pub struct PromptInfo {
 /// Parse a prompt file content to extract name and description from frontmatter.
 ///
 /// Frontmatter format:
-/// ```
+/// ```text
 /// ---
 /// name: My Prompt
 /// description: A short description
@@ -261,20 +261,35 @@ mod tests {
 
     #[test]
     fn test_load_active_prompts() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
-
+        // load_active_prompts resolves names through discover_prompts(), which
+        // reads ~/.config/shai/prompts (and project .shai/prompts). Point HOME
+        // at a temp tree so the test does not depend on the developer's config.
+        // HOME is process-wide: take HOME_LOCK and restore via HomeGuard so
+        // parallel skill/prompt discovery tests cannot race.
+        let _lock = crate::config::test_env::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_home = TempDir::new().unwrap();
+        let prompts_dir = temp_home
+            .path()
+            .join(".config")
+            .join("shai")
+            .join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+        // Unique name: project-local prompts still win over HOME, so avoid
+        // colliding with a real `.shai/prompts/caveman.md` in the checkout.
+        let name = "ci_gate_unique_prompt_fixture";
         fs::write(
-            temp_path.join("caveman.md"),
-            "---\nname: caveman\ndescription: Caveman mode\n---\nBe concise.",
+            prompts_dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: CI fixture\n---\nBe concise."),
         )
         .unwrap();
 
-        let prompts = discover_prompts_in_dir(temp_path);
-        let names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
-        let loaded = load_active_prompts(&names);
+        let _home = crate::config::test_env::HomeGuard::set(temp_home.path());
+        let loaded = load_active_prompts(&[name.to_string()]);
+
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, "caveman");
+        assert_eq!(loaded[0].0, name);
         assert!(loaded[0].1.contains("Be concise."));
     }
 }
